@@ -40,7 +40,11 @@ Python 3.10+ ve paketler: `pip install -r requirements.txt`
 ## Güvenlik notları
 
 - Sandbox ayarları: örnek ve araçlar **salt okunur** paylaşılır, sadece `output\` yazılabilir. Pano, vGPU, yazıcı, mikrofon ve kamera kapalıdır.
-- **`cases\...\output\` içindeki hiçbir şeyi çalıştırma.** Sandbox içindeki zararlı bu klasöre yazabilir.
+- **`cases\...\output\` içindeki hiçbir şeyi çalıştırma.** Sandbox içindeki zararlı bu klasöre yazabilir. Analiz bitince izleyicinin kendi dosyaları dışındaki her şey `.quarantine` uzantısı ve "internetten indirildi" işaretiyle (ZoneId=3) etiketlenir, ayrıca **KIRMIZI** bayrak verilir.
+- Örnek, izleyici scripti öldürürse bu fark edilir: izleme sırasında `live.json` 3 dakika güncellenmezse **KIRMIZI** (anti-analiz) bayrak verilir ve o ana kadar toplanan veriler saklanır. Sandbox'tan gelen her veri yine de güvenilmezdir; akıllı bir zararlı sahte sonuç da yazabilir.
+- Geçerli dijital imza risk puanını düşürmez. Zararlılar çalıntı sertifikalarla da imzalanır.
+- Panele bırakılan dosyalar için sınır 4 GB, ayrıca diskte en az 2 GB boş alan kalmalı. Daha büyük dosyaları yol seçerek analiz et.
+- Windows Sandbox bir bilgisayarda aynı anda bir kez açılabilir. İkinci analiz "sırada" bekler, ilki bitince kendiliğinden başlar.
 - İnternet açıkken sandbox içinde bir güvenlik duvarı kuralı ev ağını (10.x, 172.16-31.x, 192.168.x, 169.254.x, 100.64.x, fc00::/7) ve ana bilgisayarı engeller. Sadece sandbox'ın kendi ağ geçidi ve DNS'i açık kalır. Örnek yönetici yetkisiyle çalıştığı için bu kuralı silebilir. Kural 5 saniyede bir kontrol edilir, silinirse yeniden uygulanır ve **KIRMIZI** bayrak verilir; aradaki birkaç saniyelik boşluk teorik olarak kalır. En güvenlisi "Sandbox'ta internet açık" kutusunu kaldırmak (trafik o zaman gözlenemez).
 - Panel yalnızca kendi sayfasından gelen istekleri kabul eder. Başka siteler ve başka yerel portlar `Origin` / `Sec-Fetch-Site` kontrolüyle reddedilir (CSRF ve DNS rebinding koruması).
 - VirusTotal'e yüklenen dosyaları VT'nin ücretli kullanıcıları indirebilir. Kişisel dosya yükleme.

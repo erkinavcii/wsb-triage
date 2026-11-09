@@ -279,8 +279,13 @@
       if (d.selected_path) $('pathInput').value = d.selected_path;
     });
 
+    const MAX_UPLOAD = 4 * 1024 ** 3;
     async function uploadAndStart(file) {
       if (!file) return;
+      if (file.size > MAX_UPLOAD) {
+        alert(`"${file.name}" ${(file.size / 1024 ** 3).toFixed(1)} GB. Panele bırakma sınırı 4 GB.\n\nBüyük dosyaları sağdaki 'Dosya' / 'Klasör' butonuyla seçin; kopyalanmadan analiz edilir.`);
+        return;
+      }
       const dz = $('dropZone'); const old = dz.innerHTML;
       dz.innerHTML = `<div class="text-sm text-cyan-300 animate-pulse">"${esc(file.name)}" alınıyor (${fmtMB(file.size)})...</div>`;
       try {
@@ -378,7 +383,7 @@
       pending: '<span class="text-slate-500">○</span>',
       running: '<span class="inline-block w-3.5 h-3.5 border-2 border-cyan-400 border-t-transparent rounded-full animate-spin"></span>',
       done: '<span class="text-emerald-400">✓</span>', skipped: '<span class="text-slate-400">⤼</span>',
-      waiting: '<span class="text-amber-300">⏸</span>', unavailable: '<span class="text-amber-300">⚠</span>', error: '<span class="text-rose-400">✗</span>',
+      waiting: '<span class="text-amber-300">⏸</span>', queued: '<span class="text-sky-300">⏳</span>', unavailable: '<span class="text-amber-300">⚠</span>', error: '<span class="text-rose-400">✗</span>',
     };
 
     function renderJob(st) {

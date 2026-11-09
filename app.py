@@ -44,7 +44,33 @@ async def local_only(request: Request, call_next):
         site = request.headers.get("sec-fetch-site")
         if (origin and origin not in ALLOWED_ORIGINS) or (site and site not in ("same-origin", "none")):
             return JSONResponse({"detail": "Başka bir siteden gelen istek reddedildi."}, status_code=403)
+    # 3) Upload size: checked before the body is read (Starlette spools the whole upload to a temp file first).
+    if request.url.path == "/api/upload":
+        problem = _upload_problem(request.headers.get("content-length"))
+        if problem:
+            return JSONResponse({"detail": problem[1]}, status_code=problem[0])
     return await call_next(request)
+
+
+MAX_UPLOAD_BYTES = 4 * 1024 ** 3        # bigger files: pick them by path (no copy needed)
+DISK_RESERVE_BYTES = 2 * 1024 ** 3      # always leave this much free
+
+
+def _upload_problem(content_length: Optional[str]):
+    if not content_length or not content_length.isdigit():
+        return 411, "Yükleme boyutu bilinmiyor; dosyayı yol seçerek analiz edin."
+    size = int(content_length)
+    if size > MAX_UPLOAD_BYTES:
+        return 413, (f"Dosya {size / 1024 ** 3:.1f} GB; panele bırakma sınırı {MAX_UPLOAD_BYTES // 1024 ** 3} GB. "
+                     "Büyük dosyaları 'Dosya' / 'Klasör' butonuyla yol seçerek analiz edin (kopyalama gerekmez).")
+    import tempfile
+    # the upload is written twice (temp spool + uploads/), possibly on the same drive
+    for d in {Path(tempfile.gettempdir()).anchor, UPLOADS_DIR.anchor}:
+        free = shutil.disk_usage(d).free
+        need = size * (2 if Path(tempfile.gettempdir()).anchor == UPLOADS_DIR.anchor else 1) + DISK_RESERVE_BYTES
+        if free < need:
+            return 507, f"{d} sürücüsünde yeterli boş alan yok ({free / 1024 ** 3:.1f} GB boş, {need / 1024 ** 3:.1f} GB gerekli)."
+    return None
 
 
 # ------------------------------------------------------------------ models
@@ -128,8 +154,17 @@ def upload_file(file: UploadFile = File(...)):
     dest_dir = UPLOADS_DIR / re.sub(r"[^\w.-]", "_", safe_name)[:60]
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / safe_name
-    with open(dest, "wb") as buf:
-        shutil.copyfileobj(file.file, buf)
+    written = 0
+    try:
+        with open(dest, "wb") as buf:
+            while chunk := file.file.read(8 * 1024 * 1024):
+                written += len(chunk)
+                if written > MAX_UPLOAD_BYTES:      # Content-Length can lie; enforce the real size too
+                    raise HTTPException(413, f"Dosya {MAX_UPLOAD_BYTES // 1024 ** 3} GB sınırını aşıyor.")
+                buf.write(chunk)
+    except BaseException:
+        dest.unlink(missing_ok=True)
+        raise
     return {"path": str(dest)}
 
 

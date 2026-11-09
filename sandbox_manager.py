@@ -193,14 +193,26 @@ def harden_and_snapshot_virtualbox_vm(vm_name: str) -> Dict[str, Any]:
             return {"status": "error",
                     "message": f"'{vm_name}' şu an '{state}' durumunda. Ayarlar ancak VM kapalıyken değişir; önce VM'i kapatın."}
         steps, failed = [], []
+        # Each setting: VirtualBox 7 option names first, older 6.x names as fallback.
         checks = [
-            (["modifyvm", vm_name, "--nic1", "none", "--nic2", "none", "--nic3", "none", "--nic4", "none"], "Tüm ağ kartları kapatıldı"),
-            (["modifyvm", vm_name, "--clipboard-mode", "disabled"], "Pano paylaşımı kapatıldı"),
-            (["modifyvm", vm_name, "--drag-and-drop", "disabled"], "Sürükle-bırak kapatıldı"),
+            ([["--nic1", "none", "--nic2", "none", "--nic3", "none", "--nic4", "none"]], "Tüm ağ kartları kapatıldı"),
+            ([["--clipboard-mode", "disabled"], ["--clipboard", "disabled"]], "Pano paylaşımı kapatıldı"),
+            ([["--drag-and-drop", "disabled"], ["--draganddrop", "disabled"]], "Sürükle-bırak kapatıldı"),
+            ([["--usb-ohci", "off", "--usb-ehci", "off", "--usb-xhci", "off"], ["--usb", "off", "--usbehci", "off", "--usbxhci", "off"]],
+             "USB denetleyicileri kapatıldı (USB bellek / cihaz geçişi yok)"),
+            ([["--accelerate-3d", "off"], ["--accelerate3d", "off"]], "3D hızlandırma kapatıldı (grafik sürücüsü saldırı yüzeyi)"),
+            ([["--vrde", "off"]], "Uzaktan ekran (VRDE) kapatıldı"),
         ]
-        for args, label in checks:
-            p = _run([str(VBOX_EXE)] + args, timeout=20)
-            (steps if p.returncode == 0 else failed).append(label if p.returncode == 0 else f"{label} — BAŞARISIZ: {(p.stderr or p.stdout).strip()[:200]}")
+        for variants, label in checks:
+            err = ""
+            for opts in variants:
+                p = _run([str(VBOX_EXE), "modifyvm", vm_name] + opts, timeout=20)
+                if p.returncode == 0:
+                    steps.append(label)
+                    break
+                err = (p.stderr or p.stdout).strip()[:200]
+            else:
+                failed.append(f"{label} — BAŞARISIZ: {err}")
         shared = _run([str(VBOX_EXE), "showvminfo", vm_name, "--machinereadable"], timeout=15).stdout
         if "SharedFolderNameMachineMapping" in shared:
             failed.append("VM'de paylaşılan klasör var — VirtualBox ayarlarından kaldırın (zararlı oradan ana bilgisayara ulaşabilir).")

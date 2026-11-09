@@ -58,6 +58,7 @@ DEFAULT_OPTIONS = {
 }
 
 COPY_INTO_SANDBOX_MAX_MB = 1024   # samples above this run directly from the read-only mapped folder
+MONITOR_DEAD_SEC = 180            # no live.json update for this long while observing -> monitor considered killed
 
 JOBS: Dict[str, "Job"] = {}
 JOBS_LOCK = threading.Lock()
@@ -568,8 +569,13 @@ def stage_sandbox(job: Job) -> None:
     if not sbm.WSB_EXE.exists():
         job.stage("sandbox", "unavailable", "Windows Sandbox kapalı. Üstteki 'Windows Sandbox'ı Etkinleştir' butonunu kullanıp bilgisayarı yeniden başlatın.")
         return
+    # Windows Sandbox runs one instance per machine: wait in line instead of failing.
     if not SANDBOX_LOCK.acquire(blocking=False):
-        raise PipelineError("Başka bir analizin sandbox'ı çalışıyor. Bitince tekrar deneyin.")
+        job.stage("sandbox", "queued", "Sırada: başka bir analizin sandbox'ı bitince otomatik başlayacak.")
+        job.log("Sandbox meşgul, sıraya alındı.")
+        while not SANDBOX_LOCK.acquire(timeout=5):
+            pass
+        job.log("Sıra geldi, sandbox hazırlanıyor.")
     try:
         if sbm.sandbox_state() is True:
             raise PipelineError("Açık bir Windows Sandbox penceresi var (aynı anda yalnızca bir tane açılabilir). Kapatıp tekrar deneyin.")
@@ -604,17 +610,40 @@ def stage_sandbox(job: Job) -> None:
         deadline = started + duration + 15 * 60
         done_flag = out / "done.flag"
         misses = 0
+        # Heartbeat: while observing, the monitor rewrites live.json every ~5 s. A sample running as admin can kill the
+        # monitor (anti-analysis); then live.json stops changing and no done.flag ever comes.
+        last_beat, last_beat_t, sample_started_t, max_gap = None, None, None, 0.0
+        job.state["sandbox"].pop("monitor_lost", None)
+        job.state["sandbox"].pop("monitor_max_gap", None)
         while not done_flag.exists():
             time.sleep(4)
+            now = time.time()
             live = _read_json(out / "live.json")
             if live:
                 job.state["sandbox"]["live"] = live
+                beat = (live.get("Updated"), live.get("SecondsLeft"), live.get("Phase"))
+                if beat != last_beat:
+                    if last_beat_t is not None:
+                        max_gap = max(max_gap, now - last_beat_t)
+                    last_beat, last_beat_t = beat, now
+            if sample_started_t is None and _timeline_has(out, ("Sample started", "No runnable file")):
+                sample_started_t = now
             status = (out / "status.txt").read_text(encoding="utf-8", errors="replace").strip() if (out / "status.txt").exists() else ""
             if status:
                 job.state["sandbox"]["status_text"] = status
                 job.state["stages"]["sandbox"]["msg"] = status
+            observing = (live or {}).get("Phase", "observing") == "observing"
+            silent_since = last_beat_t if last_beat_t is not None else sample_started_t
+            if observing and silent_since is not None and now - silent_since > MONITOR_DEAD_SEC:
+                job.state["sandbox"]["monitor_lost"] = {"after_sec": int(now - (sample_started_t or started)),
+                                                        "silent_sec": int(now - silent_since),
+                                                        "last_update": (live or {}).get("Updated")}
+                job.log(f"İzleyici {int(now - silent_since)} sn'dir yanıt vermiyor — örnek izleme scriptini durdurmuş olabilir. "
+                        "O ana kadar toplanan veriler saklandı.")
+                job.save()
+                break
             job.save()
-            if time.time() > deadline:
+            if now > deadline:
                 job.log("Sandbox zaman aşımına uğradı.")
                 break
             if time.time() - started > 90:
@@ -626,18 +655,63 @@ def stage_sandbox(job: Job) -> None:
         live = _read_json(out / "live.json")
         if live:
             job.state["sandbox"]["live"] = live
+        if max_gap > 60:
+            job.state["sandbox"]["monitor_max_gap"] = int(max_gap)
         if not job.opt("keep_sandbox_open"):
             job.log("Sandbox kapatılıyor (içindeki her şey silinir).")
             sbm.stop_sandbox()
+        elif job.state["sandbox"].get("monitor_lost"):
+            job.log("İzleyici durdu; 'kapatma' seçili olmadığı için sandbox açık bırakıldı. İçindekileri ana bilgisayara kopyalamayın.")
+        quarantined = quarantine_output(out)
+        job.state["sandbox"]["quarantined"] = quarantined
+        if quarantined:
+            job.log(f"output klasöründe beklenmeyen {len(quarantined)} dosya karantinaya alındı (.quarantine): {', '.join(quarantined[:10])}")
         beh = _read_json(out / "behavior.json")
         if beh:
             beh.get("Files", {}).pop("NewFilesSample", None)
             job.state["behavior"] = beh
             job.stage("sandbox", "done", f"Tamamlandı. Ağ kaydı: {beh.get('CaptureStatus')}")
+        elif job.state["sandbox"].get("monitor_lost"):
+            job.stage("sandbox", "error", "İzleyici yanıt vermeyi bıraktı (örnek tarafından durdurulmuş olabilir). Son canlı veriler aşağıda.")
         else:
             job.stage("sandbox", "error", "Sandbox davranış raporu (behavior.json) oluşmadı.")
     finally:
         SANDBOX_LOCK.release()
+
+
+# Files the monitor itself writes into output/. Anything else was put there by something inside the sandbox.
+OUTPUT_ALLOWLIST = {"live.json", "behavior.json", "status.txt", "timeline.log", "capture.pcapng", "procmon.pml", "done.flag"}
+
+
+def quarantine_output(out: Path) -> List[str]:
+    """Renames every unexpected file in output/ to *.quarantine and marks it as downloaded from the internet (MOTW),
+    so a double-click cannot run something a sample dropped there."""
+    moved: List[str] = []
+    if not out.exists():
+        return moved
+    for p in sorted(out.rglob("*"), key=lambda x: len(x.parts), reverse=True):
+        if not p.is_file() or (p.parent == out and p.name in OUTPUT_ALLOWLIST) or p.name.endswith(".quarantine"):
+            continue
+        try:
+            target = p.with_name(p.name + ".quarantine")
+            p.rename(target)
+            try:
+                with open(f"{target}:Zone.Identifier", "w", encoding="ascii") as ads:
+                    ads.write("[ZoneTransfer]\r\nZoneId=3\r\n")
+            except OSError:
+                pass
+            moved.append(str(p.relative_to(out)))
+        except OSError:
+            moved.append(f"{p.relative_to(out)} (yeniden adlandırılamadı)")
+    return moved
+
+
+def _timeline_has(out: Path, needles) -> bool:
+    try:
+        text = (out / "timeline.log").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return any(n in text for n in needles)
 
 
 def request_stop(job: Job) -> None:
@@ -734,11 +808,30 @@ def compute_verdict(job: Job) -> None:
         notes.append(f"{inv['hash_mismatch']} dosyanın imzası bozuk (HashMismatch) — orijinal dosya sonradan değiştirilmiş (crack/yama).")
     for st in s.get("static") or []:
         crit = [f["category"] for f in st.get("string_findings", []) if f.get("severity") == "critical"]
-        if crit and (st.get("signature") or {}).get("status") != "Valid":
+        if not crit:
+            continue
+        sig = st.get("signature") or {}
+        if sig.get("status") == "Valid":
+            # Signed does not mean safe (stolen certificates), but embedded browser engines (CEF/Electron) legitimately
+            # contain browser-profile strings, so this stays a note.
+            signer = (sig.get("signer") or "").split(",")[0].replace("CN=", "")
+            notes.append(f"Statik: '{st['rel']}' imzalı ({signer}) ama şu izleri içeriyor: {', '.join(crit)} — "
+                         "gömülü tarayıcı motorlarında normal olabilir; imzalı zararlılar da olur, VT ve sandbox sonucuyla birlikte değerlendirin.")
+        else:
             notes.append(f"Statik: '{st['rel']}' imzasız ve şu izleri içeriyor: {', '.join(crit)}")
 
     b = s.get("behavior")
     live = (s.get("sandbox") or {}).get("live") or {}
+    sbx = s.get("sandbox") or {}
+    if sbx.get("monitor_lost"):
+        ml = sbx["monitor_lost"]
+        red.append(f"Sandbox izleyicisi örnek çalıştırıldıktan ~{ml.get('after_sec')} sn sonra yanıt vermeyi bıraktı "
+                   f"({ml.get('silent_sec')} sn sessizlik) — örnek analiz aracını durdurmuş olabilir (anti-analiz davranışı).")
+    elif sbx.get("monitor_max_gap"):
+        notes.append(f"Sandbox izleyicisi bir ara {sbx['monitor_max_gap']} sn yanıt vermedi (sistem çok yoğun olabilir).")
+    if sbx.get("quarantined"):
+        red.append(f"Sandbox içinden analiz klasörüne beklenmeyen {len(sbx['quarantined'])} dosya yazıldı (karantinaya alındı): "
+                   + ", ".join(sbx["quarantined"][:5]))
     lan = (b or {}).get("LanBlock") or live.get("LanBlock") or {}
     if lan.get("Tampered"):
         red.append("Yerel ağ engeli sandbox içinde kaldırıldı/kapatıldı — örnek ağ korumasını devre dışı bırakmaya çalıştı: "
@@ -858,8 +951,28 @@ def write_report(job: Job) -> None:
 
 
 # ======================================================================== downloads watcher
+def _file_in_use(path: Path) -> bool:
+    """True if another process still has the file open (e.g. a downloader writing to it).
+    Opening with share mode 0 fails with ERROR_SHARING_VIOLATION while any other handle is open."""
+    if os.name != "nt":
+        return False
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    GENERIC_READ, OPEN_EXISTING, INVALID = 0x80000000, 3, wintypes.HANDLE(-1).value
+    h = k32.CreateFileW(str(path), GENERIC_READ, 0, None, OPEN_EXISTING, 0, None)
+    if h == INVALID:
+        return ctypes.get_last_error() in (32, 33)   # sharing / lock violation
+    k32.CloseHandle(h)
+    return False
+
+
+
 class DownloadWatcher:
     IGNORE = (".crdownload", ".part", ".partial", ".tmp", ".download", ".opdownload", ".!ut")
+    STABLE_POLLS = 3   # 3 polls x 5 s with an unchanged size
     SETTINGS = BASE_DIR / "watch.json"
 
     def __init__(self):
@@ -905,15 +1018,17 @@ class DownloadWatcher:
                         key = str(p)
                         if any(f["path"] == key for f in self.found):
                             continue
-                        if self._seen.get(key) == st.st_size and st.st_size > 0:   # size stable for one poll -> download finished
+                        prev_size, stable = self._seen.get(key, (None, 0))
+                        stable = stable + 1 if prev_size == st.st_size and st.st_size > 0 else 0
+                        self._seen[key] = (st.st_size, stable)
+                        # finished = same size for STABLE_POLLS polls in a row AND no other process holds the file open
+                        if stable >= self.STABLE_POLLS and not _file_in_use(p):
                             later_part = bool(re.search(r"\.(part0*([2-9]|\d{2,})\.rar|r\d\d|0*([2-9]|\d{2,})\d*)$", p.name, re.I)) and not p.name.lower().endswith(".001")
                             item = {"path": key, "name": p.name, "size": st.st_size, "time": _now(), "job": None, "later_part": later_part}
                             self.found.append(item)
                             if self.auto_start and not later_part:
                                 job = create_job(key, {"run_sandbox": False})
                                 item["job"] = job.id
-                        else:
-                            self._seen[key] = st.st_size
             except Exception:
                 traceback.print_exc()
 

@@ -292,7 +292,8 @@ def analyze_single_file(file_path: str, sig_info: Optional[Dict[str, Any]] = Non
         risk_score += 20
         risk_reasons.append(f"Dosya geçerli bir dijital imzaya sahip değil (Durum: {sig_status}).")
     else:
-        risk_reasons.append(f"Geçerli dijital imza mevcut: {sig_info.get('signer', '')}")
+        # A valid signature is information, not evidence of safety: stealers are often signed with stolen/bought certificates.
+        risk_reasons.append(f"Geçerli dijital imza: {sig_info.get('signer', '')} (imza zararsızlık kanıtı değildir; risk puanını düşürmez)")
 
     if path_obj.name.lower() in SUSPICIOUS_FILENAMES and sig_status != "Valid":
         risk_score += 25
@@ -316,17 +317,13 @@ def analyze_single_file(file_path: str, sig_info: Optional[Dict[str, Any]] = Non
             risk_score += 18
         risk_reasons.append(f"{finding['category']}: {', '.join(finding['matches'][:4])}")
 
-    if sig_status == "Valid" and risk_score < 40:
-        # Trusted signed binaries often import standard APIs legitimately
-        risk_score = max(0, risk_score - 25)
-
     risk_score = min(100, risk_score)
     if risk_score >= 65:
         risk_level = "YÜKSEK RİSK (Tehlikeli / Şüpheli)"
     elif risk_score >= 35:
         risk_level = "ORTA RİSK (İnceleme & Sandbox Şart)"
     else:
-        risk_level = "DÜŞÜK RİSK (Statik İncelemede Temiz/İmzalı)"
+        risk_level = "DÜŞÜK RİSK (statik incelemede belirgin iz yok)"
 
     return {
         "file_name": path_obj.name,
