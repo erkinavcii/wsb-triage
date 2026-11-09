@@ -1,0 +1,34 @@
+# Kimlik ve Yapılandırma Bilgileri
+config.json
+watch.json
+
+# Analiz Örnekleri, Yüklenen Dosyalar ve Oturumlar (Malware & Kişisel Veri Güvenliği)
+cases/
+uploads/
+sandbox_sessions/
+demo_supheli_paket/
+
+# Eski komut satırı sürümü (panel onun yerini aldı) ve dağıtılamayan üçüncü taraf araçlar
+SandboxAnaliz/
+sandbox/Procmon*.exe
+
+# PowerShell ve Geçici Dosyalar
+*.tmp
+*.log
+*.pcapng
+*.etl
+*.pml
+_sigcheck*
+
+# Python Çıktıları
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Sanal Ortamlar ve IDE Dosyaları
+.venv/
+venv/
+ENV/
+.vscode/
+.idea/
+.claude/
