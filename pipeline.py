@@ -58,6 +58,10 @@ DEFAULT_OPTIONS = {
 }
 
 COPY_INTO_SANDBOX_MAX_MB = 1024   # samples above this run directly from the read-only mapped folder
+MAX_UNPACK_RATIO = 1000            # unpacked/packed above this (and > 1 GB) = zip bomb
+DISK_RESERVE_BYTES = 2 * 1024 ** 3  # keep this much free when extracting
+TSHARK_TIMEOUT_SEC = 300          # per tshark query; a timeout gives a partial network summary, not a failed analysis
+SIGCHECK_BATCH = 500              # files per Authenticode check run
 MONITOR_DEAD_SEC = 180            # no live.json update for this long while observing -> monitor considered killed
 
 JOBS: Dict[str, "Job"] = {}
@@ -264,8 +268,17 @@ def run_job(job: Job) -> None:
 
 
 def start_sandbox_later(job: Job) -> None:
-    def _run():
+    # Check-and-set under the job lock: a double click, or a click while the job is queued/running, must not start a
+    # second sandbox thread on the same case folder.
+    with job.lock:
+        if job.state["status"] == "running" or job.state["stages"]["sandbox"]["status"] in ("running", "queued"):
+            raise PipelineError("Bu analiz zaten çalışıyor ya da sandbox sırasında bekliyor.")
         job.state["status"] = "running"
+        job.state["stages"]["sandbox"]["status"] = "queued"
+        job.state["stages"]["sandbox"]["msg"] = "Başlatılıyor..."
+    job.save()
+
+    def _run():
         try:
             stage_sandbox(job)
             stage_report(job)
@@ -290,9 +303,38 @@ def _seven_zip_version(exe: str) -> Optional[float]:
         return None
 
 
+def _check_unpacked_size(job: Job, total: int, src: Path) -> None:
+    """Refuse archives that would fill the disk (zip bombs, or simply too big for the free space)."""
+    packed = max(1, _archive_set_size(src))
+    free = shutil.disk_usage(job.case_dir).free
+    gb = lambda n: f"{n / 1024 ** 3:.1f} GB" if n >= 1024 ** 3 else f"{n / 1024 ** 2:.1f} MB"  # noqa: E731
+    if total > MAX_UNPACK_RATIO * packed and total > 1024 ** 3:
+        raise PipelineError(f"Arşiv açılınca {gb(total)} olacak ama kendisi {gb(packed)} ({total // packed}x). "
+                            "Bu bir zip bombası olabilir, açılmadı.")
+    if total + DISK_RESERVE_BYTES > free:
+        raise PipelineError(f"Arşiv açılınca {gb(total)} olacak, diskte {gb(free)} boş alan var "
+                            f"({gb(DISK_RESERVE_BYTES)} pay bırakılıyor). Yer açıp tekrar deneyin.")
+    job.log(f"Arşiv açılınca yaklaşık {gb(total)} olacak; diskte {gb(free)} boş alan var.")
+
+
+def _archive_set_size(src: Path) -> int:
+    """Size of the archive including all volumes of a multi-part set."""
+    name = src.name
+    for rx in (r"^(.*\.part)\d+(\.rar)$", r"^(.*)\.\d{3}$"):
+        m = re.match(rx, name, re.I)
+        if m:
+            stem = re.escape(m.group(1))
+            pat = re.compile(stem + (r"\d+" + re.escape(m.group(2)) if m.lastindex == 2 else r"\.\d{3}") + "$", re.I)
+            return sum(p.stat().st_size for p in src.parent.iterdir() if p.is_file() and pat.match(p.name))
+    return src.stat().st_size
+
+
 def stage_extract(job: Job) -> None:
     job.stage("extract", "running", "Hazırlanıyor...")
     src = Path(job.state["sample"])
+    if src.is_file() and is_later_volume(src.name):
+        raise PipelineError(f"'{src.name}' çok parçalı bir arşivin ara parçası. İlk parçayı (.part1.rar / .001 / .rar) seçin; "
+                            "diğer parçalar aynı klasörden otomatik okunur.")
     is_archive = src.is_file() and (src.suffix.lower() in ARCHIVE_EXT or re.search(r"\.part0*1\.rar$", src.name, re.I))
     if src.is_dir():
         home = Path.home().resolve()
@@ -316,6 +358,12 @@ def stage_extract(job: Job) -> None:
             ver = _seven_zip_version(sz)
             if ver is not None and ver < 25.0:
                 job.log(f"UYARI: 7-Zip {ver} eski. 25.00 öncesi sürümlerde arşiv yol aşımı açıkları var (CVE-2025-11001/11002); güncelleyin.")
+            job.stage("extract", "running", "Arşiv içeriği listeleniyor...")
+            lp = subprocess.run([sz, "l", "-slt", f"-p{pw or 'no-password'}", str(src)], capture_output=True,
+                                text=True, timeout=600, errors="replace", creationflags=NO_WINDOW)
+            if lp.returncode == 0:   # if listing fails (e.g. encrypted headers, wrong password) extraction reports why
+                body = lp.stdout.split("\n----------", 1)[-1]
+                _check_unpacked_size(job, sum(int(x) for x in re.findall(r"^Size = (\d+)", body, re.M)), src)
             job.stage("extract", "running", "7-Zip ile açılıyor (hiçbir şey çalıştırılmıyor)...")
             p = subprocess.run([sz, "x", "-y", f"-p{pw or 'no-password'}", f"-o{inp}", str(src)], capture_output=True,
                                text=True, timeout=7200, errors="replace", creationflags=NO_WINDOW)
@@ -334,6 +382,7 @@ def stage_extract(job: Job) -> None:
                     dest = (root / name).resolve()
                     if dest != root and root not in dest.parents:
                         raise PipelineError(f"Arşivde klasör dışına yazmaya çalışan dosya yolu var: {name}")
+                _check_unpacked_size(job, sum(i.file_size for i in zf.infolist()), src)
                 zf.extractall(inp, pwd=pw.encode() if pw else None)
         else:
             raise PipelineError(f"{src.suffix} arşivini açmak için 7-Zip gerekli (https://www.7-zip.org, 25.01+). Kurup tekrar deneyin.")
@@ -362,21 +411,38 @@ foreach ($p in [IO.File]::ReadAllLines($ListFile)) {
 """
 
 
-def check_signatures(case_dir: Path, paths: List[str]) -> Dict[str, Dict[str, str]]:
+def check_signatures(case_dir: Path, paths: List[str], progress=None):
+    """Authenticode check in batches -> (results by path, number of files whose batch timed out).
+    A batch that times out (huge installers, busy disk) leaves its files 'Unknown' instead of failing the analysis."""
+    res: Dict[str, Dict[str, str]] = {}
     if not paths:
-        return {}
+        return res, 0
     ps1, lst, out = case_dir / "_sigcheck.ps1", case_dir / "_sigcheck_in.txt", case_dir / "_sigcheck_out.json"
     ps1.write_text(SIGCHECK_PS1, encoding="utf-8")
-    lst.write_text("\n".join(paths), encoding="utf-8-sig")
-    subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps1), "-ListFile", str(lst), "-OutFile", str(out)],
-                   capture_output=True, timeout=max(120, len(paths) // 5), creationflags=NO_WINDOW)
-    res: Dict[str, Dict[str, str]] = {}
-    for item in _read_json(out) or []:
-        res[item["Path"]] = {"status": item.get("Status") or "Unknown", "message": item.get("Message") or "",
-                             "signer": item.get("Signer") or "", "issuer": item.get("Issuer") or ""}
-    for f in (ps1, lst, out):
-        f.unlink(missing_ok=True)
-    return res
+    timed_out = 0
+    try:
+        for start in range(0, len(paths), SIGCHECK_BATCH):
+            batch = paths[start:start + SIGCHECK_BATCH]
+            if progress:
+                progress(start, len(paths))
+            lst.write_text("\n".join(batch), encoding="utf-8-sig")
+            out.unlink(missing_ok=True)
+            try:
+                subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps1), "-ListFile", str(lst), "-OutFile", str(out)],
+                               capture_output=True, timeout=max(120, len(batch) // 2), creationflags=NO_WINDOW)
+            except subprocess.TimeoutExpired:
+                timed_out += len(batch)
+                continue
+            for item in _read_json(out) or []:
+                res[item["Path"]] = {"status": item.get("Status") or "Unknown", "message": item.get("Message") or "",
+                                     "signer": item.get("Signer") or "", "issuer": item.get("Issuer") or ""}
+    finally:
+        for f in (ps1, lst, out):
+            f.unlink(missing_ok=True)
+    for p in paths:
+        res.setdefault(p, {"status": "Unknown", "message": "imza kontrolü zaman aşımına uğradı" if timed_out else "kontrol edilemedi",
+                           "signer": "", "issuer": ""})
+    return res, timed_out
 
 
 def _sha256(path: Path) -> str:
@@ -412,7 +478,10 @@ def stage_inventory(job: Job) -> None:
 
     to_sign = [r["path"] for r in items if (r["is_pe"] or r["is_script"]) and not r["missing"]]
     job.stage("inventory", "running", f"{len(to_sign)} dosyanın dijital imzası kontrol ediliyor...")
-    sigs = check_signatures(job.case_dir, to_sign)
+    sigs, sig_timeouts = check_signatures(
+        job.case_dir, to_sign, lambda done, total: job.stage("inventory", "running", f"Dijital imza: {done} / {total} dosya"))
+    if sig_timeouts:
+        job.log(f"UYARI: {sig_timeouts} dosyanın imza kontrolü zaman aşımına uğradı; bunlar 'Unknown' (imzasız gibi) sayıldı.")
     for r in items:
         if r["path"] in sigs:
             r["sig"] = sigs[r["path"]]
@@ -531,7 +600,11 @@ def stage_vt(job: Job) -> None:
                                       "gui_url": f"https://www.virustotal.com/gui/file/{r['sha256']}"} for r in picks]
     job.state["vt"] = entries
     unknown: List[int] = []
+    quota = False                       # once the quota is used up, every further call is pointless
     for i, (r, e) in enumerate(zip(picks, entries)):
+        if quota:
+            e["status"] = "Sorgulanmadı (VirusTotal kotası doldu)"
+            continue
         job.stage("vt", "running", f"1/3 Hash sorgusu ({i + 1}/{len(picks)}): {r['rel']} — ücretsiz API dakikada 4 istek kabul eder")
         try:
             e["result"] = vt_client.lookup(r["sha256"], key)
@@ -546,6 +619,9 @@ def stage_vt(job: Job) -> None:
             else:
                 e["status"] = "VT'de yok — yüklenecek"
                 unknown.append(i)
+        except vt_client.VtQuotaError:
+            quota = True
+            e["status"] = "Sorgulanmadı (VirusTotal kotası doldu)"
         except Exception as ex:
             e["status"] = f"Hata: {ex}"
         compute_verdict(job)
@@ -554,16 +630,22 @@ def stage_vt(job: Job) -> None:
     pending: Dict[int, str] = {}
     for n, i in enumerate(unknown, 1):
         r, e = picks[i], entries[i]
+        if quota:
+            e["status"] = "VT'de yok — yüklenmedi (kota doldu)"
+            continue
         job.stage("vt", "running", f"2/3 Yükleniyor ({n}/{len(unknown)}): {r['rel']} ({r['size'] / 1048576:.1f} MB)")
         try:
             pending[i] = vt_client.upload(r["path"], key)
             e["status"] = "Yüklendi — taranıyor"
+        except vt_client.VtQuotaError:
+            quota = True
+            e["status"] = "VT'de yok — yüklenmedi (kota doldu)"
         except Exception as ex:
             e["status"] = f"Yükleme hatası: {ex}"
         job.save()
 
     deadline = time.time() + 10 * 60
-    while pending and time.time() < deadline:
+    while pending and time.time() < deadline and not quota:
         for i, aid in list(pending.items()):
             job.stage("vt", "running", f"3/3 VirusTotal taramaları bekleniyor ({len(pending)} dosya kaldı): {picks[i]['rel']}")
             try:
@@ -573,15 +655,23 @@ def stage_vt(job: Job) -> None:
                     del pending[i]
                     compute_verdict(job)
                     job.save()
+            except vt_client.VtQuotaError:
+                quota = True
+                break
             except Exception as ex:
                 entries[i]["status"] = f"Hata: {ex}"
                 del pending[i]
             if time.time() >= deadline:
                 break
     for i in pending:
-        entries[i]["status"] = "Yüklendi, tarama hâlâ sırada (VT linkinden sonra bakın)"
+        entries[i]["status"] = "Yüklendi, tarama sonucu alınamadı (VT linkinden sonra bakın)"
     flagged = sum(1 for e in job.state["vt"] if e["result"] and e["result"]["stats"]["malicious"] > 0)
-    job.stage("vt", "done", f"{len(picks)} dosya sorgulandı, {flagged} tanesi en az bir motor tarafından işaretlendi.")
+    if quota:
+        job.log(vt_client.QUOTA_MSG)
+        job.stage("vt", "done", f"Kota doldu: {sum(1 for e in entries if e['result'])} / {len(picks)} dosya sorgulanabildi, "
+                                f"{flagged} tanesi işaretlendi. Kalanlar yarın tekrar denenebilir.")
+    else:
+        job.stage("vt", "done", f"{len(picks)} dosya sorgulandı, {flagged} tanesi en az bir motor tarafından işaretlendi.")
 
 
 # ======================================================================== 5. sandbox
@@ -793,30 +883,58 @@ def request_stop(job: Job) -> None:
 
 
 # ======================================================================== 6. network + report
-NOISE = ("microsoft.com", "windowsupdate.com", "windows.com", "windows.net", "msftconnecttest.com", "msftncsi.com", "live.com",
+# Domains only Microsoft itself uses (pure background noise of a fresh Windows).
+NOISE = ("microsoft.com", "windowsupdate.com", "windows.com", "msftconnecttest.com", "msftncsi.com", "live.com",
          "live.net", "bing.com", "bing.net", "msn.com", "office.com", "office.net", "office365.com", "microsoftonline.com", "msedge.net",
-         "azureedge.net", "azurefd.net", "trafficmanager.net", "akamaized.net", "akamaiedge.net", "akadns.net", "digicert.com",
-         "verisign.com", "sectigo.com", "globalsign.com", "lencr.org", "msocsp.com", "skype.com", "xboxlive.com", "microsoftstore.com",
-         "onestore.ms", "aka.ms", "msauth.net", "msftauth.net", "gfx.ms", "sfx.ms")
+         "akadns.net", "digicert.com", "verisign.com", "sectigo.com", "globalsign.com", "lencr.org", "msocsp.com", "skype.com",
+         "xboxlive.com", "microsoftstore.com", "onestore.ms", "aka.ms", "msauth.net", "msftauth.net", "gfx.ms", "sfx.ms",
+         "login.windows.net", "graph.windows.net", "delivery.mp.microsoft.com")
 ADOBE = ("adobe.com", "adobe.io", "adobelogin.com", "adobess.com", "adobedtm.com", "typekit.net", "behance.net", "adobecc.com", "adobe.net", "omtrdc.net")
+# Infrastructure anyone can rent: Windows uses some of it too, but so does malware (e.g. data sent to *.blob.core.windows.net).
+SHARED_CLOUD = ("windows.net", "azureedge.net", "azurefd.net", "trafficmanager.net", "azurewebsites.net", "cloudapp.azure.com",
+                "akamaized.net", "akamaiedge.net", "akamaihd.net", "edgekey.net", "edgesuite.net", "amazonaws.com", "cloudfront.net",
+                "googleusercontent.com", "storage.googleapis.com", "appspot.com", "firebaseio.com", "firebasestorage.googleapis.com",
+                "digitaloceanspaces.com", "r2.dev", "herokuapp.com", "vercel.app", "netlify.app", "github.io", "fastly.net",
+                "b-cdn.net", "backblazeb2.com")
+# Services that cracked installers have no business talking to, and that stealers/loaders use all the time:
+# C2 over chat APIs, paste sites, tunnels, dynamic DNS, anonymous file drops, and "what is my IP" lookups.
+ABUSED = ("api.telegram.org", "t.me", "discord.com", "discordapp.com", "discordapp.net", "pastebin.com", "paste.ee", "hastebin.com",
+          "rentry.co", "raw.githubusercontent.com", "gist.githubusercontent.com", "ngrok.io", "ngrok-free.app", "ngrok.app",
+          "trycloudflare.com", "workers.dev", "duckdns.org", "no-ip.com", "ddns.net", "hopto.org", "zapto.org", "sytes.net",
+          "serveo.net", "transfer.sh", "file.io", "gofile.io", "catbox.moe", "anonfiles.com", "temp.sh", "bashupload.com",
+          "api.ipify.org", "ipify.org", "ip-api.com", "ipinfo.io", "icanhazip.com", "checkip.amazonaws.com", "ifconfig.me",
+          "myexternalip.com", "ipwho.is", "ipapi.co", "wtfismyip.com", "freegeoip.app")
+
+CLASS_ABUSED = "KÖTÜYE KULLANIMA AÇIK SERVİS — incele"
+CLASS_CLOUD = "Paylaşımlı bulut / CDN — incele"
+CLASS_UNKNOWN = "BİLİNMEYEN — incele"
+
+
+def _match(d: str, suffixes) -> bool:
+    return any(d == s or d.endswith("." + s) for s in suffixes)
 
 
 def domain_class(d: str) -> str:
     d = (d or "").lower().rstrip(".")
-    if any(d == s or d.endswith("." + s) for s in ADOBE):
+    if _match(d, ABUSED):
+        return CLASS_ABUSED
+    if _match(d, ADOBE):
         return "Adobe"
-    if any(d == s or d.endswith("." + s) for s in NOISE):
+    if _match(d, NOISE):
         return "Windows/Microsoft (gürültü)"
+    if _match(d, SHARED_CLOUD):
+        return CLASS_CLOUD
     if d.endswith((".arpa", ".local")) or d == "wpad":
         return "Yerel (gürültü)"
-    return "BİLİNMEYEN — incele"
+    return CLASS_UNKNOWN
 
 
 def _tshark_fields(tshark: str, pcap: Path, flt: str, fields: List[str]) -> List[List[str]]:
+    """Raises subprocess.TimeoutExpired on very large captures; network_summary() turns that into a partial result."""
     args = [tshark, "-r", str(pcap), "-Y", flt, "-T", "fields", "-E", "separator=|"]
     for f in fields:
         args += ["-e", f]
-    p = subprocess.run(args, capture_output=True, text=True, timeout=600, errors="replace", creationflags=NO_WINDOW)
+    p = subprocess.run(args, capture_output=True, text=True, timeout=TSHARK_TIMEOUT_SEC, errors="replace", creationflags=NO_WINDOW)
     return [line.split("|") for line in p.stdout.splitlines() if line.strip("|").strip()]
 
 
@@ -832,10 +950,19 @@ def network_summary(pcap: Path) -> Optional[Dict[str, Any]]:
     tshark = sbm.tshark_path()
     if not tshark or not pcap.exists():
         return None
-    dns = [n for row in _tshark_fields(tshark, pcap, "dns.flags.response == 0", ["dns.qry.name"]) for n in row[0].split(",")]
-    sni = [row[0] for row in _tshark_fields(tshark, pcap, "tls.handshake.type == 1", ["tls.handshake.extensions_server_name"])]
-    http = _tshark_fields(tshark, pcap, "http.request", ["http.host", "http.request.method", "http.request.uri"])
-    syn = _tshark_fields(tshark, pcap, "tcp.flags.syn == 1 && tcp.flags.ack == 0", ["ip.dst", "ipv6.dst", "tcp.dstport"])
+    failed: List[str] = []
+
+    def q(label, flt, fields):
+        try:
+            return _tshark_fields(tshark, pcap, flt, fields)
+        except (subprocess.TimeoutExpired, OSError):
+            failed.append(label)
+            return []
+
+    dns = [n for row in q("DNS", "dns.flags.response == 0", ["dns.qry.name"]) for n in row[0].split(",")]
+    sni = [row[0] for row in q("TLS SNI", "tls.handshake.type == 1", ["tls.handshake.extensions_server_name"])]
+    http = q("HTTP", "http.request", ["http.host", "http.request.method", "http.request.uri"])
+    syn = q("TCP", "tcp.flags.syn == 1 && tcp.flags.ack == 0", ["ip.dst", "ipv6.dst", "tcp.dstport"])
     targets: Dict[str, int] = {}
     for row in syn:
         row += [""] * (3 - len(row))
@@ -849,7 +976,8 @@ def network_summary(pcap: Path) -> Optional[Dict[str, Any]]:
             seen.add(k)
             http_rows.append({"host": row[0], "method": row[1], "uri": row[2][:200], "class": domain_class(row[0])})
     return {"dns": _count(dns), "sni": _count(sni), "http": http_rows[:200],
-            "tcp_targets": [{"target": k, "count": v} for k, v in sorted(targets.items(), key=lambda kv: -kv[1])[:100]]}
+            "tcp_targets": [{"target": k, "count": v} for k, v in sorted(targets.items(), key=lambda kv: -kv[1])[:100]],
+            "partial": failed}
 
 
 SEVERE_RX = re.compile(r"trojan|stealer|backdoor|\brat\b|miner|coinmin|xmrig|redline|lumma|vidar|raccoon|stealc|agenttesla|remcos|njrat|asyncrat|dropper|downloader|ransom|spyware|banker|infostealer", re.I)
@@ -951,9 +1079,17 @@ def compute_verdict(job: Job) -> None:
             red.append(f"Canlı: {live['SuspiciousCount']} şüpheli komut satırı.")
     net = s.get("network")
     if net:
-        unk = sorted({d["name"] for d in (net.get("dns") or []) + (net.get("sni") or []) if d["class"].startswith("BİLİNMEYEN")})
+        names = (net.get("dns") or []) + (net.get("sni") or []) + [{"name": h["host"], "class": h["class"]} for h in net.get("http") or []]
+        by_class = lambda c: sorted({d["name"] for d in names if d.get("class") == c and d.get("name")})  # noqa: E731
+        abused, cloud, unk = by_class(CLASS_ABUSED), by_class(CLASS_CLOUD), by_class(CLASS_UNKNOWN)
+        if abused:
+            red.append(f"Zararlıların sık kullandığı servislerle iletişim (sohbet API'si, paste sitesi, tünel, IP sorgulama...): {', '.join(abused[:10])}")
         if unk:
             notes.append(f"{len(unk)} bilinmeyen (Microsoft/Adobe dışı) alan adıyla iletişim: {', '.join(unk[:10])}")
+        if cloud:
+            notes.append(f"{len(cloud)} paylaşımlı bulut/CDN adresi (Windows'un kendi trafiği de olabilir, zararlılar da kullanır): {', '.join(cloud[:8])}")
+        if net.get("partial"):
+            notes.append(f"Ağ özeti kısmi: {', '.join(net['partial'])} sorgusu zaman aşımına uğradı (kayıt çok büyük). Tamamı için kaydı Wireshark'ta açın.")
     level = "red" if red else ("yellow" if notes else ("green" if s["stages"]["vt"]["status"] == "done" or b else "pending"))
     s["verdict"] = {"level": level, "red": red, "notes": notes}
 
@@ -1043,6 +1179,21 @@ def _file_in_use(path: Path) -> bool:
 
 
 
+def is_later_volume(name: str) -> bool:
+    """True for the 2nd+ volume of a multi-part archive (analysing those alone is pointless; part 1 pulls them in).
+    name.part1.rar / .part01.rar / .part001.rar and name.001 are the first volume; .r00, .r01 ... follow a name.rar."""
+    n = name.lower()
+    m = re.search(r"\.part(\d+)\.rar$", n)
+    if m:
+        return int(m.group(1)) > 1
+    if re.search(r"\.r\d{2}$", n):
+        return True
+    m = re.search(r"\.(\d{3})$", n)          # 7-Zip / HJSplit style: .001, .002 ...
+    if m:
+        return int(m.group(1)) > 1
+    return False
+
+
 class DownloadWatcher:
     IGNORE = (".crdownload", ".part", ".partial", ".tmp", ".download", ".opdownload", ".!ut")
     STABLE_POLLS = 3   # 3 polls x 5 s with an unchanged size
@@ -1054,20 +1205,33 @@ class DownloadWatcher:
         self.enabled = bool(cfg.get("enabled", False))
         self.auto_start = bool(cfg.get("auto_start", False))
         self.found: List[Dict[str, Any]] = []
-        self._seen: Dict[str, int] = {}
-        self._since = time.time()
+        self._seen: Dict[str, Any] = {}
+        self._baseline: Dict[str, Any] = {}
         self._lock = threading.Lock()
+        if self.enabled:
+            self._take_baseline()
         threading.Thread(target=self._loop, daemon=True, name="download-watcher").start()
+
+    def _take_baseline(self) -> None:
+        """Files already in the folder when watching starts are not 'new'. Anything that appears later - downloaded,
+        moved or copied in, whatever its modification date - is. A baseline file that changes (size/mtime) counts as new."""
+        self._baseline = {}
+        try:
+            for p in Path(self.folder).iterdir():
+                if p.is_file():
+                    st = p.stat()
+                    self._baseline[str(p)] = (st.st_size, st.st_mtime_ns)
+        except OSError:
+            pass
+        self._seen.clear()
 
     def configure(self, folder: Optional[str], enabled: bool, auto_start: bool) -> Dict[str, Any]:
         with self._lock:
+            changed_folder = bool(folder and Path(folder).is_dir() and folder != self.folder)
             if folder and Path(folder).is_dir():
-                if folder != self.folder:
-                    self._seen.clear()
                 self.folder = folder
-            if enabled and not self.enabled:
-                self._since = time.time()
-                self._seen.clear()
+            if (enabled and not self.enabled) or (enabled and changed_folder):
+                self._take_baseline()
             self.enabled, self.auto_start = enabled, auto_start
             _write_json(self.SETTINGS, {"folder": self.folder, "enabled": self.enabled, "auto_start": self.auto_start})
         return self.status()
@@ -1086,9 +1250,9 @@ class DownloadWatcher:
                         if not p.is_file() or p.name.lower().endswith(self.IGNORE):
                             continue
                         st = p.stat()
-                        if st.st_mtime < self._since:
-                            continue
                         key = str(p)
+                        if self._baseline.get(key) == (st.st_size, st.st_mtime_ns):
+                            continue
                         if any(f["path"] == key for f in self.found):
                             continue
                         prev_size, stable = self._seen.get(key, (None, 0))
@@ -1096,7 +1260,7 @@ class DownloadWatcher:
                         self._seen[key] = (st.st_size, stable)
                         # finished = same size for STABLE_POLLS polls in a row AND no other process holds the file open
                         if stable >= self.STABLE_POLLS and not _file_in_use(p):
-                            later_part = bool(re.search(r"\.(part0*([2-9]|\d{2,})\.rar|r\d\d|0*([2-9]|\d{2,})\d*)$", p.name, re.I)) and not p.name.lower().endswith(".001")
+                            later_part = is_later_volume(p.name)
                             item = {"path": key, "name": p.name, "size": st.st_size, "time": _now(), "job": None, "later_part": later_part}
                             self.found.append(item)
                             if self.auto_start and not later_part:

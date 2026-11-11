@@ -27,6 +27,13 @@ class VtError(Exception):
     pass
 
 
+class VtQuotaError(VtError):
+    """Quota used up (free API: 500 requests/day). Retrying now is pointless."""
+
+
+QUOTA_MSG = "VirusTotal kotası doldu (ücretsiz hesap: günde 500 istek). Kalan dosyalar sorgulanmadı; yarın tekrar deneyin."
+
+
 # ------------------------------------------------------------------ config / key
 def load_config() -> Dict[str, Any]:
     if CONFIG_PATH.exists():
@@ -74,21 +81,25 @@ def _throttle() -> None:
 
 
 def _get(url: str, key: str) -> Optional[Dict[str, Any]]:
-    """GET with throttling and 429 retry. Returns None on 404."""
-    for _ in range(4):
+    """GET with throttling. Returns None on 404.
+    429: wait once for the per-minute window; a second 429 right after means the daily/monthly quota is used up,
+    so stop instead of burning minutes per file."""
+    for attempt in range(2):
         _throttle()
         resp = requests.get(url, headers={"x-apikey": key, "Accept": "application/json"}, timeout=30)
         if resp.status_code == 404:
             return None
         if resp.status_code == 429:
-            time.sleep(60)
-            continue
+            if attempt == 0:
+                time.sleep(60)
+                continue
+            raise VtQuotaError(QUOTA_MSG)
         if resp.status_code == 401:
             raise VtError("Geçersiz VirusTotal API anahtarı (HTTP 401).")
         if resp.status_code != 200:
             raise VtError(f"VirusTotal HTTP {resp.status_code}")
         return resp.json()
-    raise VtError("VirusTotal kota sınırı aşıldı (429), daha sonra tekrar deneyin.")
+    raise VtQuotaError(QUOTA_MSG)
 
 
 def summarize(data: Dict[str, Any], sha256: str) -> Dict[str, Any]:
@@ -148,6 +159,8 @@ def upload(file_path: str, key: Optional[str] = None) -> str:
     _throttle()
     with open(file_path, "rb") as f:
         resp = requests.post(url, headers={"x-apikey": key}, files={"file": (Path(file_path).name, f)}, timeout=3600)
+    if resp.status_code == 429:
+        raise VtQuotaError(QUOTA_MSG)
     if resp.status_code not in (200, 201):
         raise VtError(f"Yükleme hatası HTTP {resp.status_code}: {resp.text[:200]}")
     return resp.json().get("data", {}).get("id", "")

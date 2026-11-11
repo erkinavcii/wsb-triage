@@ -37,37 +37,49 @@ Bu belge kodun tamamı okunarak hazırlandı. "Doğrulandı" yazan maddeler kodd
 - **Sorun:** Paneldeki hemen her değer güvenli gösteriliyor, biri hariç. `behavior.json` içindeki `Files.NewCount` değeri başlığa olduğu gibi yazılıyor. Bu dosyayı sandbox içindeki program yazabilir. Sayı yerine HTML koyarsa panelde JavaScript çalışır (XSS). Panel kendi API'sine tam erişimli olduğu için bu kod izleyiciyi Belgeler klasörüne çevirebilir, VirusTotal anahtarını değiştirebilir, yeni analiz başlatabilir.
 - **Düzeltme:** `listBox` başlığı da `esc()` ile gösterilsin, `NewCount` sayıya çevrilsin. Ek katman olarak sunucu, sandbox'tan gelen JSON'u okurken alanların türünü doğrulasın (sayı beklenen yerde sayı).
 
-### A3. Çok parçalı arşivlerde ilk parça atlanıyor (orta, doğrulandı)
+### A3. Çok parçalı arşivlerde ilk parça atlanıyor (orta) — ✅ DÜZELTİLDİ
+
+> **Düzeltme:** `is_later_volume()` parça numarasını sayıya çeviriyor; `.part01.rar`, `.part001.rar`, `.001` ilk parça, `setup.2024` gibi adlar parça değil. Panelden elle bir ara parça seçilirse açık bir hata mesajı veriliyor. Test: 15 ad doğru sınıflandı.
 
 - **Nerede:** `pipeline.py`, izleyicideki `later_part` deseni
 - **Sorun:** `.part01.rar` ve `.part001.rar` "sonraki parça" sayılıyor, yani otomatik analiz hiç başlamıyor. 10 ve üzeri parçalı arşivlerde ilk parçanın adı tam olarak böyle olur. Aynı desen `setup.2024` ya da `app-1.2.10` gibi sayıyla biten adları da yanlışlıkla parça sayıyor.
 - **Düzeltme:** Parça numarasını sayıya çevirip 1'den büyük mü diye bakmak. Sayısal uzantı kuralı yalnızca `.002`, `.003` gibi üç haneli uzantılara uygulanmalı.
 
-### A4. Klasöre taşınan dosyalar izleyicide görünmüyor (orta, doğrulandı)
+### A4. Klasöre taşınan dosyalar izleyicide görünmüyor (orta) — ✅ DÜZELTİLDİ
+
+> **Düzeltme:** İzleme açılınca klasörün listesi (boyut + değiştirilme zamanı) alınıyor; sonradan beliren ya da değişen her dosya yeni sayılıyor. Test: 2000 tarihli taşınmış dosya ve üzerine yazılmış eski dosya listelendi.
 
 - **Nerede:** `pipeline.py:1016`
 - **Sorun:** İzleyici "yeni dosya"yı değiştirilme tarihine göre belirliyor. Başka klasörden taşınan ya da sunucudaki tarihini koruyan bir indirme eski tarihli görünür ve hiç listelenmez.
 - **Düzeltme:** İzleme açıldığı anda klasördeki dosyaların listesini almak, sonradan beliren her dosyayı yeni saymak.
 
-### A5. Sandbox aynı analiz için iki kez başlatılabilir (orta, doğrulandı)
+### A5. Sandbox aynı analiz için iki kez başlatılabilir (orta) — ✅ DÜZELTİLDİ
+
+> **Düzeltme:** Kontrol ve işaretleme tek adımda, kilit altında; çalışan ya da sıradaki analize ikinci istek 409 alıyor. Test: art arda 3 istekten 1'i başladı, 2'si reddedildi.
 
 - **Nerede:** `app.py:204-209`
 - **Sorun:** Kontrol sadece "çalışıyor" durumuna bakıyor. Analiz "sırada" beklerken ya da butona hızlıca iki kez basılınca ikinci bir iş parçacığı başlıyor. İkisi sırayla aynı klasörde sandbox çalıştırıyor, ilkinin çıktısı yedek klasöre itiliyor.
 - **Düzeltme:** İş başına bir "sandbox istendi" kilidi. "Sırada" durumu da reddedilsin.
 
-### A6. Bulut alan adları "gürültü" sayılıyor (orta, doğrulandı)
+### A6. Bulut alan adları "gürültü" sayılıyor (orta) — ✅ DÜZELTİLDİ
+
+> **Düzeltme:** Gürültü listesinde artık sadece Microsoft'un kendi alan adları var. Azure/Akamai/AWS/Google Cloud vb. "Paylaşımlı bulut — incele" (not). Ek olarak yeni bir "Kötüye kullanıma açık servis" sınıfı: Telegram/Discord API, paste siteleri, ngrok/Cloudflare tünelleri, dinamik DNS, anonim dosya paylaşımı ve IP sorgulama servisleri — bunlar **kırmızı** bayrak.
 
 - **Nerede:** `pipeline.py:723-725`
 - **Sorun:** `windows.net`, `azureedge.net`, `azurefd.net`, `trafficmanager.net`, `akamaized.net` Microsoft gürültüsü olarak sınıflanıyor. Bunlar herkesin kiralayabildiği altyapılar. Zararlılar verileri sık sık `*.blob.core.windows.net` gibi adreslere gönderir. Böyle bir bağlantı raporda gri görünür ve kırmızı listeye girmez.
 - **Düzeltme:** Bu alan adlarını listeden çıkarıp ayrı bir "paylaşımlı bulut — incele" sınıfına almak.
 
-### A7. Uzun süren yardımcı komutlar bütün analizi düşürüyor (orta, doğrulandı)
+### A7. Uzun süren yardımcı komutlar bütün analizi düşürüyor (orta) — ✅ DÜZELTİLDİ
+
+> **Düzeltme:** İmza kontrolü 500'lük gruplarla; süreyi aşan grubun dosyaları "Unknown" sayılıp günlüğe yazılıyor. Her tshark sorgusu ayrı; zaman aşımında ağ özeti "kısmi" diye işaretleniyor ve not düşülüyor. Test: iki zaman aşımı da analizi düşürmedi.
 
 - **Nerede:** `pipeline.py:372` (imza kontrolü), `pipeline.py:746` (tshark)
 - **Sorun:** Zaman aşımı olursa hata yakalanmıyor. Binlerce dosyalı bir kurulumda imza kontrolü, büyük bir ağ kaydında tshark süreyi aşarsa analiz "hata" ile bitiyor ve o ana kadarki sonuçlar rapora girmiyor.
 - **Düzeltme:** Zaman aşımını yakalayıp adımı "kısmen tamamlandı" olarak işaretlemek. İmza kontrolünü 500'lük gruplara bölmek.
 
-### A8. Arşiv açmada boyut sınırı yok (orta)
+### A8. Arşiv açmada boyut sınırı yok (orta) — ✅ DÜZELTİLDİ
+
+> **Düzeltme:** Açmadan önce içerik listeleniyor (`7z l -slt` ya da zip başlıkları). Toplam boyut boş alanı (2 GB payla) aşarsa ya da sıkıştırma oranı 1000 katı geçerse (ve 1 GB'tan büyükse) arşiv açılmıyor. Çok parçalı arşivlerde oran tüm parçaların toplamına göre hesaplanıyor. Test: 1,1 MB'lık, 1,1 GB'a açılan bir zip reddedildi, hiçbir şey yazılmadı.
 
 - **Nerede:** `pipeline.py`, `stage_extract`
 - **Sorun:** Küçük görünen bir arşiv açılınca yüzlerce GB olabilir (zip bombası) ve diski doldurur.
@@ -79,7 +91,9 @@ Bu belge kodun tamamı okunarak hazırlandı. "Doğrulandı" yazan maddeler kodd
 - **Sorun:** `IsDebuggerPresent`, `QueryPerformanceCounter`, `ShellExecute`, `RegSetValueEx` hemen her Windows programında bulunur. `notepad.exe` bile 20 puan alıyor. `Login Data`, `Local State` gibi metinler Chromium gömülü her programda var ve "kritik" sayılıyor. `.bat` dosyaları imzalanamadığı halde "imzasız" diye puan alıyor. Puan ayırt edici değil.
 - **Düzeltme:** Tek başına anlamsız API'leri listeden çıkarmak. Puanı tek API'ye değil birleşimlere vermek (örneğin `VirtualAllocEx` + `WriteProcessMemory` + `CreateRemoteThread` birlikte). Script dosyalarında imza durumunu saymamak.
 
-### A10. VirusTotal günlük kotası dolunca adım dakikalarca bekliyor (düşük, doğrulandı)
+### A10. VirusTotal günlük kotası dolunca adım dakikalarca bekliyor (düşük) — ✅ DÜZELTİLDİ
+
+> **Düzeltme:** 429'da bir kez 60 sn bekleniyor (dakikalık pencere); ikinci 429 "kota doldu" sayılıp bütün VT adımı duruyor, kalan dosyalar "kota doldu" olarak işaretleniyor. Test: 4 dosyalık analiz 2 istekte durdu (önce 16 istek ve ~16 dk sürerdi).
 
 - **Nerede:** `vt_client.py:83-85`
 - **Sorun:** Her 429 yanıtında 60 saniye bekleyip 4 kez deniyor. Günlük kota (ücretsiz hesapta 500 istek) dolduysa her dosya için 4 dakika boşa gider.
@@ -134,7 +148,7 @@ Etkisine göre sıralı.
 
 1. Sandbox'ı açıp gerçek bir uçtan uca deneme yapmak, çıkan sorunları düzeltmek.
 2. ~~A1 ve A2~~ — düzeltildi.
-3. A3, A4, A5, A6, A7: izleyici ve sağlamlık hataları.
+3. ~~A3, A4, A5, A6, A7~~ (ve A8, A10) — düzeltildi. Açık kalanlar: A9, A11, A12.
 4. Testleri depoya taşımak ve CI kurmak. Sonraki değişiklikler güvenle yapılır.
 5. C1 (bırakılan dosyaların hash sorgusu) ve A9 ile birlikte C3 (YARA).
 6. Tailwind'i yerelleştirip CSP eklemek, İngilizce README.

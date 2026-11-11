@@ -505,13 +505,16 @@
         <td class="mono">${esc(c.Remote)}:${esc(c.Port)}</td><td class="text-slate-400">${esc(c.State)}</td></tr>`).join('');
     }
 
+    const classRank = c => c.startsWith('KÖTÜYE') ? 0 : c.startsWith('BİLİNMEYEN') ? 1 : c.startsWith('Paylaşımlı') ? 2 : 3;
+    const classColor = c => c.startsWith('KÖTÜYE') ? 'text-rose-200 font-bold bg-rose-900/40' : c.startsWith('BİLİNMEYEN') ? 'text-rose-300 font-semibold'
+      : c.startsWith('Paylaşımlı') ? 'text-amber-300' : c === 'Adobe' ? 'text-sky-300' : 'text-slate-500';
     function domainTable(title, rows) {
       rows = rows || [];
-      const sorted = rows.slice().sort((a, b) => (a.class.startsWith('BİLİNMEYEN') ? 0 : 1) - (b.class.startsWith('BİLİNMEYEN') ? 0 : 1) || b.count - a.count);
+      const sorted = rows.slice().sort((a, b) => classRank(a.class) - classRank(b.class) || b.count - a.count);
       return `<div><div class="text-xs font-semibold text-slate-300 mb-1">${title} (${rows.length})</div>
         <div class="overflow-auto max-h-72 rounded-lg border border-slate-800"><table class="tbl w-full text-[11px]"><tr><th>Ad</th><th>Adet</th><th>Sınıf</th></tr>
         ${sorted.slice(0, 200).map(d => `<tr><td class="mono break-all">${esc(d.name)}</td><td>${d.count}</td>
-          <td class="${d.class.startsWith('BİLİNMEYEN') ? 'text-rose-300 font-semibold' : d.class === 'Adobe' ? 'text-sky-300' : 'text-slate-500'}">${esc(d.class)}</td></tr>`).join('')}</table></div></div>`;
+          <td class="${classColor(d.class)}">${esc(d.class)}</td></tr>`).join('')}</table></div></div>`;
     }
     function renderNetwork(st) {
       const n = st.network;
@@ -520,7 +523,7 @@
       if (!n) { $('netBody').innerHTML = `<div class="text-xs text-slate-400">Ağ kaydı (capture.pcapng) hazır. Otomatik özet için Wireshark'ı kurun, ardından analizi tekrar açın veya kaydı Wireshark'ta açın.</div>`; return; }
       $('netBody').innerHTML = domainTable('DNS sorguları', n.dns) + domainTable('TLS sunucu adları (SNI)', n.sni)
         + `<div><div class="text-xs font-semibold text-slate-300 mb-1">Şifresiz HTTP istekleri (${n.http.length})</div><div class="text-[11px] mono text-slate-300 max-h-48 overflow-auto space-y-0.5">
-          ${n.http.map(h => `<div class="break-all ${h.class.startsWith('BİLİNMEYEN') ? 'text-rose-300' : ''}">${esc(h.method)} http://${esc(h.host)}${esc(h.uri)}</div>`).join('') || '<span class="text-slate-500">yok</span>'}</div></div>`
+          ${n.http.map(h => `<div class="break-all ${classColor(h.class)}">${esc(h.method)} http://${esc(h.host)}${esc(h.uri)}</div>`).join('') || '<span class="text-slate-500">yok</span>'}</div></div>`
         + `<div><div class="text-xs font-semibold text-slate-300 mb-1">TCP bağlantı denemeleri</div><div class="text-[11px] mono text-slate-300 max-h-48 overflow-auto">
           ${n.tcp_targets.map(t => `<div>${esc(t.target)} ×${t.count}</div>`).join('') || '<span class="text-slate-500">yok</span>'}</div></div>`;
     }

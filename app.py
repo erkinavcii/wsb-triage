@@ -203,9 +203,10 @@ def job_state(case_id: str):
 @app.post("/api/jobs/{case_id}/sandbox")
 def job_run_sandbox(case_id: str):
     job = _job(case_id)
-    if job.state["stages"]["sandbox"]["status"] == "running":
-        raise HTTPException(400, "Sandbox zaten çalışıyor.")
-    pipeline.start_sandbox_later(job)
+    try:
+        pipeline.start_sandbox_later(job)
+    except pipeline.PipelineError as e:
+        raise HTTPException(409, str(e))
     return {"status": "started"}
 
 
