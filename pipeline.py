@@ -483,6 +483,24 @@ def stage_static(job: Job) -> None:
 
 
 # ======================================================================== 4. VirusTotal
+def _uploadable(r: Dict[str, Any], inv: Dict[str, Any]) -> bool:
+    """Only programs and scripts ever leave the machine. Uploads become downloadable by paying VT users, so documents,
+    photos or an archive of personal files must never be sent - even if their name looks suspicious ('license.pdf').
+    The original archive is uploaded only if it actually contains programs/scripts."""
+    if r.get("original"):
+        src = Path(r["path"])
+        if src.suffix.lower() in SCRIPT_EXT:
+            return True
+        try:
+            with open(src, "rb") as f:
+                if f.read(2) == b"MZ":
+                    return True
+        except OSError:
+            return False
+        return any(x.get("is_pe") or x.get("is_script") for x in inv.get("files", []))
+    return bool(r.get("is_pe") or r.get("is_script"))
+
+
 def stage_vt(job: Job) -> None:
     key = vt_client.get_api_key()
     if not key:
@@ -521,6 +539,8 @@ def stage_vt(job: Job) -> None:
                 e["status"] = "VT'de kayıtlı"
             elif not job.opt("vt_upload"):
                 e["status"] = "VT'de yok (yükleme kapalı)"
+            elif not _uploadable(r, inv):
+                e["status"] = "VT'de yok (program değil; gizlilik için yüklenmedi)"
             elif r["size"] > vt_client.MAX_UPLOAD:
                 e["status"] = "VT'de yok (650 MB'tan büyük, yüklenemez)"
             else:
@@ -618,7 +638,7 @@ def stage_sandbox(job: Job) -> None:
         while not done_flag.exists():
             time.sleep(4)
             now = time.time()
-            live = _read_json(out / "live.json")
+            live = sanitize_sandbox_json(_read_json(out / "live.json"))
             if live:
                 job.state["sandbox"]["live"] = live
                 beat = (live.get("Updated"), live.get("SecondsLeft"), live.get("Phase"))
@@ -652,7 +672,7 @@ def stage_sandbox(job: Job) -> None:
                 if misses >= 3:                      # ~3 consecutive clear "not running" answers
                     job.log("Sandbox penceresi izleme bitmeden kapatıldı.")
                     break
-        live = _read_json(out / "live.json")
+        live = sanitize_sandbox_json(_read_json(out / "live.json"))
         if live:
             job.state["sandbox"]["live"] = live
         if max_gap > 60:
@@ -666,7 +686,7 @@ def stage_sandbox(job: Job) -> None:
         job.state["sandbox"]["quarantined"] = quarantined
         if quarantined:
             job.log(f"output klasöründe beklenmeyen {len(quarantined)} dosya karantinaya alındı (.quarantine): {', '.join(quarantined[:10])}")
-        beh = _read_json(out / "behavior.json")
+        beh = sanitize_sandbox_json(_read_json(out / "behavior.json"))
         if beh:
             beh.get("Files", {}).pop("NewFilesSample", None)
             job.state["behavior"] = beh
@@ -712,6 +732,59 @@ def _timeline_has(out: Path, needles) -> bool:
     except OSError:
         return False
     return any(n in text for n in needles)
+
+
+# ------------------------------------------------------------------ sandbox output is attacker-controlled
+_STR_LISTS = [("Persistence", "Services"), ("Persistence", "Drivers"), ("Persistence", "Tasks"), ("Persistence", "RunKeys"),
+              ("Persistence", "Startup"), ("Defender", "Added"), ("Defender", "ThreatsDetected"), ("Hosts", "Added"),
+              ("Hosts", "Removed"), ("Firewall", "Added"), ("Files", "NewExecutables"), ("Files", "ModifiedExecutables"),
+              ("Network", "NewListening"), ("LanBlock", "Details"), ("LanBlock", "Exempt"), ("LanBlock", "Ranges"),
+              ("Quick", "Services"), ("Quick", "Tasks"), ("Quick", "RunKeys"), ("Quick", "Startup"), ("Quick", "Defender"), ("Quick", "Hosts")]
+_OBJ_LISTS = [("Processes",), ("Connections",), ("Network", "Connections"), ("Network", "DnsCache")]
+_INTS = [("Files", "NewCount"), ("Files", "ModifiedCount"), ("SecondsLeft",), ("ProcessCount",), ("SampleProcessCount",),
+         ("SuspiciousCount",), ("ConnectionCount",)]
+_BOOLS = [("LanBlock", "Requested"), ("LanBlock", "Applied"), ("LanBlock", "Tampered"), ("StoppedEarly",), ("Admin",)]
+
+
+def sanitize_sandbox_json(d: Any) -> Optional[Dict[str, Any]]:
+    """Coerces live.json / behavior.json to the expected shape. A sample inside the sandbox can write these files,
+    so wrong types must not crash the verdict code or reach the panel as something other than plain values."""
+    if not isinstance(d, dict):
+        return None
+
+    def parent(path):
+        node = d
+        for k in path[:-1]:
+            node = node.get(k)
+            if not isinstance(node, dict):
+                return None
+        return node if path[-1] in node else None
+
+    for section in ("Persistence", "Defender", "Hosts", "Firewall", "Files", "Network", "LanBlock", "Quick"):
+        if section in d and d[section] is not None and not isinstance(d[section], dict):
+            d[section] = {}
+    for path in _STR_LISTS:
+        p = parent(path)
+        if p is not None:
+            v = p[path[-1]]
+            p[path[-1]] = [str(x) for x in v if isinstance(x, (str, int, float))][:5000] if isinstance(v, list) else []
+    for path in _OBJ_LISTS:
+        p = parent(path)
+        if p is not None:
+            v = p[path[-1]]
+            p[path[-1]] = [x for x in v if isinstance(x, dict)][:5000] if isinstance(v, list) else []
+    for path in _INTS:
+        p = parent(path)
+        if p is not None:
+            try:
+                p[path[-1]] = int(p[path[-1]])
+            except (TypeError, ValueError):
+                p[path[-1]] = 0
+    for path in _BOOLS:
+        p = parent(path)
+        if p is not None:
+            p[path[-1]] = p[path[-1]] is True
+    return d
 
 
 def request_stop(job: Job) -> None:
@@ -1027,7 +1100,8 @@ class DownloadWatcher:
                             item = {"path": key, "name": p.name, "size": st.st_size, "time": _now(), "job": None, "later_part": later_part}
                             self.found.append(item)
                             if self.auto_start and not later_part:
-                                job = create_job(key, {"run_sandbox": False})
+                                # automatic runs never upload anything: hash lookups only (the user did not pick this file)
+                                job = create_job(key, {"run_sandbox": False, "vt_upload": False})
                                 item["job"] = job.id
             except Exception:
                 traceback.print_exc()

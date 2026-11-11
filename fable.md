@@ -1,0 +1,140 @@
+# wsb-triage — genel inceleme
+
+İnceleme tarihi: 11 Kasım 2026, commit `cb78e43`.
+
+Bu belge kodun tamamı okunarak hazırlandı. "Doğrulandı" yazan maddeler kodda ya da küçük bir denemeyle teyit edildi. Hiçbir madde henüz düzeltilmedi.
+
+## Önce bilinmesi gereken
+
+**Gerçek Windows Sandbox içinde hiçbir şey çalıştırılmadı.** Bu bilgisayarda Sandbox hâlâ kapalı. Şimdiye kadarki bütün testlerde izleme scripti ana bilgisayarda test modunda çalıştırıldı. Aşağıdaki parçalar bu yüzden hiç denenmedi:
+
+- `pktmon` ile ağ kaydı ve `.pcapng` dönüşümü
+- Yerel ağ engelleme kuralı (sandbox'ın kendi ağ geçidi ve DNS'i gerçekten açık kalıyor mu)
+- İşlem başlatma izleme (`Win32_ProcessStartTrace`), yönetici yetkisi varsayımı
+- Sandbox'ı kapatma: Windows 11 24H2 ve sonrasında Sandbox ayrı bir uygulama olarak geliyor, işlem adları ve `wsb` komutu farklı olabilir
+- 1 GB üstü kurulumun salt okunur klasörden yerinde çalışması
+- VirusTotal çağrıları (API anahtarı hiç girilmedi, sahte istemciyle test edildi)
+
+İlk iş Sandbox'ı açıp demo paketiyle uçtan uca bir deneme yapmak olmalı. Aşağıdaki listeden önce bu gelir.
+
+## A. Hatalar ve güvenlik açıkları
+
+Önem sırasına göre.
+
+### A1. Otomatik analiz kişisel dosyaları VirusTotal'e yükleyebilir (yüksek) — ✅ DÜZELTİLDİ
+
+> **Düzeltme (11 Kasım 2026):** İzleyicinin başlattığı analizler artık hiçbir dosya yüklemiyor, sadece hash soruyor. Elle başlatılan analizlerde de yalnızca programlar ve scriptler yükleniyor; arşivin kendisi ancak içinde program varsa yükleniyor (`pipeline.py`, `_uploadable`). Test edildi: `license.pdf`, `foto.jpg` ve belge dolu bir zip yüklenmedi, `setup.exe` yüklendi.
+
+- **Nerede:** `pipeline.py:495` ve `pipeline.py:1030`
+- **Sorun:** VirusTotal adımı, analiz edilen dosyanın kendisini her zaman listeye ekliyor. İndirilenler izleyicisi de otomatik analizde "bilinmeyenleri yükle" seçeneği açık olarak iş başlatıyor. Sonuç: izleyici açıkken indirdiğin bir banka dökümü, sözleşme ya da fotoğraf arşivi, 650 MB'ın altındaysa VirusTotal'e yüklenir. VirusTotal'in ücretli kullanıcıları yüklenen dosyaları indirebilir.
+- **Düzeltme:** İzleyicinin başlattığı işlerde yükleme kapalı olsun, sadece hash sorgusu yapılsın. Ayrıca dosyanın kendisi yalnızca çalıştırılabilir dosya ya da arşivse yüklensin.
+
+### A2. Sandbox'tan gelen veri panelde kod çalıştırabilir (yüksek) — ✅ DÜZELTİLDİ
+
+> **Düzeltme (11 Kasım 2026):** İki katman. Panel: kutu başlıkları da güvenli gösteriliyor, sandbox'tan gelen diziler ve sayılar tür kontrolünden geçiyor (`asArr` / `asNum`). Sunucu: `live.json` ve `behavior.json` okunur okunmaz beklenen biçime getiriliyor (`pipeline.py`, `sanitize_sandbox_json`); yanlış türler artık değerlendirme kodunu da çökertemiyor. Test edildi: temizleyici atlanarak 15 alana yerleştirilen zararlı kodun hiçbiri panelde çalışmadı.
+
+- **Nerede:** `static/index.html:487` ve `listBox` fonksiyonu (`index.html:453`)
+- **Sorun:** Paneldeki hemen her değer güvenli gösteriliyor, biri hariç. `behavior.json` içindeki `Files.NewCount` değeri başlığa olduğu gibi yazılıyor. Bu dosyayı sandbox içindeki program yazabilir. Sayı yerine HTML koyarsa panelde JavaScript çalışır (XSS). Panel kendi API'sine tam erişimli olduğu için bu kod izleyiciyi Belgeler klasörüne çevirebilir, VirusTotal anahtarını değiştirebilir, yeni analiz başlatabilir.
+- **Düzeltme:** `listBox` başlığı da `esc()` ile gösterilsin, `NewCount` sayıya çevrilsin. Ek katman olarak sunucu, sandbox'tan gelen JSON'u okurken alanların türünü doğrulasın (sayı beklenen yerde sayı).
+
+### A3. Çok parçalı arşivlerde ilk parça atlanıyor (orta, doğrulandı)
+
+- **Nerede:** `pipeline.py`, izleyicideki `later_part` deseni
+- **Sorun:** `.part01.rar` ve `.part001.rar` "sonraki parça" sayılıyor, yani otomatik analiz hiç başlamıyor. 10 ve üzeri parçalı arşivlerde ilk parçanın adı tam olarak böyle olur. Aynı desen `setup.2024` ya da `app-1.2.10` gibi sayıyla biten adları da yanlışlıkla parça sayıyor.
+- **Düzeltme:** Parça numarasını sayıya çevirip 1'den büyük mü diye bakmak. Sayısal uzantı kuralı yalnızca `.002`, `.003` gibi üç haneli uzantılara uygulanmalı.
+
+### A4. Klasöre taşınan dosyalar izleyicide görünmüyor (orta, doğrulandı)
+
+- **Nerede:** `pipeline.py:1016`
+- **Sorun:** İzleyici "yeni dosya"yı değiştirilme tarihine göre belirliyor. Başka klasörden taşınan ya da sunucudaki tarihini koruyan bir indirme eski tarihli görünür ve hiç listelenmez.
+- **Düzeltme:** İzleme açıldığı anda klasördeki dosyaların listesini almak, sonradan beliren her dosyayı yeni saymak.
+
+### A5. Sandbox aynı analiz için iki kez başlatılabilir (orta, doğrulandı)
+
+- **Nerede:** `app.py:204-209`
+- **Sorun:** Kontrol sadece "çalışıyor" durumuna bakıyor. Analiz "sırada" beklerken ya da butona hızlıca iki kez basılınca ikinci bir iş parçacığı başlıyor. İkisi sırayla aynı klasörde sandbox çalıştırıyor, ilkinin çıktısı yedek klasöre itiliyor.
+- **Düzeltme:** İş başına bir "sandbox istendi" kilidi. "Sırada" durumu da reddedilsin.
+
+### A6. Bulut alan adları "gürültü" sayılıyor (orta, doğrulandı)
+
+- **Nerede:** `pipeline.py:723-725`
+- **Sorun:** `windows.net`, `azureedge.net`, `azurefd.net`, `trafficmanager.net`, `akamaized.net` Microsoft gürültüsü olarak sınıflanıyor. Bunlar herkesin kiralayabildiği altyapılar. Zararlılar verileri sık sık `*.blob.core.windows.net` gibi adreslere gönderir. Böyle bir bağlantı raporda gri görünür ve kırmızı listeye girmez.
+- **Düzeltme:** Bu alan adlarını listeden çıkarıp ayrı bir "paylaşımlı bulut — incele" sınıfına almak.
+
+### A7. Uzun süren yardımcı komutlar bütün analizi düşürüyor (orta, doğrulandı)
+
+- **Nerede:** `pipeline.py:372` (imza kontrolü), `pipeline.py:746` (tshark)
+- **Sorun:** Zaman aşımı olursa hata yakalanmıyor. Binlerce dosyalı bir kurulumda imza kontrolü, büyük bir ağ kaydında tshark süreyi aşarsa analiz "hata" ile bitiyor ve o ana kadarki sonuçlar rapora girmiyor.
+- **Düzeltme:** Zaman aşımını yakalayıp adımı "kısmen tamamlandı" olarak işaretlemek. İmza kontrolünü 500'lük gruplara bölmek.
+
+### A8. Arşiv açmada boyut sınırı yok (orta)
+
+- **Nerede:** `pipeline.py`, `stage_extract`
+- **Sorun:** Küçük görünen bir arşiv açılınca yüzlerce GB olabilir (zip bombası) ve diski doldurur.
+- **Düzeltme:** Açmadan önce `7z l` ile toplam boyutu okuyup boş alanla karşılaştırmak.
+
+### A9. Statik puan neredeyse her dosyada yüksek çıkıyor (orta, doğrulandı)
+
+- **Nerede:** `analyzer.py:25-47` ve metin desenleri
+- **Sorun:** `IsDebuggerPresent`, `QueryPerformanceCounter`, `ShellExecute`, `RegSetValueEx` hemen her Windows programında bulunur. `notepad.exe` bile 20 puan alıyor. `Login Data`, `Local State` gibi metinler Chromium gömülü her programda var ve "kritik" sayılıyor. `.bat` dosyaları imzalanamadığı halde "imzasız" diye puan alıyor. Puan ayırt edici değil.
+- **Düzeltme:** Tek başına anlamsız API'leri listeden çıkarmak. Puanı tek API'ye değil birleşimlere vermek (örneğin `VirtualAllocEx` + `WriteProcessMemory` + `CreateRemoteThread` birlikte). Script dosyalarında imza durumunu saymamak.
+
+### A10. VirusTotal günlük kotası dolunca adım dakikalarca bekliyor (düşük, doğrulandı)
+
+- **Nerede:** `vt_client.py:83-85`
+- **Sorun:** Her 429 yanıtında 60 saniye bekleyip 4 kez deniyor. Günlük kota (ücretsiz hesapta 500 istek) dolduysa her dosya için 4 dakika boşa gider.
+- **Düzeltme:** Yanıttaki hata kodunu okuyup günlük kota dolmuşsa adımı hemen "kota doldu" diye bitirmek.
+
+### A11. Büyük dosya yüklemesi belleği dolduruyor (düşük)
+
+- **Nerede:** `vt_client.py`, `upload`
+- **Sorun:** `requests` çok parçalı gövdeyi bellekte oluşturur. 600 MB'lık bir yükleme 600 MB'tan fazla RAM kullanır.
+- **Düzeltme:** `requests-toolbelt` ile akış halinde yükleme ya da yükleme sınırını 200 MB'a indirmek.
+
+### A12. Küçük sorunlar
+
+- **Arşiv şifresi saklanıyor.** `state.json` içinde düz metin duruyor ve API yanıtında dönüyor. İş bitince silinmeli.
+- **"Bayrak yok" yanıltabilir.** Sandbox çalışmasa da VirusTotal bittiyse sonuç yeşil görünüyor. Sonuç kutusu hangi adımların gerçekten çalıştığını da söylemeli.
+- **Durum okuma yarışı.** İş parçacığı durumu değiştirirken API aynı anda okuyor. Nadiren "dictionary changed size" hatası verebilir. Değişiklikler de kilit altında yapılmalı.
+- **Analizler hiç silinmiyor.** `cases/` ve `uploads/` sürekli büyüyor. Her arşiv analizi açılmış dosyaların bir kopyasını bırakıyor.
+- **İş iptal edilemiyor.** Sırada bekleyen ya da VirusTotal'i bekleyen bir analizi durdurmanın yolu yok.
+- **`Baslat.bat` tarayıcıyı sunucudan önce açıyor.** Port doluysa pencere anlaşılmaz bir hatayla kapanıyor.
+- **Defender sinyalleri sandbox'ta işe yaramayabilir.** Windows Sandbox içinde Defender genelde çalışmaz. "Defender tespitleri" ve "Defender değişiklikleri" kutuları boş kalabilir. Gerçek denemede bakılmalı.
+
+## B. Geliştirilebilecek yerler
+
+- **Panel dış kaynağa bağımlı.** Arayüz `cdn.tailwindcss.com` adresinden script yüklüyor (`index.html:7`). İnternet yokken panel bozuk görünür. Daha önemlisi, bu script panelin yerel API'sine erişebilen bir sayfada çalışıyor. CSS derlenip depoya konmalı, ardından sıkı bir Content-Security-Policy başlığı eklenmeli. Bu, A2 türü hatalara karşı da ikinci katman olur.
+- **Depoda test yok.** Sahte sandbox'la yaptığım senaryo testleri depoya girmedi. `tests/` klasörüne taşınıp GitHub Actions ile her gönderimde çalıştırılmalı. PowerShell scripti için ayrıştırma ve ASCII kontrolü de eklenebilir.
+- **README sadece Türkçe.** Depo açıklaması ve etiketler İngilizce. İngilizce bir README ve bir ekran görüntüsü, depoyu bulan kişinin ilk baktığı şey olur.
+- **Yeni Sandbox komut satırı.** Windows 11 24H2 ve sonrasında `wsb start`, `wsb exec`, `wsb stop` komutları var. Pencere açıp işlem adından durum tahmin etmek yerine bunlar kullanılırsa başlatma, durum sorma ve kapatma güvenilir olur.
+- **Sandbox belleği panelden ayarlanamıyor.** API'de seçenek var, arayüzde yok. Varsayılan 4 GB, Photoshop gibi kurulumlar için az.
+- **Salt okunur klasörden çalışan kurulumlar.** Kendi klasörüne yazmaya çalışan kurulum programları hata verir. Böyle bir durumda rapor bunu açıkça söylemeli.
+- **Ağ kaydı tavanı.** `pktmon` kaydı 2 GB ile sınırlı ve dolunca en eski paketleri siler. Kurulum sırasında büyük indirme olursa ilk dakikaların trafiği kaybolur. Paket başına boyut sınırı (örneğin 512 bayt) çoğu analiz için yeterli.
+- **Rapor dili ve biçimi.** Rapor yalnızca Türkçe Markdown. JSON dışa aktarma ve HTML rapor paylaşmayı kolaylaştırır.
+- **Yerel API'de kimlik doğrulama yok.** Bilgisayardaki her program ve her yerel kullanıcı `127.0.0.1:8765`'e istek atabilir. Başlangıçta üretilen rastgele bir belirteç bunu kapatır.
+
+## C. Yeni özellik önerileri
+
+Etkisine göre sıralı.
+
+1. **Bırakılan dosyaların hash'ini VirusTotal'de sorgulamak.** İzleyici, sandbox içinde yeni oluşan çalıştırılabilir dosyaların SHA-256'sını raporuna yazsın. Ana bilgisayar bunları hash ile sorgulasın. Dosya dışarı çıkmaz, risk yok. Kurulum programı temiz görünüp asıl zararlıyı sonradan indiren paketleri bu yakalar. En değerli ek bu.
+2. **Kurulum paketlerinin içini açmak.** 7-Zip, NSIS ve MSI gibi birçok kurulum biçimini açabiliyor. Statik analiz şu an sadece dıştaki `setup.exe`'ye bakıyor. İçindeki dosyalar da envantere girerse imzası bozuk DLL'ler çalıştırmadan görülür.
+3. **YARA kuralları.** `yara-python` ile açık kural setleri (örneğin YARA-Forge) statik adıma eklenebilir. A9'daki el yapımı desenlerden çok daha isabetli olur.
+4. **Ekran görüntüleri.** İzleme sırasında 30 saniyede bir sandbox ekranının görüntüsü. Sahte kurulum ekranları ve fidye notları tek bakışta anlaşılır.
+5. **Sahte kullanıcı hareketi.** Fare hareketi ve "İleri" butonlarına otomatik tıklama. Hem kurulumlar kendiliğinden ilerler hem de hareket bekleyen zararlılar tetiklenir.
+6. **Bağlantıları işlemle eşlemek.** Ağ özetinde her alan adının yanında hangi işlemin bağlandığı yazsın. İzleyici bu bilgiyi zaten topluyor, sadece tshark özetiyle birleştirilmiyor.
+7. **İki çalıştırmayı karşılaştırmak.** Aynı programın resmi sürümüyle crack'li sürümünü ayrı ayrı çalıştırıp farkı göstermek. Crack'in fazladan ne yaptığı doğrudan ortaya çıkar.
+8. **Göstergeleri dışa aktarmak.** Hash, alan adı ve IP listesini CSV ya da STIX olarak vermek.
+9. **Ek istihbarat kaynakları.** MalwareBazaar ve Hybrid Analysis hash sorguları ücretsiz. VirusTotal kotası dolduğunda yedek olur.
+10. **Bildirim.** Analiz bitince ya da kırmızı bayrak çıkınca Windows bildirimi. Uzun izlemelerde panelin başında beklemek gerekmez.
+11. **Analiz yönetimi.** Paneldan analiz silme, iptal etme ve "30 günden eskileri temizle" seçeneği (A12'deki iki maddeyi çözer).
+12. **Sağ tık menüsü.** Dosya Gezgini'nde "wsb-triage ile analiz et" seçeneği. Paneli açıp yol seçmekten hızlı.
+
+## Önerilen sıra
+
+1. Sandbox'ı açıp gerçek bir uçtan uca deneme yapmak, çıkan sorunları düzeltmek.
+2. ~~A1 ve A2~~ — düzeltildi.
+3. A3, A4, A5, A6, A7: izleyici ve sağlamlık hataları.
+4. Testleri depoya taşımak ve CI kurmak. Sonraki değişiklikler güvenle yapılır.
+5. C1 (bırakılan dosyaların hash sorgusu) ve A9 ile birlikte C3 (YARA).
+6. Tailwind'i yerelleştirip CSP eklemek, İngilizce README.

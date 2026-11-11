@@ -107,14 +107,14 @@
           <h3 class="text-sm font-semibold text-white">📥 İndirilenler klasörünü izle</h3>
           <div class="flex items-center gap-3 text-xs">
             <label class="flex items-center gap-1.5 cursor-pointer"><input type="checkbox" id="watchEnabled" /> Açık</label>
-            <label class="flex items-center gap-1.5 cursor-pointer" title="Yeni dosya indirilince analiz otomatik başlar; Sandbox adımı sizin onayınızı bekler."><input type="checkbox" id="watchAuto" /> Otomatik analiz et</label>
+            <label class="flex items-center gap-1.5 cursor-pointer" title="Yeni dosya indirilince analiz otomatik başlar. VirusTotal'e dosya yüklenmez, sadece hash sorulur. Sandbox adımı sizin onayınızı bekler."><input type="checkbox" id="watchAuto" /> Otomatik analiz et</label>
           </div>
         </div>
         <div class="flex gap-2">
           <input id="watchFolder" type="text" class="flex-1 bg-slate-900/90 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white" />
           <button id="btnWatchSave" class="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs text-slate-200 border border-slate-700">Kaydet</button>
         </div>
-        <p class="text-[11px] text-slate-500">İndirmesi biten yeni dosyalar burada listelenir. Otomatik modda sandbox adımı onayınızı bekler, çünkü örneği çalıştırır.</p>
+        <p class="text-[11px] text-slate-500">İndirmesi biten yeni dosyalar burada listelenir. Otomatik modda VirusTotal'e hiçbir dosya yüklenmez (sadece hash sorgusu) ve sandbox adımı onayınızı bekler, çünkü örneği çalıştırır.</p>
         <div id="watchList" class="space-y-1.5 max-h-48 overflow-y-auto text-xs text-slate-400">—</div>
       </div>
       <div class="glass-card rounded-2xl p-5 space-y-3">
@@ -450,10 +450,13 @@
       }).join('');
     }
 
+    // Everything under b / live comes from inside the sandbox and must be treated as attacker-controlled.
+    const asArr = x => Array.isArray(x) ? x : [];
+    const asNum = x => Number.isFinite(Number(x)) ? Number(x) : 0;
     function listBox(title, items, color) {
-      items = items || [];
+      items = asArr(items);
       return `<div class="p-3 rounded-lg bg-slate-900 border ${items.length ? `border-${color}-500/40` : 'border-slate-800'}">
-        <div class="text-xs font-semibold text-${color}-300 mb-1">${title} (${items.length})</div>
+        <div class="text-xs font-semibold text-${color}-300 mb-1">${esc(title)} (${items.length})</div>
         <div class="text-[11px] mono text-slate-300 space-y-1 max-h-36 overflow-y-auto">${items.length ? items.slice(0, 60).map(x => `<div class="break-all">${esc(x)}</div>`).join('') : '<span class="text-slate-500">yok</span>'}</div></div>`;
     }
 
@@ -464,14 +467,14 @@
       if (!show) return;
       $('sbPulse').className = 'w-2.5 h-2.5 rounded-full ' + (s.status === 'running' ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500');
       $('sbStatusText').textContent = (st.sandbox || {}).status_text || s.msg || '';
-      const procs = b ? (b.Processes || []) : (live ? live.Processes || [] : []);
-      const conns = b ? ((b.Network || {}).Connections || []) : (live ? live.Connections || [] : []);
+      const procs = asArr(b ? b.Processes : (live || {}).Processes).filter(p => p && typeof p === 'object');
+      const conns = asArr(b ? (b.Network || {}).Connections : (live || {}).Connections).filter(c => c && typeof c === 'object');
       const susp = procs.filter(p => p.Suspicious).length, fromSample = procs.filter(p => p.InTree).length;
       const counter = (label, val, warn) => `<div class="p-3 rounded-xl bg-slate-900 border border-slate-800 text-center"><div class="text-[11px] text-slate-400">${label}</div><div class="text-lg font-bold ${warn ? 'text-rose-300' : 'text-white'}">${esc(val)}</div></div>`;
-      $('sbCounters').innerHTML = counter('Kalan süre', live && s.status === 'running' ? live.SecondsLeft + ' sn' : (b ? 'bitti' : '—'))
+      $('sbCounters').innerHTML = counter('Kalan süre', live && s.status === 'running' ? asNum(live.SecondsLeft) + ' sn' : (b ? 'bitti' : '—'))
         + counter('Yeni işlem (örnekten)', `${procs.length} (${fromSample})`) + counter('Şüpheli komut', susp, susp > 0) + counter('TCP bağlantısı', conns.length);
       const src = b || live || {}, lan = src.LanBlock || {};
-      const lanText = lan.Tampered ? `<span class="text-rose-300 font-semibold">🚨 Yerel ağ engeli kaldırılmaya çalışıldı (yeniden uygulandı): ${esc((lan.Details || []).join(', '))}</span>`
+      const lanText = lan.Tampered ? `<span class="text-rose-300 font-semibold">🚨 Yerel ağ engeli kaldırılmaya çalışıldı (yeniden uygulandı): ${esc(asArr(lan.Details).join(', '))}</span>`
         : lan.Applied ? `<span class="text-emerald-300">🔒 Ev ağı / ana bilgisayar engelli — sadece internet açık</span>`
         : lan.Requested ? `<span class="text-amber-300">⚠️ Yerel ağ engeli uygulanamadı: ${esc(lan.Status)}</span>` : `<span class="text-slate-400">İnternet kapalı</span>`;
       $('sbCounters').innerHTML += `<div class="col-span-2 md:col-span-4 text-[11px] flex flex-wrap gap-x-6 gap-y-1">${lanText}
@@ -482,13 +485,13 @@
         const P = b.Persistence || {}, D = b.Defender || {};
         pers = listBox('🛑 Defender değişiklikleri', D.Added, 'rose') + listBox('🛑 Defender tespitleri', D.ThreatsDetected, 'rose')
           + listBox('⚙️ Yeni servisler', P.Services, 'rose') + listBox('🧩 Yeni sürücüler', P.Drivers, 'rose')
-          + listBox('⏰ Zamanlanmış görevler', P.Tasks, 'amber') + listBox('📌 Otomatik başlatma (Run/IFEO)', (P.RunKeys || []).concat(P.Startup || []), 'amber')
+          + listBox('⏰ Zamanlanmış görevler', P.Tasks, 'amber') + listBox('📌 Otomatik başlatma (Run/IFEO)', asArr(P.RunKeys).concat(asArr(P.Startup)), 'amber')
           + listBox('📝 hosts eklenen satırlar', (b.Hosts || {}).Added, 'amber') + listBox('🧱 Güvenlik duvarı kuralları', (b.Firewall || {}).Added, 'amber')
-          + listBox(`📂 Yeni çalıştırılabilir dosyalar (toplam ${(b.Files || {}).NewCount || 0} yeni dosya)`, (b.Files || {}).NewExecutables, 'purple');
+          + listBox(`📂 Yeni çalıştırılabilir dosyalar (toplam ${asNum((b.Files || {}).NewCount)} yeni dosya)`, (b.Files || {}).NewExecutables, 'purple');
       } else {
         const q = (live && live.Quick) || {};
         pers = listBox('🛑 Defender değişiklikleri', q.Defender, 'rose') + listBox('⚙️ Yeni servisler', q.Services, 'rose')
-          + listBox('⏰ Zamanlanmış görevler', q.Tasks, 'amber') + listBox('📌 Otomatik başlatma', (q.RunKeys || []).concat(q.Startup || []), 'amber')
+          + listBox('⏰ Zamanlanmış görevler', q.Tasks, 'amber') + listBox('📌 Otomatik başlatma', asArr(q.RunKeys).concat(asArr(q.Startup)), 'amber')
           + listBox('📝 hosts değişiklikleri', q.Hosts, 'amber')
           + `<div class="p-3 rounded-lg bg-slate-900 border border-slate-800 text-[11px] text-slate-400">Dosya sistemi, sürücü ve güvenlik duvarı karşılaştırması izleme bitince yapılır. Bu kutular 30 sn'de bir güncellenir.</div>`;
       }
