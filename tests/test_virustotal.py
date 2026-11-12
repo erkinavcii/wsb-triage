@@ -204,3 +204,27 @@ def test_upload_sends_the_stream(tmp_path, monkeypatch):
     assert vt_client.upload(str(f), "k") == "aid-1"
     assert seen["ctype"].startswith("multipart/form-data; boundary=")
     assert b"MZ" in seen["body"]
+
+
+def test_dropped_files_vt_rejects_hostile_and_deduplicates_case(tmp_path, fake_vt):
+    job = bare_job(tmp_path)
+    existing = "a" * 64
+    dup_hash = "b" * 64
+    job.state["vt"] = [{"rel": "orig.exe", "sha256": existing, "status": "ok", "result": None, "gui_url": ""}]
+    beh = {
+        "Files": {
+            "DroppedHashes": [
+                "not-a-dict",
+                {"Path": "C:\\bad1.exe", "SHA256": "../../uploads/secret", "Size": 10},
+                {"Path": "C:\\bad2.exe", "SHA256": None, "Size": 10},
+                {"Path": "C:\\same_as_orig.exe", "SHA256": existing.upper(), "Size": 10},
+                {"Path": None, "SHA256": dup_hash.upper(), "Size": "not-an-int"},
+                {"Path": "C:\\Temp\\copy2.exe", "SHA256": dup_hash.lower(), "Size": 50},
+            ]
+        }
+    }
+    pipeline._check_dropped_files_vt(job, beh)
+    assert fake_vt.lookups == [dup_hash]
+    assert len(job.state["vt"]) == 2
+    assert job.state["vt"][1]["rel"] == "[bırakılan] unknown.exe"
+    assert job.state["vt"][1]["size"] == 0

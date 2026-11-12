@@ -199,6 +199,14 @@ def create_job(sample_path: str, options: Optional[Dict[str, Any]] = None) -> Jo
         raise PipelineError(f"Dosya veya klasör bulunamadı: {src}")
     opts = dict(DEFAULT_OPTIONS)
     opts.update({k: v for k, v in (options or {}).items() if k in DEFAULT_OPTIONS and v is not None})
+    try:
+        opts["memory_mb"] = max(1024, min(65536, int(opts.get("memory_mb") or 4096)))
+    except (TypeError, ValueError):
+        opts["memory_mb"] = 4096
+    try:
+        opts["duration_min"] = max(1, min(180, int(opts.get("duration_min") or 10)))
+    except (TypeError, ValueError):
+        opts["duration_min"] = 10
     password = opts.pop("password", "") or ""
     opts["has_password"] = bool(password)
     safe = re.sub(r"[^\w.-]", "_", src.name)[:40] or "sample"
@@ -785,28 +793,49 @@ def _check_dropped_files_vt(job: Job, beh: Dict[str, Any]) -> None:
     if not key:
         return
     dropped = (beh.get("Files") or {}).get("DroppedHashes") or []
-    if not dropped:
+    if not isinstance(dropped, list) or not dropped:
         return
 
-    existing_shas = {e.get("sha256") for e in job.state.get("vt", []) if e.get("sha256")}
-    new_drops = [d for d in dropped if d.get("SHA256") and d["SHA256"] not in existing_shas]
+    seen_shas = {str(e.get("sha256") or "").strip().lower() for e in job.state.get("vt", []) if e.get("sha256")}
+    new_drops: List[Dict[str, Any]] = []
+    for item in dropped:
+        if not isinstance(item, dict):
+            continue
+        raw_sha = item.get("SHA256")
+        if not isinstance(raw_sha, str):
+            continue
+        sha = raw_sha.strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", sha) or sha in seen_shas:
+            continue
+        seen_shas.add(sha)
+        raw_path = item.get("Path")
+        safe_path = raw_path if isinstance(raw_path, str) and raw_path.strip() else "unknown.exe"
+        try:
+            safe_size = max(0, int(item.get("Size") or 0))
+        except (TypeError, ValueError):
+            safe_size = 0
+        new_drops.append({"Path": safe_path, "SHA256": sha, "Size": safe_size})
+        if len(new_drops) >= 10:
+            break
     if not new_drops:
         return
 
-    job.log(f"Sandbox içinde bırakılan {len(new_drops)} yeni çalıştırılabilir dosyanın hash'i VirusTotal'de sorgulanıyor...")
+    msg = f"Sandbox içinde bırakılan {len(new_drops)} yeni çalıştırılabilir dosyanın hash'i VirusTotal'de sorgulanıyor..."
+    job.log(msg)
+    job.stage("sandbox", "running", msg)
     quota = False
-    for item in new_drops[:10]:
+    for item in new_drops:
         job.check_cancel()
         if quota:
             break
         sha = item["SHA256"]
-        p_name = Path(item.get("Path", "unknown.exe")).name
+        p_name = Path(item["Path"]).name or "unknown.exe"
         rel_label = f"[bırakılan] {p_name}"
         entry = {
             "rel": rel_label,
-            "path": item.get("Path", ""),
+            "path": item["Path"],
             "sha256": sha,
-            "size": item.get("Size", 0),
+            "size": item["Size"],
             "status": "Sırada",
             "result": None,
             "gui_url": f"https://www.virustotal.com/gui/file/{sha}",
@@ -996,6 +1025,7 @@ _OBJ_LISTS = [("Processes",), ("Connections",), ("Network", "Connections"), ("Ne
 _INTS = [("Files", "NewCount"), ("Files", "ModifiedCount"), ("SecondsLeft",), ("ProcessCount",), ("SampleProcessCount",),
          ("SuspiciousCount",), ("ConnectionCount",)]
 _BOOLS = [("LanBlock", "Requested"), ("LanBlock", "Applied"), ("LanBlock", "Tampered"), ("StoppedEarly",), ("Admin",)]
+_STRS = [("RunMode",), ("Target",), ("Started",), ("Ended",), ("CaptureStatus",), ("LanBlock", "Status")]
 
 
 def sanitize_sandbox_json(d: Any) -> Optional[Dict[str, Any]]:
@@ -1036,6 +1066,11 @@ def sanitize_sandbox_json(d: Any) -> Optional[Dict[str, Any]]:
         p = parent(path)
         if p is not None:
             p[path[-1]] = p[path[-1]] is True
+    for path in _STRS:
+        p = parent(path)
+        if p is not None:
+            v = p[path[-1]]
+            p[path[-1]] = str(v)[:500] if isinstance(v, (str, int, float)) else ""
     return d
 
 
@@ -1232,7 +1267,7 @@ def compute_verdict(job: Job) -> None:
         if conns:
             notes.append(f"Örneğin başlattığı işlemler {len(conns)} ağ bağlantısı açtı.")
         run_mode = b.get("RunMode") or ""
-        if "in-place" in run_mode:
+        if isinstance(run_mode, str) and "in-place" in run_mode:
             notes.append("Kurulum boyutu büyük olduğu için salt okunur paylaşılan klasörden yerinde çalıştırıldı. Kurulum kendi klasörüne dosya yazmaya çalıştıysa hata vermiş olabilir.")
     elif live:
         q = live.get("Quick") or {}
@@ -1337,40 +1372,83 @@ def write_report(job: Job) -> None:
     write_html_report(job, L)
 
 
+def _render_plain_bold(text: str) -> str:
+    """Escapes HTML everywhere while converting **bold** spans safely."""
+    out: List[str] = []
+    pos = 0
+    for m in re.finditer(r"\*\*([^*]+)\*\*", text):
+        out.append(escape_html(text[pos:m.start()]))
+        out.append(f"<strong>{escape_html(m.group(1))}</strong>")
+        pos = m.end()
+    out.append(escape_html(text[pos:]))
+    return "".join(out)
+
+
+def _render_inline_md(text: str) -> str:
+    """Safely converts `code` and **bold** spans while HTML-escaping all text segments."""
+    out: List[str] = []
+    pos = 0
+    for m in re.finditer(r"`([^`]+)`", text):
+        out.append(_render_plain_bold(text[pos:m.start()]))
+        out.append(f"<code>{escape_html(m.group(1))}</code>")
+        pos = m.end()
+    out.append(_render_plain_bold(text[pos:]))
+    return "".join(out)
+
+
 def write_html_report(job: Job, md_lines: List[str]) -> None:
-    """Generates a standalone, beautiful HTML report for easy offline sharing."""
+    """Generates a standalone, self-contained HTML report with all dynamic content escaped."""
     s = job.state
     v = s.get("verdict", {})
     lvl = v.get("level", "pending")
     badge_color = {"red": "#ef4444", "yellow": "#f59e0b", "green": "#10b981", "pending": "#64748b"}.get(lvl, "#64748b")
-    
-    # Simple markdown-to-html converter for the report lines
-    html_parts = []
+
+    html_parts: List[str] = []
     in_table = False
+    in_list = False
+
+    def close_blocks(keep_table: bool = False, keep_list: bool = False) -> None:
+        nonlocal in_table, in_list
+        if in_table and not keep_table:
+            in_table = False
+            html_parts.append("</tbody></table></div>")
+        if in_list and not keep_list:
+            in_list = False
+            html_parts.append("</ul>")
+
+    def render_cell(c: str) -> str:
+        m = re.fullmatch(r"\[([^\]]+)\]\(([^)]+)\)", c.strip())
+        if m and re.fullmatch(r"https?://[^\s<>\"]+", m.group(2), re.I):
+            return f'<a href="{escape_html(m.group(2))}" target="_blank" rel="noopener noreferrer">{escape_html(m.group(1))}</a>'
+        return escape_html(c)
+
     for line in md_lines:
         line_s = line.strip()
         if line_s.startswith("|") and line_s.endswith("|"):
             cells = [c.strip() for c in line_s.strip("|").split("|")]
             if all(set(c) <= set("-: ") for c in cells):
                 continue
+            close_blocks(keep_table=True)
             if not in_table:
                 in_table = True
                 html_parts.append('<div class="table-wrap"><table>')
                 row_html = "".join(f"<th>{escape_html(c)}</th>" for c in cells)
                 html_parts.append(f"<thead><tr>{row_html}</tr></thead><tbody>")
             else:
-                def render_cell(c):
-                    m = re.match(r"\[([^\]]+)\]\(([^)]+)\)", c)
-                    if m:
-                        return f'<a href="{escape_html(m.group(2))}" target="_blank" rel="noopener">{escape_html(m.group(1))}</a>'
-                    return escape_html(c)
                 row_html = "".join(f"<td>{render_cell(c)}</td>" for c in cells)
                 html_parts.append(f"<tr>{row_html}</tr>")
             continue
-        elif in_table:
-            in_table = False
-            html_parts.append("</tbody></table></div>")
 
+        is_bullet = line_s.startswith("- ") and not line_s.startswith("- **KIRMIZI:**") and not line_s.startswith("- NOT:")
+        if is_bullet:
+            close_blocks(keep_list=True)
+            if not in_list:
+                in_list = True
+                html_parts.append("<ul>")
+            html_parts.append(f"<li>{_render_inline_md(line_s[2:])}</li>")
+            continue
+
+        close_blocks()
         if line_s.startswith("# "):
             html_parts.append(f"<h1>{escape_html(line_s[2:])}</h1>")
         elif line_s.startswith("## "):
@@ -1381,18 +1459,10 @@ def write_html_report(job: Job, md_lines: List[str]) -> None:
             html_parts.append(f'<div class="item-red"><b>🚨 KIRMIZI:</b> {escape_html(line_s[14:].strip())}</div>')
         elif line_s.startswith("- NOT:"):
             html_parts.append(f'<div class="item-note"><b>ℹ️ NOT:</b> {escape_html(line_s[6:].strip())}</div>')
-        elif line_s.startswith("- "):
-            content = line_s[2:]
-            # formatting: `code` and **bold**
-            content = re.sub(r"`([^`]+)`", lambda m: f"<code>{escape_html(m.group(1))}</code>", content)
-            content = re.sub(r"\*\*([^*]+)\*\*", lambda m: f"<strong>{escape_html(m.group(1))}</strong>", content)
-            html_parts.append(f"<li>{content}</li>")
         elif line_s:
-            content = re.sub(r"`([^`]+)`", lambda m: f"<code>{escape_html(m.group(1))}</code>", line_s)
-            content = re.sub(r"\*\*([^*]+)\*\*", lambda m: f"<strong>{escape_html(m.group(1))}</strong>", content)
-            html_parts.append(f"<p>{content}</p>")
-    if in_table:
-        html_parts.append("</tbody></table></div>")
+            html_parts.append(f"<p>{_render_inline_md(line_s)}</p>")
+
+    close_blocks()
 
     body_html = "\n".join(html_parts)
     html = f"""<!DOCTYPE html>
@@ -1409,6 +1479,7 @@ def write_html_report(job: Job, md_lines: List[str]) -> None:
     .item-red {{ background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.4); color: #fca5a5; padding: 0.5rem 0.75rem; border-radius: 8px; margin: 0.3rem 0; font-size: 0.9rem; }}
     .item-note {{ background: rgba(245, 158, 11, 0.15); border: 1px solid rgba(245, 158, 11, 0.4); color: #fde68a; padding: 0.5rem 0.75rem; border-radius: 8px; margin: 0.3rem 0; font-size: 0.9rem; }}
     code {{ background: #1e293b; color: #38bdf8; padding: 0.15rem 0.3rem; border-radius: 4px; font-family: Consolas, monospace; font-size: 0.85em; }}
+    ul {{ padding-left: 1.25rem; margin: 0.4rem 0; }}
     li {{ margin: 0.25rem 0; }}
     .table-wrap {{ overflow-x: auto; margin: 1rem 0; }}
     table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; }}

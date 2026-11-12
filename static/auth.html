@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="tr" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SafeBox — Erişim Doğrulaması</title>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body class="min-h-screen flex items-center justify-center p-4">
+  <div class="glass-card rounded-2xl max-w-md w-full p-6 space-y-4">
+    <div class="flex items-center gap-3">
+      <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-cyan-500 to-blue-600 flex items-center justify-center shadow-lg shadow-cyan-500/20">
+        <svg class="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
+      </div>
+      <div>
+        <h1 class="text-base font-bold text-white">SafeBox Erişim Belirteci</h1>
+        <p class="text-xs text-slate-400">Yerel API ve web paneli korumalı</p>
+      </div>
+    </div>
+    <p class="text-xs text-slate-300 leading-relaxed">
+      Başka yerel programların istek atmasını önlemek için panel erişim belirteciyle korunur.
+      <span class="text-slate-400"><br /><code class="mono text-cyan-300">Baslat.bat</code> ile açarsanız otomatik giriş yapılır; doğrudan açtıysanız sunucu terminalindeki belirteci veya <code class="mono text-cyan-300">%LOCALAPPDATA%\SafeBox\session.token</code> dosyasındaki değeri girin.</span>
+    </p>
+    <div id="authErr" class="hidden text-xs text-rose-300 bg-rose-950/40 border border-rose-500/40 rounded-xl px-3 py-2"></div>
+    <input id="authTokenInput" type="password" autocomplete="off" placeholder="32 karakterli erişim belirteci (token)" class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500 mono" />
+    <button id="btnAuthSubmit" class="w-full px-4 py-2.5 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-sm font-semibold text-white shadow-lg shadow-cyan-500/20">Paneli Aç</button>
+  </div>
+  <script src="/static/auth.js" defer></script>
+</body>
+</html>

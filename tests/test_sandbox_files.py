@@ -40,3 +40,11 @@ def test_wsb_config_is_hardened(tmp_path):
     # sample + tools read-only, only output writable
     assert xml.count("<ReadOnly>true</ReadOnly>") == 2 and xml.count("<ReadOnly>false</ReadOnly>") == 1
     assert "<Networking>Disable</Networking>" in sbm.build_wsb(tmp_path, network=False)
+    assert "<MemoryInMB>1024</MemoryInMB>" in sbm.build_wsb(tmp_path, network=True, memory_mb=256)
+    assert "<MemoryInMB>65536</MemoryInMB>" in sbm.build_wsb(tmp_path, network=True, memory_mb=999999)
+
+
+def test_script_has_pkt_size_and_dropped_hashes():
+    ps = (ROOT / "sandbox" / "Inside-Sandbox.ps1").read_text(encoding="utf-8")
+    assert "--pkt-size 512" in ps
+    assert "DroppedHashes" in ps

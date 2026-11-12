@@ -123,22 +123,22 @@ Bu belge kodun tamamı okunarak hazırlandı. "Doğrulandı" yazan maddeler kodd
 
 ## B. Geliştirilebilecek yerler
 
-- **Panel dış kaynağa bağımlı.** — ✅ DÜZELTİLDİ (Gemini): Tailwind kütüphanesi `static/tailwind.js` olarak yerelleştirildi. `app.py` middleware seviyesinde sıkı Content-Security-Policy (CSP) başlığı, X-Frame-Options: DENY ve nosniff koruması eklendi.
-- **Depoda test yok.** — ✅ DÜZELTİLDİ (Gemini): 101 adet senaryo ve birim testi `tests/` klasörüne taşındı (`test_extract.py`, `test_virustotal.py`, `test_verdict.py`, `test_jobs.py`, `test_sandbox_files.py`, `test_static.py`, `test_app.py`). `.github/workflows/tests.yml` ile GitHub Actions CI bağlandı.
-- **README sadece Türkçe.** — ✅ DÜZELTİLDİ (Gemini): Kapsamlı İngilizce README (`README.md`), mimari diyagramı ve web arayüzünün ekran görüntüsü (`static/screenshot.png`) eklendi. Orijinal Türkçe döküman `README.tr.md` olarak korundu.
+- **Panel dış kaynağa bağımlı.** — ✅ DÜZELTİLDİ (Gemini): CDN bağımlılığı ve satır içi `<script>`/`<style>` blokları tamamen kaldırıldı (`static/styles.css`, `static/app.js`, `static/auth.js`). `app.py` ara katmanı gerçek sıkı CSP (`default-src 'none'; script-src 'self'; style-src 'self'`, `'unsafe-inline'`/`'unsafe-eval'` yok), `X-Frame-Options: DENY`, `nosniff` ve `Cache-Control: no-store` döndürür.
+- **Depoda test yok.** — ✅ DÜZELTİLDİ (Gemini): 109 adet senaryo ve birim testi `tests/` klasörüne taşındı (`test_extract.py`, `test_virustotal.py`, `test_verdict.py`, `test_jobs.py`, `test_sandbox_files.py`, `test_static.py`, `test_app.py`). `.github/workflows/tests.yml` ile GitHub Actions CI bağlandı.
+- **README sadece Türkçe.** — ✅ DÜZELTİLDİ (Gemini): İngilizce `README.md`, mimari diyagramı ve tam yüklenmiş web arayüzünün ekran görüntüsü (`static/screenshot.png`) eklendi. Türkçe döküman `README.tr.md` olarak korundu.
 - ~~**Analiz yönetimi**~~ (C11) — A12 ile birlikte yapıldı: silme, iptal, eskileri temizleme.
 - **Yeni Sandbox komut satırı.** Windows 11 24H2 ve sonrasında `wsb start`, `wsb exec`, `wsb stop` komutları var. Pencere açıp işlem adından durum tahmin etmek yerine bunlar kullanılırsa başlatma, durum sorma ve kapatma güvenilir olur.
-- **Sandbox belleği panelden ayarlanamıyor.** — ✅ DÜZELTİLDİ (Gemini): Panel arayüzüne bellek seçim kutusu (2 GB, 4 GB varsayılan, 8 GB ağır kurulum, 12 GB, 16 GB) eklendi ve `pipeline.create_job` / `build_wsb` akışına bağlandı.
-- **Salt okunur klasörden çalışan kurulumlar.** — ✅ DÜZELTİLDİ (Gemini): 1 GB üstü kurulumlar `in-place` (salt okunur) çalıştırıldığında `pipeline.compute_verdict` bunu tespit eder ve rapora açık uyarı notu ekler.
-- **Ağ kaydı tavanı.** — ✅ DÜZELTİLDİ (Gemini): `Inside-Sandbox.ps1` içindeki `pktmon` başlatma komutuna `--pkt-size 512` parametresi eklendi. Büyük indirmelerde 2 GB sınırının dolup ilk paketlerin ezilmesi engellendi.
-- **Rapor dili ve biçimi.** — ✅ DÜZELTİLDİ (Gemini): HTML (`report.html`) ve JSON (`state.json`) dışa aktarma eklendi. Panelden tek tıkla yeni sekmede HTML rapor açma ve JSON indirme butonları yerleştirildi.
-- **Yerel API'de kimlik doğrulama yok.** — ✅ DÜZELTİLDİ (Gemini): Başlangıçta rastgele üretilen `API_TOKEN` ile yerel API koruması eklendi. Panel `X-SafeBox-Token` başlığı ve HTTP-only güvenli çerezle doğrulanır, yabancı yerel istekler 401 alır.
+- **Sandbox belleği panelden ayarlanamıyor.** — ✅ DÜZELTİLDİ (Gemini): Panel arayüzüne 2 GB–16 GB RAM seçim kutusu eklendi; backend `pipeline.create_job` ve `sandbox_manager.build_wsb` bellek (1024–65536 MB) ve süre (1–180 dk) değerlerini sınırlandırıp doğrular.
+- **Salt okunur klasörden çalışan kurulumlar.** — ✅ DÜZELTİLDİ (Gemini): 1 GB üstü kurulumlar `in-place` çalıştırıldığında `compute_verdict` rapora uyarı ekler; `sanitize_sandbox_json` `RunMode`/`Target` alanlarını stringe zorlayarak tip zehirlenmesini engeller.
+- **Ağ kaydı tavanı.** — ✅ DÜZELTİLDİ (Gemini): `Inside-Sandbox.ps1` içindeki `pktmon start` komutuna `--pkt-size 512` eklendi (Windows `pktmon` varsayılanı olan 128 byte'ta HTTP/TLS SNI başlıklarının kesilmesini önlerken tam paketlerin 2 GB kaydı gereksiz şişirmesini 512 byte ile sınırlar). *Not: Çok büyük indirmelerde 2 GB döngüsel tampon hâlâ dolabilir.*
+- **Rapor dili ve biçimi.** — ✅ DÜZELTİLDİ (Gemini): HTML (`report.html`) ve JSON (`state.json`) dışa aktarma eklendi. `write_html_report` tüm düz metin, liste, kod/kalın blokları ve tablo linklerini XSS'e karşı temizler (`javascript:` engelli); `report?format=html` betiksiz (`default-src 'none'; style-src 'unsafe-inline'`) CSP ile sunulur.
+- **Yerel API'de kimlik doğrulama yok.** — ✅ DÜZELTİLDİ (Gemini): Tüm `/api/*` uç noktaları (`GET` dahil; yalnızca `/api/health` ve `/api/auth` hariç) ve `GET /` rastgele `API_TOKEN` ile korunur; yetkisiz `GET /` token veya çerez sızdırmaz (`401`). `Baslat.bat` `%LOCALAPPDATA%\SafeBox\session.token` üzerinden tek tıkla otomatik oturum açar; tarayıcı/API istekleri `X-SafeBox-Token` ve `HttpOnly; SameSite=Strict` çerezle doğrulanır.
 
 ## C. Yeni özellik önerileri
 
 Etkisine göre sıralı.
 
-1. **Bırakılan dosyaların hash'ini VirusTotal'de sorgulamak.** — ✅ YAPILDI (Gemini): `Inside-Sandbox.ps1`, analiz sonunda oluşan yeni çalıştırılabilir dosyaların (`NewExecutables`) SHA-256 hash'lerini hesaplar. `pipeline.py` sandbox bitiminde bu hash'leri VirusTotal API'sinde sorgular (`_check_dropped_files_vt`). İkincil zararlılar güvenle yakalanır.
+1. **Bırakılan dosyaların hash'ini VirusTotal'de sorgulamak.** — ✅ YAPILDI (Gemini): `Inside-Sandbox.ps1` yeni çalıştırılabilirlerin (`NewExecutables`) SHA-256 hash'lerini toplar (`DroppedHashes`); `_check_dropped_files_vt` 64 hane hex doğrulaması yapıp büyük/küçük harfi normalize ederek tekilleştirir ve en fazla 10 yeni hash'i dosya yüklemeden VT'de sorgular.
 2. **Kurulum paketlerinin içini açmak.** 7-Zip, NSIS ve MSI gibi birçok kurulum biçimini açabiliyor. Statik analiz şu an sadece dıştaki `setup.exe`'ye bakıyor. İçindeki dosyalar da envantere girerse imzası bozuk DLL'ler çalıştırmadan görülür.
 3. **YARA kuralları.** `yara-python` ile açık kural setleri (örneğin YARA-Forge) statik adıma eklenebilir. A9'daki el yapımı desenlerden çok daha isabetli olur.
 4. **Ekran görüntüleri.** İzleme sırasında 30 saniyede bir sandbox ekranının görüntüsü. Sahte kurulum ekranları ve fidye notları tek bakışta anlaşılır.

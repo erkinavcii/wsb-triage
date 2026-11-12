@@ -107,10 +107,11 @@ def build_wsb(case_dir: Path, network: bool, memory_mb: int = 4096, input_dir: O
         f"    <MappedFolder><HostFolder>{escape(str(h))}</HostFolder><SandboxFolder>{b}</SandboxFolder><ReadOnly>{ro}</ReadOnly></MappedFolder>"
         for h, b, ro in maps
     )
+    safe_memory = max(1024, min(65536, int(memory_mb or 4096)))
     return f"""<Configuration>
   <VGpu>Disable</VGpu>
   <Networking>{"Enable" if network else "Disable"}</Networking>
-  <MemoryInMB>{int(memory_mb)}</MemoryInMB>
+  <MemoryInMB>{safe_memory}</MemoryInMB>
   <AudioInput>Disable</AudioInput>
   <VideoInput>Disable</VideoInput>
   <PrinterRedirection>Disable</PrinterRedirection>

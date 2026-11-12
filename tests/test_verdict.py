@@ -49,7 +49,9 @@ def test_verdict_survives_hostile_behavior(tmp_path):
 
 def test_panel_escapes_box_titles():
     html = (pipeline.BASE_DIR / "static" / "index.html").read_text(encoding="utf-8")
-    assert "asNum" in html and "asArr" in html
+    js = (pipeline.BASE_DIR / "static" / "app.js").read_text(encoding="utf-8")
+    assert "<script>" not in html and "<style>" not in html
+    assert "asNum" in js and "asArr" in js
 
 
 # ---------------------------------------------------------------- A6
@@ -156,3 +158,40 @@ def test_signatures_are_read(tmp_path, unsigned_exe):
     assert timed_out == 0
     assert res[good]["status"] == "Valid"
     assert res[bad]["status"] != "Valid"
+
+
+def test_in_place_run_mode_note_and_non_string_safety(tmp_path):
+    job = bare_job(tmp_path)
+    job.state["behavior"] = pipeline.sanitize_sandbox_json({"RunMode": "in-place (read-only share)"})
+    pipeline.compute_verdict(job)
+    assert any("salt okunur" in n for n in job.state["verdict"]["notes"])
+
+    # Hostile non-string RunMode in behavior JSON must never raise TypeError
+    job.state["behavior"] = pipeline.sanitize_sandbox_json({"RunMode": 12345})
+    assert job.state["behavior"]["RunMode"] == "12345"
+    pipeline.compute_verdict(job)
+
+
+def test_write_html_report_escapes_xss_and_renders_markdown(tmp_path):
+    job = bare_job(tmp_path)
+    md = [
+        "# Başlık <script>alert(1)</script>",
+        "- plain <img src=x onerror=alert(1)> bullet",
+        "- **`<code>`** ve `a*b<x>` ve **kalın <svg onload=1>**",
+        "- **KIRMIZI:** saldırı <b>raw</b>",
+        "| Ad | Link |",
+        "|---|---|",
+        "| bad | [x](javascript:alert(1)) |",
+        "| ok | [VT](https://www.virustotal.com/gui/file/abc) |",
+    ]
+    pipeline.write_html_report(job, md)
+    html_out = (job.case_dir / "report.html").read_text(encoding="utf-8")
+    assert "<script>" not in html_out
+    assert "<img " not in html_out
+    assert "<svg " not in html_out
+    assert "<b " not in html_out and "<b>raw</b>" not in html_out
+    assert 'href="javascript:' not in html_out
+    assert "<ul>" in html_out and "</ul>" in html_out
+    assert "<code>&lt;code&gt;</code>" in html_out
+    assert "<strong>kalın &lt;svg onload=1&gt;</strong>" in html_out
+    assert 'href="https://www.virustotal.com/gui/file/abc"' in html_out

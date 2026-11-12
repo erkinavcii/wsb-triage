@@ -1,14 +1,16 @@
+import html
 import json
 import os
 import re
 import secrets
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -23,6 +25,7 @@ UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 STATIC_DIR = BASE_DIR / "static"
 PORT = int(os.environ.get("SAFEBOX_PORT", "8765"))
 API_TOKEN = os.environ.get("SAFEBOX_TOKEN") or secrets.token_hex(16)
+TOKEN_FILE = Path(os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()) / "SafeBox" / "session.token"
 
 app = FastAPI(title="SafeBox - Zararlı Yazılım & Sandbox Analiz Merkezi")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -30,6 +33,17 @@ watcher = pipeline.DownloadWatcher()
 
 
 ALLOWED_ORIGINS = {f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}", f"http://[::1]:{PORT}"}
+
+
+def _extract_token(request: Request) -> Optional[str]:
+    if "x-safebox-token" in request.headers:
+        return request.headers.get("x-safebox-token")
+    return request.cookies.get("safebox_token")
+
+
+def _is_authenticated(request: Request) -> bool:
+    tok = _extract_token(request)
+    return bool(tok) and secrets.compare_digest(tok, API_TOKEN)
 
 
 @app.middleware("http")
@@ -47,11 +61,12 @@ async def local_only(request: Request, call_next):
         if (origin and origin not in ALLOWED_ORIGINS) or (site and site not in ("same-origin", "none")):
             return JSONResponse({"detail": "Başka bir siteden gelen istek reddedildi."}, status_code=403)
 
-    # 3) Local API Token check: protect mutating API endpoints (/api/jobs, /api/watch, etc.)
-    # Browser UI sends X-SafeBox-Token (passed via initial index HTML) or cookie
-    if request.url.path.startswith("/api/") and request.method not in ("GET", "HEAD", "OPTIONS"):
-        token = request.headers.get("X-SafeBox-Token") or request.cookies.get("safebox_token")
-        if not token or not secrets.compare_digest(token, API_TOKEN):
+    # 3) Local API Token check: protect ALL API endpoints (/api/*), except /api/health and /api/auth.
+    open_api = (request.url.path == "/api/health" and request.method in ("GET", "HEAD")) or (
+        request.url.path == "/api/auth" and request.method == "POST"
+    )
+    if request.url.path.startswith("/api/") and not open_api:
+        if not _is_authenticated(request):
             return JSONResponse({"detail": "Yetkisiz erişim: API belirteci (token) eksik veya geçersiz."}, status_code=401)
 
     # 4) Upload size: checked before the body is read (Starlette spools the whole upload to a temp file first).
@@ -59,22 +74,37 @@ async def local_only(request: Request, call_next):
         problem = _upload_problem(request.headers.get("content-length"))
         if problem:
             return JSONResponse({"detail": problem[1]}, status_code=problem[0])
-            return JSONResponse({"detail": problem[1]}, status_code=problem[0])
     response = await call_next(request)
-    # Content-Security-Policy & security headers
-    response.headers["Content-Security-Policy"] = (
-        "default-src 'none'; "
-        "script-src 'self' 'unsafe-eval' 'unsafe-inline'; "
-        "style-src 'self' 'unsafe-inline'; "
-        "img-src 'self' data:; "
-        "connect-src 'self'; "
-        "font-src 'self'; "
-        "base-uri 'none'; "
-        "frame-ancestors 'none'; "
-        "form-action 'none';"
+    # Content-Security-Policy & security headers (strict script-src 'self' & style-src 'self' for main panel)
+    is_html_report = (
+        request.url.path.endswith("/report")
+        and request.query_params.get("format") == "html"
+        and response.status_code < 400
     )
+    if is_html_report:
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'none'; "
+            "style-src 'unsafe-inline'; "
+            "base-uri 'none'; "
+            "frame-ancestors 'none'; "
+            "form-action 'none';"
+        )
+    else:
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'none'; "
+            "script-src 'self'; "
+            "style-src 'self'; "
+            "img-src 'self' data:; "
+            "connect-src 'self'; "
+            "font-src 'self'; "
+            "base-uri 'none'; "
+            "frame-ancestors 'none'; "
+            "form-action 'none';"
+        )
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
+    if not request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-store"
     return response
 
 
@@ -135,13 +165,40 @@ class WatchRequest(BaseModel):
     auto_start: bool = False
 
 
+class AuthRequest(BaseModel):
+    token: str
+
+
 # ------------------------------------------------------------------ pages / status
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
-    resp = HTMLResponse(html.replace('window.__SAFEBOX_TOKEN__ = "";', f'window.__SAFEBOX_TOKEN__ = "{API_TOKEN}";'))
-    resp.set_cookie("safebox_token", API_TOKEN, httponly=True, samesite="strict")
+@app.get("/api/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/api/auth")
+def auth(req: AuthRequest):
+    if not secrets.compare_digest(req.token.strip(), API_TOKEN):
+        raise HTTPException(401, "Geçersiz erişim belirteci (token).")
+    resp = JSONResponse({"status": "ok"})
+    resp.set_cookie("safebox_token", API_TOKEN, httponly=True, samesite="strict", path="/")
     return resp
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request, token: Optional[str] = None):
+    if token is not None:
+        if not secrets.compare_digest(token.strip(), API_TOKEN):
+            return HTMLResponse((STATIC_DIR / "auth.html").read_text(encoding="utf-8"), status_code=401)
+        resp = RedirectResponse("/", status_code=303)
+        resp.set_cookie("safebox_token", API_TOKEN, httponly=True, samesite="strict", path="/")
+        return resp
+    if not _is_authenticated(request):
+        return HTMLResponse((STATIC_DIR / "auth.html").read_text(encoding="utf-8"), status_code=401)
+    html_text = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    safe_tok = html.escape(API_TOKEN, quote=True)
+    return HTMLResponse(
+        html_text.replace('<meta name="safebox-token" content="" />', f'<meta name="safebox-token" content="{safe_tok}" />')
+    )
 
 
 @app.get("/api/system-status")
@@ -371,4 +428,12 @@ def make_demo():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=PORT)
+    TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TOKEN_FILE.write_text(API_TOKEN, encoding="utf-8")
+    if os.name != "nt":
+        os.chmod(TOKEN_FILE, 0o600)
+    print(f"SafeBox Web Panel: http://127.0.0.1:{PORT}/?token={API_TOKEN}", flush=True)
+    try:
+        uvicorn.run(app, host="127.0.0.1", port=PORT)
+    finally:
+        TOKEN_FILE.unlink(missing_ok=True)

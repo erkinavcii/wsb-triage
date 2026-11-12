@@ -20,26 +20,53 @@ def test_index_is_served(client):
     r = client.get("/")
     assert r.status_code == 200
     assert "<html" in r.text.lower()
-    assert "/static/tailwind.js" in r.text
-    assert "Content-Security-Policy" in r.headers
-    assert "default-src 'none'" in r.headers["Content-Security-Policy"]
-    assert app_module.API_TOKEN in r.text
+    assert "/static/styles.css" in r.text
+    assert "/static/app.js" in r.text
+    csp = r.headers.get("Content-Security-Policy", "")
+    assert "default-src 'none'" in csp
+    assert "script-src 'self'" in csp
+    assert "style-src 'self'" in csp
+    assert "'unsafe-inline'" not in csp
+    assert "'unsafe-eval'" not in csp
+    assert r.headers.get("Cache-Control") == "no-store"
+    assert f'content="{app_module.API_TOKEN}"' in r.text
 
 
 def test_api_token_protection(client):
-    # Post without token -> 401
-    bad_client = TestClient(app_module.app, base_url=BASE)
-    r = bad_client.post("/api/watch", json={"enabled": False})
-    assert r.status_code == 401
-    assert "API belirteci" in r.text
+    bad_client = TestClient(app_module.app, base_url=BASE, follow_redirects=False)
 
-    # Post with invalid token -> 401
-    r = bad_client.post("/api/watch", json={"enabled": False}, headers={"X-SafeBox-Token": "wrong-token"})
-    assert r.status_code == 401
+    # Unauthenticated GET / returns 401 unlock screen and NEVER leaks token or cookie
+    r_root = bad_client.get("/")
+    assert r_root.status_code == 401
+    assert app_module.API_TOKEN not in r_root.text
+    assert "safebox_token" not in r_root.cookies
 
-    # Post with valid token in header -> passes auth
-    r = bad_client.post("/api/watch", json={"enabled": False}, headers={"X-SafeBox-Token": app_module.API_TOKEN})
-    assert r.status_code == 200
+    # Minimal health probe is open for launcher readiness polling
+    assert bad_client.get("/api/health").status_code == 200
+
+    # All real API GET and POST endpoints reject unauthenticated callers
+    for path in ("/api/jobs", "/api/system-status", "/api/browse-dialog", "/api/jobs/missing/report",
+                 f"/api/vt/query/{'0' * 64}"):
+        assert bad_client.get(path).status_code == 401, f"{path} was not protected"
+    assert bad_client.post("/api/watch", json={"enabled": False}).status_code == 401
+    assert bad_client.post("/api/watch", json={"enabled": False}, headers={"X-SafeBox-Token": "wrong-token"}).status_code == 401
+
+    # Query token exchange redirects cleanly and sets HttpOnly cookie
+    r_redir = bad_client.get(f"/?token={app_module.API_TOKEN}")
+    assert r_redir.status_code == 303
+    assert r_redir.cookies.get("safebox_token") == app_module.API_TOKEN
+    assert bad_client.get("/").status_code == 200
+
+    # Valid cookie MUST NOT bypass an explicit bad/empty X-SafeBox-Token header
+    assert bad_client.post("/api/watch", json={"enabled": False}, headers={"X-SafeBox-Token": ""}).status_code == 401
+    assert bad_client.post("/api/watch", json={"enabled": False}, headers={"X-SafeBox-Token": "wrong"}).status_code == 401
+
+    # /api/auth accepts valid JSON token and rejects invalid ones
+    assert bad_client.post("/api/auth", json={"token": "nope"}).status_code == 401
+    assert bad_client.post("/api/auth", json={"token": app_module.API_TOKEN}).status_code == 200
+
+    # Valid header passes
+    assert client.post("/api/watch", json={"enabled": False}).status_code == 200
 
 
 def test_foreign_host_is_refused(client):
@@ -108,8 +135,26 @@ def test_report_formats(client, tmp_path, monkeypatch):
     r_html = client.get("/api/jobs/test-formats/report?format=html")
     assert r_html.status_code == 200
     assert "<h1>Test Report</h1>" in r_html.text
+    html_csp = r_html.headers.get("Content-Security-Policy", "")
+    assert "default-src 'none'" in html_csp
+    assert "script-src" not in html_csp
 
     # json report
     r_json = client.get("/api/jobs/test-formats/report?format=json")
     assert r_json.status_code == 200
     assert r_json.json()["id"] == "test-formats"
+
+
+def test_job_creation_clamps_memory_and_duration(tmp_path, monkeypatch):
+    sample = tmp_path / "dummy.bat"
+    sample.write_text("@echo off\n", encoding="utf-8")
+    monkeypatch.setattr(pipeline, "CASES_DIR", tmp_path / "cases")
+    monkeypatch.setattr(pipeline, "run_job", lambda j: None)
+
+    j_low = pipeline.create_job(str(sample), {"memory_mb": 128, "duration_min": -5, "run_sandbox": False})
+    assert j_low.opt("memory_mb") == 1024
+    assert j_low.opt("duration_min") == 1
+
+    j_high = pipeline.create_job(str(sample), {"memory_mb": 999999, "duration_min": 500, "run_sandbox": False})
+    assert j_high.opt("memory_mb") == 65536
+    assert j_high.opt("duration_min") == 180

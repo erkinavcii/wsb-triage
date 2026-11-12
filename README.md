@@ -31,11 +31,11 @@ SafeBox is a lightweight, local web-based triage and malware analysis workbench 
 - **Network Traffic Summaries:**
   - Automated `tshark` dissection: DNS queries, TLS Server Name Indication (SNI), and HTTP endpoints with categorization (Microsoft background noise, Shared Cloud/CDN, Abused infrastructure, or Unknown).
 - **Comprehensive Reporting:**
-  - Generates structured Markdown (`report.md`), interactive standalone HTML (`report.html`), and machine-readable JSON (`state.json`).
+  - Generates structured Markdown (`report.md`), clean standalone HTML (`report.html`), and machine-readable JSON (`state.json`).
 - **Download Folder Watcher:**
   - Real-time watcher for browser downloads with baseline diffing, stable-size debouncing, and automated triage.
 - **Hardened Local Security:**
-  - Bound strictly to `127.0.0.1`, DNS rebinding protection, CSRF prevention (`Sec-Fetch-Site` & `Origin`), strict Content-Security-Policy (CSP), and random secret API token validation (`X-SafeBox-Token`).
+  - Bound strictly to `127.0.0.1`, DNS rebinding protection, CSRF prevention (`Sec-Fetch-Site` & `Origin`), strict Content-Security-Policy (`script-src 'self'; style-src 'self'`), and startup secret API token validation (`X-SafeBox-Token` / `HttpOnly` cookie) across all `/api/*` endpoints.
 
 ---
 
@@ -44,7 +44,7 @@ SafeBox is a lightweight, local web-based triage and malware analysis workbench 
 ```
                       +---------------------------------------+
                       |       SafeBox Host Web UI (8765)      |
-                      |   FastAPI + Local Tailwind CSS + CSP  |
+                      |    FastAPI + Static CSS + Strict CSP  |
                       +-------------------+-------------------+
                                           |
                         +-----------------+-----------------+
@@ -56,7 +56,7 @@ SafeBox is a lightweight, local web-based triage and malware analysis workbench 
             - Static PE / strings             - In-sandbox monitor script
             - VirusTotal API lookup           - pktmon / pcapng network capture
                         |                     - Live process & persistence diff
-                        +-----------------+---+
+                        +-----------------+-----------------+
                                           |
                                 [Comprehensive Report]
                            (Markdown, HTML & State JSON)
@@ -92,11 +92,11 @@ SafeBox is a lightweight, local web-based triage and malware analysis workbench 
    ```
 
 3. Launch SafeBox:
-   - Double-click **`Baslat.bat`** or run:
+   - Double-click **`Baslat.bat`** (automatically handles the session token and opens the browser), or run:
      ```cmd
      python app.py
      ```
-   - Open your browser at **`http://127.0.0.1:8765`**.
+   - Open the printed authenticated URL (`http://127.0.0.1:8765/?token=...`) or paste the session token shown in console (`%LOCALAPPDATA%\SafeBox\session.token`) into the browser prompt.
 
 ---
 
