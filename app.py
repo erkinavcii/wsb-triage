@@ -49,7 +49,22 @@ async def local_only(request: Request, call_next):
         problem = _upload_problem(request.headers.get("content-length"))
         if problem:
             return JSONResponse({"detail": problem[1]}, status_code=problem[0])
-    return await call_next(request)
+    response = await call_next(request)
+    # Content-Security-Policy & security headers
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'none'; "
+        "script-src 'self' 'unsafe-eval' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "connect-src 'self'; "
+        "font-src 'self'; "
+        "base-uri 'none'; "
+        "frame-ancestors 'none'; "
+        "form-action 'none';"
+    )
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    return response
 
 
 MAX_UPLOAD_BYTES = 4 * 1024 ** 3        # bigger files: pick them by path (no copy needed)

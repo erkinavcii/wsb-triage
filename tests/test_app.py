@@ -16,6 +16,9 @@ def test_index_is_served(client):
     r = client.get("/")
     assert r.status_code == 200
     assert "<html" in r.text.lower()
+    assert "/static/tailwind.js" in r.text
+    assert "Content-Security-Policy" in r.headers
+    assert "default-src 'none'" in r.headers["Content-Security-Policy"]
 
 
 def test_foreign_host_is_refused(client):
