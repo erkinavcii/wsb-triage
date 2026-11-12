@@ -8,7 +8,10 @@ Each analysis is a "case" folder under cases/:
     output/  written by the sandbox: live.json, behavior.json, capture.pcapng, timeline.log
     state.json, inventory.json, report.md
 """
+import csv
 import hashlib
+import io
+import ipaddress
 import json
 import os
 import re
@@ -19,9 +22,10 @@ import time
 import traceback
 import uuid
 import zipfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import analyzer
 import sandbox_manager as sbm
@@ -1579,6 +1583,251 @@ def write_html_report(job: Job, md_lines: List[str]) -> None:
 
 def escape_html(s: Any) -> str:
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#39;")
+
+
+_NOISE_DOMAIN_CLASSES = {"Windows/Microsoft (gürültü)", "Yerel (gürültü)"}
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _csv_safe(val: Any) -> str:
+    s = str(val or "")
+    if s and s[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + s
+    return s
+
+
+def _stix_escape(val: Any) -> str:
+    return str(val or "").replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _clean_ip(raw: Any) -> Optional[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    txt = str(raw or "").strip()
+    if not txt:
+        return None
+    if txt.startswith("[") and "]" in txt:
+        txt = txt[1:txt.index("]")]
+    try:
+        return ipaddress.ip_address(txt)
+    except ValueError:
+        return None
+
+
+def collect_iocs(job: Job, include_noise: bool = False) -> List[Dict[str, Any]]:
+    """Extracts deduplicated file hashes, domains, IPs, and URLs from job state & inventory."""
+    s = job.snapshot()
+    found: Dict[tuple, Dict[str, Any]] = {}
+
+    def add(ioc_type: str, value: str, source: str, classification: str = "",
+            context: str = "", malicious: bool = False) -> None:
+        v = str(value or "").strip()
+        if not v:
+            return
+        norm = v.lower() if ioc_type in ("sha256", "domain", "ipv4", "ipv6") else v
+        key = (ioc_type, norm)
+        cur = found.get(key)
+        if cur is None:
+            found[key] = {
+                "type": ioc_type,
+                "value": norm if ioc_type in ("sha256", "domain", "ipv4", "ipv6") else v,
+                "source": source,
+                "classification": classification,
+                "context": context[:300],
+                "malicious": bool(malicious),
+            }
+            return
+        if malicious:
+            cur["malicious"] = True
+        if source and source not in cur["source"].split(", "):
+            cur["source"] = f"{cur['source']}, {source}"
+        if classification and classification not in cur["classification"]:
+            cur["classification"] = f"{cur['classification']}; {classification}" if cur["classification"] else classification
+        if context and context not in cur["context"] and len(cur["context"]) < 240:
+            cur["context"] = f"{cur['context']} | {context}"[:300] if cur["context"] else context[:300]
+
+    # 1. File hashes (inventory + static + VT + sandbox dropped hashes)
+    orig_sha = (s.get("inventory") or {}).get("original_sha256")
+    if orig_sha and _SHA256_RE.fullmatch(orig_sha.lower()):
+        add("sha256", orig_sha.lower(), "sample", "Orijinal örnek", Path(s.get("sample", "")).name)
+
+    inv = _load_inventory(job)
+    for rec in inv.get("files") or []:
+        sha = (rec.get("sha256") or "").strip().lower()
+        if _SHA256_RE.fullmatch(sha):
+            sig_st = ((rec.get("sig") or {}).get("status")) or ""
+            add("sha256", sha, "sample", f"İmza: {sig_st}" if sig_st else "Envanter",
+                rec.get("rel", ""), malicious=(sig_st == "HashMismatch"))
+
+    for st in s.get("static") or []:
+        sha = (st.get("sha256") or "").strip().lower()
+        if _SHA256_RE.fullmatch(sha):
+            score = int(st.get("risk_score") or 0)
+            yara = [m.get("rule") for m in (st.get("yara_matches") or []) if m.get("rule")]
+            cls = f"Risk {score}/100" + (f" [YARA: {', '.join(yara[:3])}]" if yara else "")
+            add("sha256", sha, "static", cls, st.get("rel", ""),
+                malicious=(score >= 50 or bool(yara)))
+        for u in st.get("interesting_urls") or []:
+            u = str(u).strip()
+            if u.startswith(("http://", "https://")):
+                host = (urlparse(u).hostname or "").lower().rstrip(".")
+                dcls = domain_class(host) if host else CLASS_UNKNOWN
+                if host and (include_noise or dcls not in _NOISE_DOMAIN_CLASSES):
+                    add("domain", host, "static", dcls, f"URL içinde: {st.get('rel', '')}",
+                        malicious=(dcls == CLASS_ABUSED))
+                if include_noise or not host or dcls not in _NOISE_DOMAIN_CLASSES:
+                    add("url", u, "static", dcls, st.get("rel", ""), malicious=(dcls == CLASS_ABUSED))
+
+    for e in s.get("vt") or []:
+        sha = (e.get("sha256") or "").strip().lower()
+        if _SHA256_RE.fullmatch(sha):
+            r = e.get("result") or {}
+            mal = int((r.get("stats") or {}).get("malicious") or 0) if r else 0
+            tot = int((r.get("stats") or {}).get("total") or 0) if r else 0
+            lbl = r.get("suggested_threat_label") or e.get("status") or ""
+            cls = f"VT {mal}/{tot} ({lbl})" if tot else f"VT: {lbl}"
+            add("sha256", sha, "vt", cls, e.get("rel", ""), malicious=(mal > 0))
+
+    b = s.get("behavior") or {}
+    for d in (b.get("Files") or {}).get("DroppedHashes") or []:
+        if not isinstance(d, dict):
+            continue
+        sha = str(d.get("SHA256") or "").strip().lower()
+        if _SHA256_RE.fullmatch(sha):
+            add("sha256", sha, "dropped", "Sandbox'ta yeni oluşturulan dosya", str(d.get("Path") or ""))
+
+    # 2. Domains & URLs from network summary + sandbox DNS cache
+    net = s.get("network") or {}
+    for entry in (net.get("dns") or []) + (net.get("sni") or []):
+        dom = str(entry.get("name") or "").strip().lower().rstrip(".")
+        if not dom or _clean_ip(dom):
+            continue
+        dcls = entry.get("class") or domain_class(dom)
+        if include_noise or dcls not in _NOISE_DOMAIN_CLASSES:
+            add("domain", dom, "network", dcls, f"×{entry.get('count', 1)}",
+                malicious=(dcls == CLASS_ABUSED))
+
+    for row in net.get("http") or []:
+        host = str(row.get("host") or "").strip().lower().rstrip(".")
+        uri = str(row.get("uri") or "")
+        method = str(row.get("method") or "GET")
+        dcls = row.get("class") or (domain_class(host) if host else CLASS_UNKNOWN)
+        if host and not _clean_ip(host) and (include_noise or dcls not in _NOISE_DOMAIN_CLASSES):
+            add("domain", host, "network", dcls, f"HTTP {method}", malicious=(dcls == CLASS_ABUSED))
+        if host and (include_noise or dcls not in _NOISE_DOMAIN_CLASSES):
+            add("url", f"http://{host}{uri}", "network", dcls, f"HTTP {method}",
+                malicious=(dcls == CLASS_ABUSED))
+
+    for dns_row in (b.get("Network") or {}).get("DnsCache") or []:
+        if not isinstance(dns_row, dict):
+            continue
+        dom = str(dns_row.get("Name") or "").strip().lower().rstrip(".")
+        if not dom or _clean_ip(dom):
+            continue
+        dcls = domain_class(dom)
+        if include_noise or dcls not in _NOISE_DOMAIN_CLASSES:
+            add("domain", dom, "behavior", dcls, f"DnsCache -> {dns_row.get('Data') or ''}",
+                malicious=(dcls == CLASS_ABUSED))
+
+    # 3. IP addresses from sandbox connections + tshark SYN targets
+    for conn in (b.get("Network") or {}).get("Connections") or []:
+        if not isinstance(conn, dict):
+            continue
+        ip_obj = _clean_ip(conn.get("Remote"))
+        if not ip_obj or ip_obj.is_unspecified or ip_obj.is_loopback or ip_obj.is_multicast:
+            continue
+        from_sample = bool(conn.get("FromSample"))
+        if (ip_obj.is_private or ip_obj.is_link_local) and not (include_noise or from_sample):
+            continue
+        itype = "ipv6" if ip_obj.version == 6 else "ipv4"
+        proc = str(conn.get("Process") or "")
+        port = conn.get("Port") or ""
+        cls = "Yerel/LAN (örnek)" if (ip_obj.is_private or ip_obj.is_link_local) else ("Örnek bağlantısı" if from_sample else "Dış IP")
+        add(itype, str(ip_obj), "behavior", cls, f"{proc}:{port}".strip(":"), malicious=from_sample)
+
+    for tgt in net.get("tcp_targets") or []:
+        raw_t = str(tgt.get("target") or "")
+        ip_part = raw_t.rsplit(":", 1)[0] if ":" in raw_t else raw_t
+        ip_obj = _clean_ip(ip_part)
+        if not ip_obj or ip_obj.is_unspecified or ip_obj.is_loopback or ip_obj.is_multicast:
+            continue
+        if (ip_obj.is_private or ip_obj.is_link_local) and not include_noise:
+            continue
+        itype = "ipv6" if ip_obj.version == 6 else "ipv4"
+        add(itype, str(ip_obj), "network", "Dış IP (SYN)", f"{raw_t} ×{tgt.get('count', 1)}")
+
+    order = {"sha256": 0, "domain": 1, "ipv4": 2, "ipv6": 3, "url": 4}
+    return sorted(found.values(), key=lambda x: (not x["malicious"], order.get(x["type"], 9), x["value"]))
+
+
+def export_iocs_csv(job: Job, include_noise: bool = False) -> str:
+    """Exports extracted job IOCs as formula-safe CSV text."""
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(["type", "value", "malicious", "source", "classification", "context"])
+    for item in collect_iocs(job, include_noise=include_noise):
+        val = item["value"] if item["type"] in ("sha256", "domain", "ipv4", "ipv6") else _csv_safe(item["value"])
+        w.writerow([
+            item["type"],
+            val,
+            "true" if item["malicious"] else "false",
+            _csv_safe(item["source"]),
+            _csv_safe(item["classification"]),
+            _csv_safe(item["context"]),
+        ])
+    return buf.getvalue()
+
+
+def export_iocs_stix(job: Job, include_noise: bool = False) -> Dict[str, Any]:
+    """Exports extracted job IOCs as a STIX 2.1 Bundle dictionary."""
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    identity_id = f"identity--{uuid.uuid5(uuid.NAMESPACE_URL, 'safebox-analyzer:identity')}"
+    objects: List[Dict[str, Any]] = [{
+        "type": "identity",
+        "spec_version": "2.1",
+        "id": identity_id,
+        "created": ts,
+        "modified": ts,
+        "name": "SafeBox Analyzer",
+        "identity_class": "system",
+    }]
+    for item in collect_iocs(job, include_noise=include_noise):
+        t, v = item["type"], item["value"]
+        esc_v = _stix_escape(v)
+        if t == "sha256":
+            pattern = f"[file:hashes.'SHA-256' = '{esc_v}']"
+        elif t == "domain":
+            pattern = f"[domain-name:value = '{esc_v}']"
+        elif t == "ipv4":
+            pattern = f"[ipv4-addr:value = '{esc_v}']"
+        elif t == "ipv6":
+            pattern = f"[ipv6-addr:value = '{esc_v}']"
+        elif t == "url":
+            pattern = f"[url:value = '{esc_v}']"
+        else:
+            continue
+        ind_id = f"indicator--{uuid.uuid5(uuid.NAMESPACE_URL, f'{job.id}:{t}:{v}')}"
+        labels = [x for x in (item["source"], item["classification"]) if x]
+        objects.append({
+            "type": "indicator",
+            "spec_version": "2.1",
+            "id": ind_id,
+            "created": ts,
+            "modified": ts,
+            "valid_from": ts,
+            "created_by_ref": identity_id,
+            "name": f"{t}: {v[:120]}",
+            "description": item["context"] or item["classification"],
+            "pattern": pattern,
+            "pattern_type": "stix",
+            "pattern_version": "2.1",
+            "indicator_types": ["malicious-activity"] if item["malicious"] else ["anomalous-activity"],
+            "confidence": 85 if item["malicious"] else 40,
+            "labels": labels[:6],
+        })
+    return {
+        "type": "bundle",
+        "id": f"bundle--{uuid.uuid5(uuid.NAMESPACE_URL, f'safebox-bundle:{job.id}')}",
+        "objects": objects,
+    }
 
 
 # ======================================================================== downloads watcher

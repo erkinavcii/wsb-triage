@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -349,6 +349,27 @@ def job_report(case_id: str, format: str = "md"):
     if not p.exists():
         raise HTTPException(404, "Rapor henüz yok")
     return p.read_text(encoding="utf-8")
+
+
+@app.get("/api/jobs/{case_id}/iocs")
+def job_iocs(case_id: str, format: str = "stix", include_noise: bool = False):
+    job = _job(case_id)
+    fmt = (format or "stix").lower()
+    if fmt == "csv":
+        data = pipeline.export_iocs_csv(job, include_noise=include_noise)
+        return Response(
+            content=data,
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="iocs_{job.id}.csv"'},
+        )
+    if fmt in ("stix", "json"):
+        bundle = pipeline.export_iocs_stix(job, include_noise=include_noise)
+        return JSONResponse(
+            content=bundle,
+            media_type="application/stix+json",
+            headers={"Content-Disposition": f'attachment; filename="iocs_{job.id}.stix.json"'},
+        )
+    raise HTTPException(400, "Geçersiz format (csv veya stix olmalı).")
 
 
 @app.post("/api/jobs/{case_id}/open")

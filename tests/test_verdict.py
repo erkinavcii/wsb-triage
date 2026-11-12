@@ -195,3 +195,74 @@ def test_write_html_report_escapes_xss_and_renders_markdown(tmp_path):
     assert "<code>&lt;code&gt;</code>" in html_out
     assert "<strong>kalın &lt;svg onload=1&gt;</strong>" in html_out
     assert 'href="https://www.virustotal.com/gui/file/abc"' in html_out
+
+
+def test_ioc_export_csv_and_stix_dedup_noise_and_safety(tmp_path):
+    job = bare_job(tmp_path)
+    sha_sample = "a" * 64
+    sha_drop = "b" * 64
+    job.state["inventory"] = {"original_sha256": sha_sample}
+    job.state["static"] = [{
+        "rel": "=CMD|' /C calc'!A0",
+        "sha256": sha_sample,
+        "risk_score": 70,
+        "yara_matches": [{"rule": "TestYara"}],
+        "interesting_urls": ["https://evil.example/drop.exe", "https://settings.data.microsoft.com/ok"],
+    }]
+    job.state["vt"] = [{"rel": "sample.exe", "sha256": sha_sample.upper(), "status": "ok",
+                        "result": {"stats": {"malicious": 15, "total": 70}, "suggested_threat_label": "stealer"}}]
+    job.state["behavior"] = {
+        "Files": {"DroppedHashes": [{"Path": "C:\\drop.exe", "SHA256": sha_drop.upper()}]},
+        "Network": {
+            "Connections": [
+                {"Remote": "198.51.100.22", "Port": 443, "Process": "drop.exe", "FromSample": True},
+                {"Remote": "192.168.1.10", "Port": 445, "Process": "drop.exe", "FromSample": True},
+                {"Remote": "10.0.0.5", "Port": 80, "Process": "svchost.exe", "FromSample": False},
+                {"Remote": "127.0.0.1", "Port": 8080, "Process": "drop.exe", "FromSample": True},
+            ],
+            "DnsCache": [{"Name": "settings-win.data.microsoft.com", "Data": "1.2.3.4"}],
+        },
+    }
+    job.state["network"] = {
+        "dns": [{"name": "api.telegram.org", "count": 2, "class": pipeline.CLASS_ABUSED}],
+        "sni": [],
+        "http": [{"host": "c2.example", "method": "POST", "uri": "/gate'x", "class": pipeline.CLASS_UNKNOWN}],
+        "tcp_targets": [{"target": "198.51.100.22:443", "count": 3}],
+    }
+
+    iocs = pipeline.collect_iocs(job)
+    vals = {(x["type"], x["value"]) for x in iocs}
+    assert ("sha256", sha_sample) in vals
+    assert ("sha256", sha_drop) in vals
+    assert ("domain", "api.telegram.org") in vals
+    assert ("domain", "evil.example") in vals
+    assert ("ipv4", "198.51.100.22") in vals
+    assert ("ipv4", "192.168.1.10") in vals
+    assert ("url", "http://c2.example/gate'x") in vals
+    # Pure Microsoft noise, non-sample LAN IP, and loopback excluded by default
+    assert ("domain", "settings-win.data.microsoft.com") not in vals
+    assert ("ipv4", "10.0.0.5") not in vals
+    assert ("ipv4", "127.0.0.1") not in vals
+    # No duplicate sha_sample from uppercase VT vs lowercase static
+    assert sum(1 for x in iocs if x["type"] == "sha256" and x["value"] == sha_sample) == 1
+
+    # With include_noise=True Microsoft noise and non-sample LAN IP appear
+    noisy_vals = {(x["type"], x["value"]) for x in pipeline.collect_iocs(job, include_noise=True)}
+    assert ("domain", "settings-win.data.microsoft.com") in noisy_vals
+    assert ("ipv4", "10.0.0.5") in noisy_vals
+
+    # CSV formula injection neutralized while raw hash remains intact
+    csv_txt = pipeline.export_iocs_csv(job)
+    assert f"sha256,{sha_sample},true," in csv_txt
+    assert "'=CMD|" in csv_txt
+
+    # STIX 2.1 bundle validation
+    stix = pipeline.export_iocs_stix(job)
+    assert stix["type"] == "bundle"
+    inds = [o for o in stix["objects"] if o["type"] == "indicator"]
+    assert len(inds) == len(iocs)
+    patterns = {o["pattern"] for o in inds}
+    assert f"[file:hashes.'SHA-256' = '{sha_sample}']" in patterns
+    assert "[domain-name:value = 'api.telegram.org']" in patterns
+    assert "[ipv4-addr:value = '198.51.100.22']" in patterns
+    assert r"[url:value = 'http://c2.example/gate\'x']" in patterns

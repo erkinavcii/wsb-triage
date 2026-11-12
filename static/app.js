@@ -204,6 +204,8 @@ function renderJob(st) {
     btn += `<button class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-200" id="bReport">📄 Raporu göster</button>`;
     btn += `<a href="/api/jobs/${encodeURIComponent(st.id)}/report?format=html" target="_blank" rel="noopener noreferrer" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-cyan-300">🌐 HTML Rapor</a>`;
     btn += `<a href="/api/jobs/${encodeURIComponent(st.id)}/report?format=json" target="_blank" rel="noopener noreferrer" download="report_${encodeURIComponent(st.id)}.json" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-emerald-300">📦 JSON İndir</a>`;
+    btn += `<a href="/api/jobs/${encodeURIComponent(st.id)}/iocs?format=csv" download="iocs_${encodeURIComponent(st.id)}.csv" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-amber-300">🧾 IOC (CSV)</a>`;
+    btn += `<a href="/api/jobs/${encodeURIComponent(st.id)}/iocs?format=stix" download="iocs_${encodeURIComponent(st.id)}.stix.json" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-purple-300">🛡 IOC (STIX 2.1)</a>`;
   }
   if (st.has_pcap) btn += `<button class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-200" id="bPcap" ${caps.tshark ? '' : 'disabled title="Wireshark kurulu değil"'}>🦈 Wireshark'ta aç</button>`;
   if (sbStatus === 'running') btn += `<button class="px-3 py-1.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-xs text-rose-200 border border-rose-500/40" id="bStop">⏹ İzlemeyi şimdi bitir</button>`;

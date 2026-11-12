@@ -144,6 +144,18 @@ def test_report_formats(client, tmp_path, monkeypatch):
     assert r_json.status_code == 200
     assert r_json.json()["id"] == "test-formats"
 
+    # iocs (csv + stix + invalid format)
+    r_csv = client.get("/api/jobs/test-formats/iocs?format=csv")
+    assert r_csv.status_code == 200
+    assert "text/csv" in r_csv.headers["content-type"]
+    assert "type,value,malicious,source,classification,context" in r_csv.text
+
+    r_stix = client.get("/api/jobs/test-formats/iocs?format=stix")
+    assert r_stix.status_code == 200
+    assert r_stix.json()["type"] == "bundle"
+
+    assert client.get("/api/jobs/test-formats/iocs?format=xml").status_code == 400
+
 
 def test_job_creation_clamps_memory_and_duration(tmp_path, monkeypatch):
     sample = tmp_path / "dummy.bat"
