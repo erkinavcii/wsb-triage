@@ -274,8 +274,19 @@ def job_stop(case_id: str):
 
 
 @app.get("/api/jobs/{case_id}/report", response_class=PlainTextResponse)
-def job_report(case_id: str):
-    p = _job(case_id).case_dir / "report.md"
+def job_report(case_id: str, format: str = "md"):
+    job = _job(case_id)
+    if format == "html":
+        p = job.case_dir / "report.html"
+        if not p.exists():
+            raise HTTPException(404, "HTML rapor henüz yok")
+        return HTMLResponse(p.read_text(encoding="utf-8"))
+    elif format == "json":
+        p = job.case_dir / "state.json"
+        if not p.exists():
+            raise HTTPException(404, "Rapor henüz yok")
+        return JSONResponse(json.loads(p.read_text(encoding="utf-8")))
+    p = job.case_dir / "report.md"
     if not p.exists():
         raise HTTPException(404, "Rapor henüz yok")
     return p.read_text(encoding="utf-8")

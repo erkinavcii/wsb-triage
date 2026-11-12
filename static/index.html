@@ -76,12 +76,19 @@
           <button data-browse="file" class="px-3.5 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs text-slate-200 border border-slate-700">📄 Dosya</button>
           <button data-browse="folder" class="px-3.5 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs text-slate-200 border border-slate-700">📁 Klasör</button>
         </div>
-        <div class="grid grid-cols-1 sm:grid-cols-3 gap-2">
+        <div class="grid grid-cols-1 sm:grid-cols-4 gap-2">
           <input id="pwInput" type="text" autocomplete="off" placeholder="Arşiv şifresi (varsa)" class="bg-slate-900/90 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500" />
           <input id="targetInput" type="text" placeholder="Çalıştırılacak dosya (boş = otomatik)" class="bg-slate-900/90 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500" />
           <select id="durationInput" class="bg-slate-900/90 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white">
             <option value="5">Sandbox'ta 5 dk izle</option><option value="10" selected>Sandbox'ta 10 dk izle</option>
             <option value="15">Sandbox'ta 15 dk izle</option><option value="30">Sandbox'ta 30 dk izle</option><option value="60">Sandbox'ta 60 dk izle</option>
+          </select>
+          <select id="memoryInput" class="bg-slate-900/90 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white" title="Windows Sandbox için ayrılacak RAM miktarı">
+            <option value="2048">Bellek: 2 GB RAM</option>
+            <option value="4096" selected>Bellek: 4 GB RAM (Varsayılan)</option>
+            <option value="8192">Bellek: 8 GB RAM (Ağır Kurulum)</option>
+            <option value="12288">Bellek: 12 GB RAM</option>
+            <option value="16384">Bellek: 16 GB RAM</option>
           </select>
         </div>
         <div class="flex flex-wrap gap-2 text-xs">
@@ -265,6 +272,7 @@
     function options() {
       return {
         password: $('pwInput').value, target: $('targetInput').value.trim(), duration_min: parseInt($('durationInput').value, 10),
+        memory_mb: parseInt($('memoryInput').value, 10) || 4096,
         network: $('optNetwork').checked, vt_upload: $('optUpload').checked, run_sandbox: $('optSandbox').checked, keep_sandbox_open: $('optKeepOpen').checked,
       };
     }
@@ -408,7 +416,11 @@
       // buttons
       const sbStatus = st.stages.sandbox.status;
       let btn = `<button class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-200" id="bOpenFolder">📂 Klasörü aç</button>`;
-      if (st.has_report) btn += `<button class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-200" id="bReport">📄 Raporu göster</button>`;
+      if (st.has_report) {
+        btn += `<button class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-200" id="bReport">📄 Raporu göster</button>`;
+        btn += `<a href="/api/jobs/${encodeURIComponent(st.id)}/report?format=html" target="_blank" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-cyan-300">🌐 HTML Rapor</a>`;
+        btn += `<a href="/api/jobs/${encodeURIComponent(st.id)}/report?format=json" target="_blank" download="report_${encodeURIComponent(st.id)}.json" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-emerald-300">📦 JSON İndir</a>`;
+      }
       if (st.has_pcap) btn += `<button class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-200" id="bPcap" ${caps.tshark ? '' : 'disabled title="Wireshark kurulu değil"'}>🦈 Wireshark'ta aç</button>`;
       if (sbStatus === 'running') btn += `<button class="px-3 py-1.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-xs text-rose-200 border border-rose-500/40" id="bStop">⏹ İzlemeyi şimdi bitir</button>`;
       else if (st.status !== 'running' && ['waiting', 'unavailable', 'error', 'done'].includes(sbStatus))

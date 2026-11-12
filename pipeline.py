@@ -1331,6 +1331,100 @@ def write_report(job: Job) -> None:
     L += ["", "## Sınırlar", "", "- Zararlılar sandbox'ı fark edip sessiz kalabilir veya izleme süresinden uzun bekleyebilir.",
           "- Windows arka plan trafiği kayda karışır; 'gürültü' sınıflandırması tahmindir.", "- Temiz sonuç riski azaltır, güvenli olduğunu kanıtlamaz."]
     (job.case_dir / "report.md").write_text("\n".join(L), encoding="utf-8")
+    write_html_report(job, L)
+
+
+def write_html_report(job: Job, md_lines: List[str]) -> None:
+    """Generates a standalone, beautiful HTML report for easy offline sharing."""
+    s = job.state
+    v = s.get("verdict", {})
+    lvl = v.get("level", "pending")
+    badge_color = {"red": "#ef4444", "yellow": "#f59e0b", "green": "#10b981", "pending": "#64748b"}.get(lvl, "#64748b")
+    
+    # Simple markdown-to-html converter for the report lines
+    html_parts = []
+    in_table = False
+    for line in md_lines:
+        line_s = line.strip()
+        if line_s.startswith("|") and line_s.endswith("|"):
+            cells = [c.strip() for c in line_s.strip("|").split("|")]
+            if all(set(c) <= set("-: ") for c in cells):
+                continue
+            if not in_table:
+                in_table = True
+                html_parts.append('<div class="table-wrap"><table>')
+                row_html = "".join(f"<th>{escape_html(c)}</th>" for c in cells)
+                html_parts.append(f"<thead><tr>{row_html}</tr></thead><tbody>")
+            else:
+                def render_cell(c):
+                    m = re.match(r"\[([^\]]+)\]\(([^)]+)\)", c)
+                    if m:
+                        return f'<a href="{escape_html(m.group(2))}" target="_blank" rel="noopener">{escape_html(m.group(1))}</a>'
+                    return escape_html(c)
+                row_html = "".join(f"<td>{render_cell(c)}</td>" for c in cells)
+                html_parts.append(f"<tr>{row_html}</tr>")
+            continue
+        elif in_table:
+            in_table = False
+            html_parts.append("</tbody></table></div>")
+
+        if line_s.startswith("# "):
+            html_parts.append(f"<h1>{escape_html(line_s[2:])}</h1>")
+        elif line_s.startswith("## "):
+            html_parts.append(f"<h2>{escape_html(line_s[3:])}</h2>")
+        elif line_s.startswith("### "):
+            html_parts.append(f"<h3>{escape_html(line_s[4:])}</h3>")
+        elif line_s.startswith("- **KIRMIZI:**"):
+            html_parts.append(f'<div class="item-red"><b>🚨 KIRMIZI:</b> {escape_html(line_s[14:].strip())}</div>')
+        elif line_s.startswith("- NOT:"):
+            html_parts.append(f'<div class="item-note"><b>ℹ️ NOT:</b> {escape_html(line_s[6:].strip())}</div>')
+        elif line_s.startswith("- "):
+            content = line_s[2:]
+            # formatting: `code` and **bold**
+            content = re.sub(r"`([^`]+)`", lambda m: f"<code>{escape_html(m.group(1))}</code>", content)
+            content = re.sub(r"\*\*([^*]+)\*\*", lambda m: f"<strong>{escape_html(m.group(1))}</strong>", content)
+            html_parts.append(f"<li>{content}</li>")
+        elif line_s:
+            content = re.sub(r"`([^`]+)`", lambda m: f"<code>{escape_html(m.group(1))}</code>", line_s)
+            content = re.sub(r"\*\*([^*]+)\*\*", lambda m: f"<strong>{escape_html(m.group(1))}</strong>", content)
+            html_parts.append(f"<p>{content}</p>")
+    if in_table:
+        html_parts.append("</tbody></table></div>")
+
+    body_html = "\n".join(html_parts)
+    html = f"""<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8">
+  <title>SafeBox Analiz Raporu - {escape_html(Path(s.get('sample', 'sample')).name)}</title>
+  <style>
+    body {{ background: #0b0f19; color: #e2e8f0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; padding: 2rem; max-width: 1000px; margin: 0 auto; line-height: 1.5; }}
+    h1 {{ color: #38bdf8; border-bottom: 1px solid #1e293b; padding-bottom: 0.5rem; }}
+    h2 {{ color: #94a3b8; margin-top: 1.5rem; border-bottom: 1px solid #1e293b; padding-bottom: 0.3rem; }}
+    h3 {{ color: #cbd5e1; margin-top: 1rem; }}
+    .badge {{ display: inline-block; padding: 0.25rem 0.75rem; border-radius: 9999px; font-weight: bold; background: {badge_color}22; color: {badge_color}; border: 1px solid {badge_color}66; margin-bottom: 1rem; }}
+    .item-red {{ background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.4); color: #fca5a5; padding: 0.5rem 0.75rem; border-radius: 8px; margin: 0.3rem 0; font-size: 0.9rem; }}
+    .item-note {{ background: rgba(245, 158, 11, 0.15); border: 1px solid rgba(245, 158, 11, 0.4); color: #fde68a; padding: 0.5rem 0.75rem; border-radius: 8px; margin: 0.3rem 0; font-size: 0.9rem; }}
+    code {{ background: #1e293b; color: #38bdf8; padding: 0.15rem 0.3rem; border-radius: 4px; font-family: Consolas, monospace; font-size: 0.85em; }}
+    li {{ margin: 0.25rem 0; }}
+    .table-wrap {{ overflow-x: auto; margin: 1rem 0; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
+    th, td {{ padding: 0.5rem; text-align: left; border: 1px solid #1e293b; }}
+    th {{ background: #111827; color: #94a3b8; }}
+    a {{ color: #38bdf8; text-decoration: none; }}
+    a:hover {{ text-decoration: underline; }}
+  </style>
+</head>
+<body>
+  <div class="badge">SONUÇ: {escape_html(lvl.upper())}</div>
+  {body_html}
+</body>
+</html>"""
+    (job.case_dir / "report.html").write_text(html, encoding="utf-8")
+
+
+def escape_html(s: Any) -> str:
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#39;")
 
 
 # ======================================================================== downloads watcher

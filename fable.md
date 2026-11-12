@@ -128,10 +128,10 @@ Bu belge kodun tamamı okunarak hazırlandı. "Doğrulandı" yazan maddeler kodd
 - **README sadece Türkçe.** Depo açıklaması ve etiketler İngilizce. İngilizce bir README ve bir ekran görüntüsü, depoyu bulan kişinin ilk baktığı şey olur.
 - ~~**Analiz yönetimi**~~ (C11) — A12 ile birlikte yapıldı: silme, iptal, eskileri temizleme.
 - **Yeni Sandbox komut satırı.** Windows 11 24H2 ve sonrasında `wsb start`, `wsb exec`, `wsb stop` komutları var. Pencere açıp işlem adından durum tahmin etmek yerine bunlar kullanılırsa başlatma, durum sorma ve kapatma güvenilir olur.
-- **Sandbox belleği panelden ayarlanamıyor.** API'de seçenek var, arayüzde yok. Varsayılan 4 GB, Photoshop gibi kurulumlar için az.
+- **Sandbox belleği panelden ayarlanamıyor.** — ✅ DÜZELTİLDİ (Gemini): Panel arayüzüne bellek seçim kutusu (2 GB, 4 GB varsayılan, 8 GB ağır kurulum, 12 GB, 16 GB) eklendi ve `pipeline.create_job` / `build_wsb` akışına bağlandı.
 - **Salt okunur klasörden çalışan kurulumlar.** Kendi klasörüne yazmaya çalışan kurulum programları hata verir. Böyle bir durumda rapor bunu açıkça söylemeli.
 - **Ağ kaydı tavanı.** `pktmon` kaydı 2 GB ile sınırlı ve dolunca en eski paketleri siler. Kurulum sırasında büyük indirme olursa ilk dakikaların trafiği kaybolur. Paket başına boyut sınırı (örneğin 512 bayt) çoğu analiz için yeterli.
-- **Rapor dili ve biçimi.** Rapor yalnızca Türkçe Markdown. JSON dışa aktarma ve HTML rapor paylaşmayı kolaylaştırır.
+- **Rapor dili ve biçimi.** — ✅ DÜZELTİLDİ (Gemini): HTML (`report.html`) ve JSON (`state.json`) dışa aktarma eklendi. Panelden tek tıkla yeni sekmede HTML rapor açma ve JSON indirme butonları yerleştirildi.
 - **Yerel API'de kimlik doğrulama yok.** — ✅ DÜZELTİLDİ (Gemini): Başlangıçta rastgele üretilen `API_TOKEN` ile yerel API koruması eklendi. Panel `X-SafeBox-Token` başlığı ve HTTP-only güvenli çerezle doğrulanır, yabancı yerel istekler 401 alır.
 
 ## C. Yeni özellik önerileri

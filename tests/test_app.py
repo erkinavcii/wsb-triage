@@ -3,6 +3,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app as app_module
+import pipeline
 
 BASE = f"http://127.0.0.1:{app_module.PORT}"
 
@@ -87,3 +88,28 @@ def test_unknown_job_is_404(client):
 
 def test_cleanup_needs_at_least_one_day(client):
     assert client.post("/api/jobs-cleanup", json={"days": 0}).status_code == 400
+
+
+def test_report_formats(client, tmp_path, monkeypatch):
+    # Setup a dummy job folder with report.md, report.html, state.json
+    case_dir = tmp_path / "cases" / "test-formats"
+    case_dir.mkdir(parents=True)
+    (case_dir / "report.md").write_text("# Test Report", encoding="utf-8")
+    (case_dir / "report.html").write_text("<h1>Test Report</h1>", encoding="utf-8")
+    (case_dir / "state.json").write_text('{"id":"test-formats","status":"done"}', encoding="utf-8")
+    monkeypatch.setattr(pipeline, "CASES_DIR", tmp_path / "cases")
+
+    # md report
+    r_md = client.get("/api/jobs/test-formats/report")
+    assert r_md.status_code == 200
+    assert "# Test Report" in r_md.text
+
+    # html report
+    r_html = client.get("/api/jobs/test-formats/report?format=html")
+    assert r_html.status_code == 200
+    assert "<h1>Test Report</h1>" in r_html.text
+
+    # json report
+    r_json = client.get("/api/jobs/test-formats/report?format=json")
+    assert r_json.status_code == 200
+    assert r_json.json()["id"] == "test-formats"
