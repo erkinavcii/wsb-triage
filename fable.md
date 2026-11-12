@@ -139,7 +139,7 @@ Bu belge kodun tamamı okunarak hazırlandı. "Doğrulandı" yazan maddeler kodd
 Etkisine göre sıralı.
 
 1. **Bırakılan dosyaların hash'ini VirusTotal'de sorgulamak.** — ✅ YAPILDI (Gemini): `Inside-Sandbox.ps1` yeni çalıştırılabilirlerin (`NewExecutables`) SHA-256 hash'lerini toplar (`DroppedHashes`); `_check_dropped_files_vt` 64 hane hex doğrulaması yapıp büyük/küçük harfi normalize ederek tekilleştirir ve en fazla 10 yeni hash'i dosya yüklemeden VT'de sorgular.
-2. **Kurulum paketlerinin içini açmak.** 7-Zip, NSIS ve MSI gibi birçok kurulum biçimini açabiliyor. Statik analiz şu an sadece dıştaki `setup.exe`'ye bakıyor. İçindeki dosyalar da envantere girerse imzası bozuk DLL'ler çalıştırmadan görülür.
+2. **Kurulum paketlerinin içini açmak.** — ✅ YAPILDI (Gemini): `pipeline._unpack_installers` / `_unpack_one_installer`, 7-Zip (`Nsis`, `Compound`/MSI, `.cab`, `7z`/`zip`/`Rar` SFX) kurulum paketlerini boyut/bomba kontrolü altında `case_dir/unpacked` klasörüne açar; `input/` sandbox için temiz kalırken çıkarılan dosyalar `[paket içi]` etiketiyle imza, statik ve VT envanterine dahil edilir (yalnızca `PE` olan düz binary'ler açılmaz).
 3. **YARA kuralları.** `yara-python` ile açık kural setleri (örneğin YARA-Forge) statik adıma eklenebilir. A9'daki el yapımı desenlerden çok daha isabetli olur.
 4. **Ekran görüntüleri.** İzleme sırasında 30 saniyede bir sandbox ekranının görüntüsü. Sahte kurulum ekranları ve fidye notları tek bakışta anlaşılır.
 5. **Sahte kullanıcı hareketi.** Fare hareketi ve "İleri" butonlarına otomatik tıklama. Hem kurulumlar kendiliğinden ilerler hem de hareket bekleyen zararlılar tetiklenir.
@@ -205,3 +205,7 @@ Gemini imzalı önceki adımlar tek tek denetlendiğinde tespit edilen hatalar v
 - **Birim ve API testleri:** `python -m pytest -q` → `109 passed in 28.99s` (B1, B5, B6, B7, B8, B9, C1 regresyon testleri dahil).
 - **Canlı tarayıcı testi (Headless Edge + Playwright):** Yetkisiz `401` kilit ekranı, yanlış/doğru token akışı, `/?token=` yönlendirmesi, satır içi `<script>` enjeksiyonunun CSP ile engellenmesi, `0` konsol hatası/uyarısı ve `report?format=html` render'ı doğrulandı.
 - **Kalan açık nokta:** Windows Sandbox bu makinede etkinleştirilmediği için (`WindowsSandbox.exe` yok), gerçek Sandbox içi `Inside-Sandbox.ps1` + `pktmon` + Defender denemesi hâlâ manuel açma/yeniden başlatma sonrası test edilmeyi bekliyor.
+
+### 4. Yeni Özellik Uygulamaları (Bölüm C — Gemini)
+
+- **C2 (Kurulum paketlerinin içini açmak — Gemini):** `pipeline._unpack_installers` & `_unpack_one_installer` ile NSIS/MSI/CAB/SFX paketleri `_check_unpacked_size` korumasından geçerek `case_dir/unpacked` içine çıkarılır; iç `.cab` akışları da açılır. `stage_inventory` bunları `[paket içi]` olarak envantere katar. (`tests/test_extract.py`: 28/28 passed).

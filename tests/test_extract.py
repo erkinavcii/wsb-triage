@@ -1,4 +1,5 @@
 """Archive handling: multi-part detection (A3) and unpack size limits (A8)."""
+import shutil
 import subprocess
 import zipfile
 
@@ -6,7 +7,7 @@ import pytest
 
 import pipeline
 import sandbox_manager as sbm
-from conftest import bare_job
+from conftest import SYSTEM32, bare_job, windows_only
 
 VOLUMES = {
     "a.part1.rar": False, "a.part01.rar": False, "a.part001.rar": False, "a.part2.rar": True, "a.part10.rar": True,
@@ -123,3 +124,39 @@ def test_wrong_archive_password_is_reported(tmp_path, run_job):
     job = run_job(arc, password="Wrong")
     assert job.state["status"] == "error"
     assert "şifre" in job.state["stages"]["extract"]["msg"].lower()
+
+
+@windows_only
+@pytest.mark.skipif(not sbm.seven_zip_path(), reason="7-Zip not installed")
+def test_sfx_installer_is_unpacked_for_static_and_inventory(tmp_path, run_job, unsigned_exe):
+    sz = sbm.seven_zip_path()
+    # Create an inner suspicious DLL wrapped inside an EXE overlay (simulates SFX / NSIS installer)
+    inner_dir = tmp_path / "inner"
+    inner_dir.mkdir()
+    unsigned_exe(inner_dir / "amtlib.dll")
+    payload_zip = tmp_path / "payload.zip"
+    subprocess.run([sz, "a", str(payload_zip), str(inner_dir / "amtlib.dll")], capture_output=True, check=True)
+
+    sfx_exe = tmp_path / "setup_sfx.exe"
+    sfx_exe.write_bytes((SYSTEM32 / "whoami.exe").read_bytes() + payload_zip.read_bytes())
+
+    job = run_job(sfx_exe)
+    assert job.state["stages"]["extract"]["status"] == "done"
+    assert "kurulum içi" in job.state["stages"]["extract"]["msg"]
+    # Input folder still has only the single setup executable for Sandbox execution
+    input_files = [p.name for p in job.input_dir.rglob("*") if p.is_file()]
+    assert input_files == ["setup_sfx.exe"]
+    # Inventory & static analysis include the unpacked inner DLL
+    rels = [r["rel"] for r in job.state["static"]]
+    assert any("[paket içi]" in r and r.endswith("amtlib.dll") for r in rels)
+
+
+@windows_only
+@pytest.mark.skipif(not sbm.seven_zip_path(), reason="7-Zip not installed")
+def test_plain_pe_is_not_unpacked_as_installer(tmp_path, run_job):
+    plain = tmp_path / "plain_tool.exe"
+    shutil.copy2(SYSTEM32 / "whoami.exe", plain)
+    job = run_job(plain)
+    assert job.state["stages"]["extract"]["status"] == "done"
+    assert not job.unpacked_dir.exists()
+    assert job.state["inventory"]["files"] == 1

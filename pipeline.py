@@ -145,6 +145,11 @@ class Job:
     def tools_dir(self) -> Path:
         return self.case_dir / "tools"
 
+    @property
+    def unpacked_dir(self) -> Path:
+        """Extracted installer payloads (MSI/NSIS/SFX) inspected statically without altering sandbox input."""
+        return self.case_dir / "unpacked"
+
     def save(self) -> None:
         snap = self.snapshot()
         with self.lock:
@@ -436,6 +441,66 @@ def _archive_set_size(src: Path) -> int:
     return src.stat().st_size
 
 
+INSTALLER_EXT = {".msi", ".msix", ".cab", ".exe"}
+MAX_INSTALLER_UNPACK_BYTES = 512 * 1024 * 1024
+_NON_CONTAINER_7Z_TYPES = {"pe", "elf", "macho", "coff", "te"}
+
+
+def _unpack_one_installer(job: Job, sz: str, cand: Path, dest_dir: Path, depth: int = 0) -> int:
+    """Uses 7-Zip to unpack MSI/NSIS/SFX/CAB installer containers for static/VT inspection.
+    Never unpacks bare PE section tables (Type = PE only). Returns extracted file count."""
+    try:
+        lp = subprocess.run([sz, "l", "-slt", "-p", str(cand)], capture_output=True, text=True,
+                            timeout=120, errors="replace", creationflags=NO_WINDOW)
+    except Exception:
+        return 0
+    if lp.returncode != 0:
+        return 0
+    types = [m.strip() for m in re.findall(r"^Type = (.+)$", lp.stdout or "", re.M)]
+    if not types or all(t.lower() in _NON_CONTAINER_7Z_TYPES for t in types):
+        return 0
+    body = (lp.stdout or "").split("\n----------", 1)[-1]
+    total_size = sum(int(x) for x in re.findall(r"^Size = (\d+)", body, re.M))
+    _check_unpacked_size(job, total_size, cand)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run([sz, "x", "-y", "-p", f"-o{dest_dir}", str(cand)], capture_output=True,
+                       text=True, timeout=600, errors="replace", creationflags=NO_WINDOW)
+    except Exception as e:
+        job.log(f"Kurulum içi açma atlandı ({cand.name}): {e}")
+        return 0
+    if depth == 0:
+        # MSI Compound containers often wrap their actual files in inner .cab streams.
+        cabs = [p for p in dest_dir.rglob("*.cab") if p.is_file() and p.stat().st_size <= MAX_INSTALLER_UNPACK_BYTES][:3]
+        for idx, cab in enumerate(cabs, 1):
+            _unpack_one_installer(job, sz, cab, dest_dir / f"_cab_{idx}_{cab.stem}", depth=1)
+    return sum(1 for p in dest_dir.rglob("*") if p.is_file())
+
+
+def _unpack_installers(job: Job, inp: Path) -> int:
+    """Inspects MSI/NSIS/SFX installers in input_dir and extracts inner payloads into unpacked_dir."""
+    sz = sbm.seven_zip_path()
+    if not sz:
+        return 0
+    cands = sorted(
+        (p for p in inp.rglob("*")
+         if p.is_file() and p.suffix.lower() in INSTALLER_EXT and p.stat().st_size <= MAX_INSTALLER_UNPACK_BYTES),
+        key=lambda p: p.stat().st_size,
+    )[:5]
+    unpacked_total = 0
+    for idx, cand in enumerate(cands, 1):
+        job.check_cancel()
+        safe_cand = re.sub(r"[^\w.-]", "_", cand.name)[:40]
+        sub = job.unpacked_dir / f"{idx}_{safe_cand}"
+        n = _unpack_one_installer(job, sz, cand, sub)
+        if n > 0:
+            unpacked_total += n
+            job.log(f"Kurulum paketinin içi açıldı ({cand.name}): {n} dosya çıkarıldı -> static/VT envanterine eklenecek.")
+        elif sub.exists() and not any(sub.rglob("*")):
+            shutil.rmtree(sub, ignore_errors=True)
+    return unpacked_total
+
+
 def stage_extract(job: Job) -> None:
     job.stage("extract", "running", "Hazırlanıyor...")
     src = Path(job.state["sample"])
@@ -498,7 +563,9 @@ def stage_extract(job: Job) -> None:
     count = sum(1 for _ in inp.rglob("*") if _.is_file())
     if count == 0:
         raise PipelineError("Hazırlanan klasörde hiç dosya yok (arşiv boş, şifre yanlış veya antivirüs hepsini silmiş olabilir).")
-    job.stage("extract", "done", f"{count} dosya hazır.")
+    unpacked_count = _unpack_installers(job, inp)
+    msg = f"{count} dosya hazır" + (f" (+ kurulum içi {unpacked_count} dosya çıkarıldı)." if unpacked_count else ".")
+    job.stage("extract", "done", msg)
 
 
 # ======================================================================== 2. inventory
@@ -564,15 +631,23 @@ def stage_inventory(job: Job) -> None:
     job.stage("inventory", "running", "Dosyalar hash'leniyor...")
     time.sleep(AV_SETTLE_SEC)  # let real-time antivirus act, so quarantined files show up as missing
     inp = job.input_dir
-    files = [p for p in inp.rglob("*") if p.is_file()]
+    file_entries: List[tuple[Path, str, bool]] = [
+        (p, str(p.relative_to(inp)), False) for p in inp.rglob("*") if p.is_file()
+    ]
+    unpacked = job.unpacked_dir
+    if unpacked.is_dir():
+        for p in unpacked.rglob("*"):
+            if p.is_file():
+                file_entries.append((p, f"[paket içi] {p.relative_to(unpacked)}", True))
     items: List[Dict[str, Any]] = []
-    for i, p in enumerate(files, 1):
+    for i, (p, rel_name, is_unpacked) in enumerate(file_entries, 1):
         if i % 100 == 0:
             job.check_cancel()
-            job.stage("inventory", "running", f"Hash: {i} / {len(files)} dosya")
-        rec = {"rel": str(p.relative_to(inp)), "path": str(p), "size": 0, "sha256": None, "is_pe": False,
-               "is_script": p.suffix.lower() in SCRIPT_EXT, "name_flag": bool(NAME_RX.search(p.name)) or p.name.lower() in analyzer.SUSPICIOUS_FILENAMES,
-               "sig": None, "missing": False}
+            job.stage("inventory", "running", f"Hash: {i} / {len(file_entries)} dosya")
+        rec = {"rel": rel_name, "path": str(p), "size": 0, "sha256": None, "is_pe": False,
+               "is_script": p.suffix.lower() in SCRIPT_EXT,
+               "name_flag": bool(NAME_RX.search(p.name)) or p.name.lower() in analyzer.SUSPICIOUS_FILENAMES,
+               "sig": None, "missing": False, "unpacked": is_unpacked}
         try:
             rec["size"] = p.stat().st_size
             with open(p, "rb") as f:
