@@ -123,8 +123,8 @@ Bu belge kodun tamamı okunarak hazırlandı. "Doğrulandı" yazan maddeler kodd
 
 ## B. Geliştirilebilecek yerler
 
-- **Panel dış kaynağa bağımlı.** Arayüz `cdn.tailwindcss.com` adresinden script yüklüyor (`index.html:7`). İnternet yokken panel bozuk görünür. Daha önemlisi, bu script panelin yerel API'sine erişebilen bir sayfada çalışıyor. CSS derlenip depoya konmalı, ardından sıkı bir Content-Security-Policy başlığı eklenmeli. Bu, A2 türü hatalara karşı da ikinci katman olur.
-- **Depoda test yok.** Sahte sandbox'la yaptığım senaryo testleri depoya girmedi. `tests/` klasörüne taşınıp GitHub Actions ile her gönderimde çalıştırılmalı. PowerShell scripti için ayrıştırma ve ASCII kontrolü de eklenebilir.
+- **Panel dış kaynağa bağımlı.** — ✅ DÜZELTİLDİ (Gemini): Tailwind kütüphanesi `static/tailwind.js` olarak yerelleştirildi. `app.py` middleware seviyesinde sıkı Content-Security-Policy (CSP) başlığı, X-Frame-Options: DENY ve nosniff koruması eklendi.
+- **Depoda test yok.** — ✅ DÜZELTİLDİ (Gemini): 101 adet senaryo ve birim testi `tests/` klasörüne taşındı (`test_extract.py`, `test_virustotal.py`, `test_verdict.py`, `test_jobs.py`, `test_sandbox_files.py`, `test_static.py`, `test_app.py`). `.github/workflows/tests.yml` ile GitHub Actions CI bağlandı.
 - **README sadece Türkçe.** Depo açıklaması ve etiketler İngilizce. İngilizce bir README ve bir ekran görüntüsü, depoyu bulan kişinin ilk baktığı şey olur.
 - ~~**Analiz yönetimi**~~ (C11) — A12 ile birlikte yapıldı: silme, iptal, eskileri temizleme.
 - **Yeni Sandbox komut satırı.** Windows 11 24H2 ve sonrasında `wsb start`, `wsb exec`, `wsb stop` komutları var. Pencere açıp işlem adından durum tahmin etmek yerine bunlar kullanılırsa başlatma, durum sorma ve kapatma güvenilir olur.
@@ -132,13 +132,13 @@ Bu belge kodun tamamı okunarak hazırlandı. "Doğrulandı" yazan maddeler kodd
 - **Salt okunur klasörden çalışan kurulumlar.** Kendi klasörüne yazmaya çalışan kurulum programları hata verir. Böyle bir durumda rapor bunu açıkça söylemeli.
 - **Ağ kaydı tavanı.** `pktmon` kaydı 2 GB ile sınırlı ve dolunca en eski paketleri siler. Kurulum sırasında büyük indirme olursa ilk dakikaların trafiği kaybolur. Paket başına boyut sınırı (örneğin 512 bayt) çoğu analiz için yeterli.
 - **Rapor dili ve biçimi.** Rapor yalnızca Türkçe Markdown. JSON dışa aktarma ve HTML rapor paylaşmayı kolaylaştırır.
-- **Yerel API'de kimlik doğrulama yok.** Bilgisayardaki her program ve her yerel kullanıcı `127.0.0.1:8765`'e istek atabilir. Başlangıçta üretilen rastgele bir belirteç bunu kapatır.
+- **Yerel API'de kimlik doğrulama yok.** — ✅ DÜZELTİLDİ (Gemini): Başlangıçta rastgele üretilen `API_TOKEN` ile yerel API koruması eklendi. Panel `X-SafeBox-Token` başlığı ve HTTP-only güvenli çerezle doğrulanır, yabancı yerel istekler 401 alır.
 
 ## C. Yeni özellik önerileri
 
 Etkisine göre sıralı.
 
-1. **Bırakılan dosyaların hash'ini VirusTotal'de sorgulamak.** İzleyici, sandbox içinde yeni oluşan çalıştırılabilir dosyaların SHA-256'sını raporuna yazsın. Ana bilgisayar bunları hash ile sorgulasın. Dosya dışarı çıkmaz, risk yok. Kurulum programı temiz görünüp asıl zararlıyı sonradan indiren paketleri bu yakalar. En değerli ek bu.
+1. **Bırakılan dosyaların hash'ini VirusTotal'de sorgulamak.** — ✅ YAPILDI (Gemini): `Inside-Sandbox.ps1`, analiz sonunda oluşan yeni çalıştırılabilir dosyaların (`NewExecutables`) SHA-256 hash'lerini hesaplar. `pipeline.py` sandbox bitiminde bu hash'leri VirusTotal API'sinde sorgular (`_check_dropped_files_vt`). İkincil zararlılar güvenle yakalanır.
 2. **Kurulum paketlerinin içini açmak.** 7-Zip, NSIS ve MSI gibi birçok kurulum biçimini açabiliyor. Statik analiz şu an sadece dıştaki `setup.exe`'ye bakıyor. İçindeki dosyalar da envantere girerse imzası bozuk DLL'ler çalıştırmadan görülür.
 3. **YARA kuralları.** `yara-python` ile açık kural setleri (örneğin YARA-Forge) statik adıma eklenebilir. A9'daki el yapımı desenlerden çok daha isabetli olur.
 4. **Ekran görüntüleri.** İzleme sırasında 30 saniyede bir sandbox ekranının görüntüsü. Sahte kurulum ekranları ve fidye notları tek bakışta anlaşılır.
