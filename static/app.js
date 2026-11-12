@@ -36,6 +36,9 @@ async function loadSystemStatus() {
     if (caps.yara && caps.yara.rules_count) {
       h += badge(`✅ YARA (${caps.yara.rules_count} kural)`, 'emerald');
     }
+    h += caps.context_menu
+      ? `<button id="btnCtxMenu" class="text-xs px-3 py-1.5 rounded-xl bg-emerald-500/15 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/30 font-medium" title="Dosya Gezgini sağ tık menüsünü kaldır">✅ Sağ tık menüsü aktif</button>`
+      : `<button id="btnCtxMenu" class="text-xs px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 font-medium" title="Dosya/klasör sağ tık menüsüne 'SafeBox ile analiz et' ekler">🖱 Sağ tık menüsü ekle</button>`;
     if (caps.virtualbox_installed && caps.virtualbox_vms.length) {
       h += `<select id="vmSelect" class="text-xs bg-slate-900 border border-slate-700 rounded-xl px-2 py-1.5">${caps.virtualbox_vms.map(v => `<option>${esc(v.name)}</option>`).join('')}</select>
             <button id="btnHarden" class="text-xs px-3 py-1.5 rounded-xl bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-300 border border-indigo-500/40">🛡️ VM'i izole et + snapshot</button>`;
@@ -43,6 +46,10 @@ async function loadSystemStatus() {
     $('sysCapsBadges').innerHTML = h;
     if ($('btnEnableWsb')) $('btnEnableWsb').onclick = async () => alert((await post('/api/sandbox/enable')).message);
     if ($('btnHarden')) $('btnHarden').onclick = hardenVm;
+    if ($('btnCtxMenu')) $('btnCtxMenu').onclick = async () => {
+      try { const d = await post('/api/context-menu', { enabled: !caps.context_menu }); alert(d.message); loadSystemStatus(); }
+      catch (e) { alert(e.message); }
+    };
   } catch (e) { $('sysSubText').textContent = 'Sunucuya ulaşılamadı: ' + e.message; }
 }
 

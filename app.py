@@ -176,6 +176,10 @@ class WatchRequest(BaseModel):
     auto_start: bool = False
 
 
+class ContextMenuRequest(BaseModel):
+    enabled: bool
+
+
 class AuthRequest(BaseModel):
     token: str
 
@@ -224,6 +228,7 @@ def system_status():
     caps["mb_enabled"] = icfg["mb_enabled"]
     caps["mb_api_configured"] = bool(icfg["mb_api_key"])
     caps["ha_api_configured"] = bool(icfg["ha_api_key"])
+    caps["context_menu"] = sandbox_manager.context_menu_status()
     return caps
 
 
@@ -482,6 +487,11 @@ def enable_wsb():
 @app.post("/api/vbox/harden")
 def harden_vbox(req: VboxHardenRequest):
     return sandbox_manager.harden_and_snapshot_virtualbox_vm(req.vm_name)
+
+
+@app.post("/api/context-menu")
+def toggle_context_menu(req: ContextMenuRequest):
+    return sandbox_manager.set_context_menu(req.enabled)
 
 
 @app.post("/api/demo")

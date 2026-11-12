@@ -2,6 +2,7 @@
 import os
 import shutil
 import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -230,3 +231,54 @@ def harden_and_snapshot_virtualbox_vm(vm_name: str) -> Dict[str, Any]:
         }
     except Exception as e:
         return {"status": "error", "message": f"VirtualBox yapılandırma hatası: {e}"}
+
+
+# ------------------------------------------------------------------ Explorer Right-Click Context Menu (HKCU, no UAC)
+_CTX_ROOTS = (
+    r"Software\Classes\*\shell\SafeBoxAnalyze",
+    r"Software\Classes\Directory\shell\SafeBoxAnalyze",
+)
+
+
+def _context_command() -> str:
+    py = Path(sys.executable)
+    pyw = py.with_name("pythonw.exe")
+    launcher = pyw if pyw.exists() else py
+    script = (BASE_DIR / "enqueue.py").resolve()
+    return f'"{launcher}" "{script}" "%1"'
+
+
+def context_menu_status() -> bool:
+    if os.name != "nt":
+        return False
+    import winreg
+    try:
+        for root in _CTX_ROOTS:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, f"{root}\\command"):
+                pass
+        return True
+    except OSError:
+        return False
+
+
+def set_context_menu(enabled: bool) -> Dict[str, Any]:
+    if os.name != "nt":
+        return {"status": "error", "enabled": False, "message": "Sağ tık menüsü yalnızca Windows'ta desteklenir."}
+    import winreg
+    if enabled:
+        cmd = _context_command()
+        icon = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "System32", "shell32.dll") + ",48"
+        for root in _CTX_ROOTS:
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, root) as k:
+                winreg.SetValueEx(k, "", 0, winreg.REG_SZ, "SafeBox ile analiz et")
+                winreg.SetValueEx(k, "Icon", 0, winreg.REG_SZ, icon)
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, f"{root}\\command") as kc:
+                winreg.SetValueEx(kc, "", 0, winreg.REG_SZ, cmd)
+        return {"status": "ok", "enabled": True, "message": "Dosya Gezgini sağ tık menüsü eklendi (HKEY_CURRENT_USER)."}
+    for root in _CTX_ROOTS:
+        for sub in (f"{root}\\command", root):
+            try:
+                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, sub)
+            except FileNotFoundError:
+                pass
+    return {"status": "ok", "enabled": False, "message": "Dosya Gezgini sağ tık menüsü kaldırıldı."}

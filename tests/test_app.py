@@ -237,3 +237,66 @@ def test_compare_endpoint(client, tmp_path, monkeypatch):
     r = client.get("/api/compare?base=case-a&target=case-b")
     assert r.status_code == 200
     assert r.json()["base"]["id"] == "case-a" and r.json()["target"]["id"] == "case-b"
+
+
+def test_context_menu_and_enqueue(client, tmp_path, monkeypatch):
+    import enqueue
+    import sandbox_manager
+    import types
+
+    store = {}
+
+    class FakeKey:
+        def __init__(self, sub):
+            self.sub = sub
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            pass
+
+    fake_winreg = types.SimpleNamespace(
+        HKEY_CURRENT_USER="HKCU",
+        REG_SZ=1,
+        CreateKey=lambda root, sub: (store.setdefault(sub, {}), FakeKey(sub))[1],
+        SetValueEx=lambda k, name, res, typ, val: store[k.sub].__setitem__(name, val),
+        OpenKey=lambda root, sub: FakeKey(sub) if sub in store else (_ for _ in ()).throw(FileNotFoundError(sub)),
+        DeleteKey=lambda root, sub: store.pop(sub) if sub in store else (_ for _ in ()).throw(FileNotFoundError(sub)),
+    )
+    monkeypatch.setitem(__import__("sys").modules, "winreg", fake_winreg)
+    monkeypatch.setattr(sandbox_manager.os, "name", "nt")
+
+    assert sandbox_manager.context_menu_status() is False
+    r_on = client.post("/api/context-menu", json={"enabled": True})
+    assert r_on.status_code == 200 and r_on.json()["enabled"] is True
+    assert sandbox_manager.context_menu_status() is True
+    cmd_val = store[r"Software\Classes\*\shell\SafeBoxAnalyze\command"][""]
+    assert "enqueue.py" in cmd_val and '"%1"' in cmd_val
+
+    r_off = client.post("/api/context-menu", json={"enabled": False})
+    assert r_off.status_code == 200 and r_off.json()["enabled"] is False
+    assert sandbox_manager.context_menu_status() is False
+
+    # Test enqueue helper end-to-end with mocked server & browser opener
+    sample = tmp_path / "crack.zip"
+    sample.write_bytes(b"PK")
+    opened = []
+    seen_req = {}
+
+    class FakeResp:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def read(self): return b'{"id":"job-xyz"}'
+
+    monkeypatch.setattr(enqueue, "_ensure_server", lambda *a, **k: "tok-123")
+    def fake_urlopen(req, timeout=10):
+        seen_req["url"] = req.full_url
+        seen_req["tok"] = req.headers.get("X-safebox-token") or req.headers.get("X-SafeBox-Token")
+        seen_req["body"] = __import__("json").loads(req.data.decode("utf-8"))
+        return FakeResp()
+    monkeypatch.setattr(enqueue.urllib.request, "urlopen", fake_urlopen)
+
+    jid = enqueue.enqueue_path(str(sample), base_url="http://127.0.0.1:8765", opener=opened.append)
+    assert jid == "job-xyz"
+    assert seen_req["tok"] == "tok-123"
+    assert seen_req["body"]["run_sandbox"] is False and seen_req["body"]["vt_upload"] is False
+    assert opened == ["http://127.0.0.1:8765/?token=tok-123#job-xyz"]
