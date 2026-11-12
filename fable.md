@@ -124,10 +124,10 @@ Bu belge kodun tamamı okunarak hazırlandı. "Doğrulandı" yazan maddeler kodd
 ## B. Geliştirilebilecek yerler
 
 - **Panel dış kaynağa bağımlı.** — ✅ DÜZELTİLDİ (Gemini): CDN bağımlılığı ve satır içi `<script>`/`<style>` blokları tamamen kaldırıldı (`static/styles.css`, `static/app.js`, `static/auth.js`). `app.py` ara katmanı gerçek sıkı CSP (`default-src 'none'; script-src 'self'; style-src 'self'`, `'unsafe-inline'`/`'unsafe-eval'` yok), `X-Frame-Options: DENY`, `nosniff` ve `Cache-Control: no-store` döndürür.
-- **Depoda test yok.** — ✅ DÜZELTİLDİ (Gemini): 109 adet senaryo ve birim testi `tests/` klasörüne taşındı (`test_extract.py`, `test_virustotal.py`, `test_verdict.py`, `test_jobs.py`, `test_sandbox_files.py`, `test_static.py`, `test_app.py`). `.github/workflows/tests.yml` ile GitHub Actions CI bağlandı.
+- **Depoda test yok.** — ✅ DÜZELTİLDİ (Gemini): Birim, statik, API ve regresyon testleri `tests/` klasörüne taşındı (`test_extract.py`, `test_virustotal.py`, `test_verdict.py`, `test_jobs.py`, `test_sandbox_files.py`, `test_static.py`, `test_app.py`; C fazı eklemeleriyle toplam 122 test). `.github/workflows/tests.yml` ile GitHub Actions CI bağlandı.
 - **README sadece Türkçe.** — ✅ DÜZELTİLDİ (Gemini): İngilizce `README.md`, mimari diyagramı ve tam yüklenmiş web arayüzünün ekran görüntüsü (`static/screenshot.png`) eklendi. Türkçe döküman `README.tr.md` olarak korundu.
 - ~~**Analiz yönetimi**~~ (C11) — A12 ile birlikte yapıldı: silme, iptal, eskileri temizleme.
-- **Yeni Sandbox komut satırı.** Windows 11 24H2 ve sonrasında `wsb start`, `wsb exec`, `wsb stop` komutları var. Pencere açıp işlem adından durum tahmin etmek yerine bunlar kullanılırsa başlatma, durum sorma ve kapatma güvenilir olur.
+- **Yeni Sandbox komut satırı.** ⏸ *(Kullanıcı isteğiyle şimdilik bekletildi.)* Windows 11 24H2 ve sonrasında `wsb start`, `wsb exec`, `wsb stop` komutları var. Pencere açıp işlem adından durum tahmin etmek yerine bunlar kullanılırsa başlatma, durum sorma ve kapatma güvenilir olur.
 - **Sandbox belleği panelden ayarlanamıyor.** — ✅ DÜZELTİLDİ (Gemini): Panel arayüzüne 2 GB–16 GB RAM seçim kutusu eklendi; backend `pipeline.create_job` ve `sandbox_manager.build_wsb` bellek (1024–65536 MB) ve süre (1–180 dk) değerlerini sınırlandırıp doğrular.
 - **Salt okunur klasörden çalışan kurulumlar.** — ✅ DÜZELTİLDİ (Gemini): 1 GB üstü kurulumlar `in-place` çalıştırıldığında `compute_verdict` rapora uyarı ekler; `sanitize_sandbox_json` `RunMode`/`Target` alanlarını stringe zorlayarak tip zehirlenmesini engeller.
 - **Ağ kaydı tavanı.** — ✅ DÜZELTİLDİ (Gemini): `Inside-Sandbox.ps1` içindeki `pktmon start` komutuna `--pkt-size 512` eklendi (Windows `pktmon` varsayılanı olan 128 byte'ta HTTP/TLS SNI başlıklarının kesilmesini önlerken tam paketlerin 2 GB kaydı gereksiz şişirmesini 512 byte ile sınırlar). *Not: Çok büyük indirmelerde 2 GB döngüsel tampon hâlâ dolabilir.*
@@ -202,9 +202,11 @@ Gemini imzalı önceki adımlar tek tek denetlendiğinde tespit edilen hatalar v
 
 ### 3. Doğrulama Durumu (Gemini Son Kontrol)
 
-- **Birim ve API testleri:** `python -m pytest -q` → `109 passed in 28.99s` (B1, B5, B6, B7, B8, B9, C1 regresyon testleri dahil).
-- **Canlı tarayıcı testi (Headless Edge + Playwright):** Yetkisiz `401` kilit ekranı, yanlış/doğru token akışı, `/?token=` yönlendirmesi, satır içi `<script>` enjeksiyonunun CSP ile engellenmesi, `0` konsol hatası/uyarısı ve `report?format=html` render'ı doğrulandı.
-- **Kalan açık nokta:** Windows Sandbox bu makinede etkinleştirilmediği için (`WindowsSandbox.exe` yok), gerçek Sandbox içi `Inside-Sandbox.ps1` + `pktmon` + Defender denemesi hâlâ manuel açma/yeniden başlatma sonrası test edilmeyi bekliyor.
+- **Birim ve API testleri:** `python -m pytest -q` → `122 passed in 37.83s` (sıfır atlanan/başarısız test; B1–B3, B5–B9 ve C1–C12 regresyon testleri dahil).
+- **Statik CSS & Canlı Tarayıcı Testi (Headless Edge + Playwright):** Tüm HTML/JS sınıfları statik `static/styles.css` içinde doğrulandı (eksik `.block` sınıfı eklendi); canlı yerel sunucuda yetkisiz `401` kilit ekranı, yanlış/doğru belirteç akışı, `/?token=` yönlendirmesi, `YARA (6 kural)` rozeti, sağ tık menü düğmesi (`#btnCtxMenu`), sahte kullanıcı hareketi (`#optSimUser`) ve bildirim (`#optNotify`) seçenekleri, `Karşılaştır` ve `MalwareBazaar / Hybrid Analysis` modalları, `CSV / STIX 2.1` IOC indirme bağlantıları, sıkı CSP ile satır içi `<script>` engellemesi, normal UI akışında `0` konsol hatası/uyarısı ve `report?format=html` render'ı doğrulandı (`static/screenshot.png` güncellendi).
+- **Kalan açık noktalar:**
+  1. **B4 (`wsb` CLI):** Kullanıcı isteği üzerine (`web cli kalsın şimdilik`) atlandı ve bekletildi.
+  2. **Gerçek Windows Sandbox içi deneme:** Bu makinede `WindowsSandbox.exe` etkin olmadığı için gerçek Sandbox açıldıktan/yeniden başlatıldıktan sonra `Inside-Sandbox.ps1` (ekran görüntüsü, sahte kullanıcı hareketi, işlem-ağ eşleme, `pktmon` + `--pkt-size 512`) ve Defender davranışı canlı doğrulanmayı bekliyor.
 
 ### 4. Yeni Özellik Uygulamaları (Bölüm C — Gemini)
 
@@ -218,3 +220,8 @@ Gemini imzalı önceki adımlar tek tek denetlendiğinde tespit edilen hatalar v
 - **C7 (İki çalıştırmayı karşılaştırmak — Gemini):** `pipeline.compare_jobs`, `/api/compare` API ucu ve arayüz `⚖️ Karşılaştır` penceresiyle resmi vs crack sürüm arasındaki değişen/bozulan imzalı dosyalar, YARA/risk artışları, ekstra kalıcılık kayıtları ve ek dış bağlantılar fark olarak sunulur.
 - **C10 (Windows bildirimi — Gemini):** `pipeline.notify_desktop` ve `_maybe_notify_job` ile analiz sonlandığında/kırmızı bayrak çıktığında sabit PowerShell + ortam değişkenleri kullanan engelleyici olmayan Windows masaüstü bildirimi ve panel onay kutusu (`#optNotify`) eklendi.
 - **C12 (Dosya Gezgini sağ tık menüsü — Gemini):** `sandbox_manager.set_context_menu` (`HKCU` altında dosya + klasör kaydı), `enqueue.py` hızlı başlatıcısı, `/api/context-menu` ve üst bar durum/geçiş düğmesi eklendi. (`winreg` mock ile test edildi).
+
+### 5. Son CSS Denetimi ve Dokümantasyon Güncellemesi (Gemini)
+
+- **`static/styles.css`:** Eksik olan `.block { display: block; }` kuralı eklendi; tüm `index.html`, `auth.html` ve `app.js` sınıfları statik olarak doğrulandı.
+- **`README.md` & `static/screenshot.png`:** B1–B3, B5–B9 ve C1–C12 özellikleri İngilizce README ve güncel ekran görüntüsüne işlendi.

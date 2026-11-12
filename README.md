@@ -17,23 +17,27 @@ SafeBox is a lightweight, local web-based triage and malware analysis workbench 
   - Samples and tools mapped strictly **Read-Only** (`C:\Analysis\input`, `C:\Analysis\tools`); only output is writable (`C:\Analysis\output`).
   - Configurable sandbox RAM allocation (2 GB up to 16 GB).
   - Automated LAN blocking firewall inside the sandbox: keeps internet access active for C2 observation while protecting local home/office subnets and host endpoints.
-- **Deep Live Behavioral Monitoring:**
-  - Background network packet capture (`pktmon` / `.pcapng`).
+  - Optional **simulated user interaction** (gentle cursor movement and UI Automation clicks scoped strictly to the sample's process tree) to bypass idle evasion or advance installer prompts.
+- **Deep Live Behavioral Monitoring & Attribution:**
+  - Background network packet capture (`pktmon` / `.pcapng`) with configurable per-packet snaplen/size cap.
+  - **Periodic desktop screenshots** captured inside the sandbox, strictly validated (`PNG + IHDR` header check, non-symlink, size-capped) before rendering in the UI.
   - Process creation tree (`Win32_ProcessStartTrace`), command-line tracing, and suspicious parameter flags (hidden/encoded PowerShell, bypasses).
-  - Persistence inspection (Services, Device Drivers, Scheduled Tasks, Run/RunOnce keys, Startup folder, IFEO).
-  - Tamper detection: Windows Defender alterations, `hosts` file modifications, and firewall rule additions.
-- **Secondary Dropper & Payload Detection:**
+  - **Process-to-network attribution:** correlates `tshark`-extracted DNS answers, TLS SNI, and HTTP endpoints with in-sandbox socket/DNS state to identify which process initiated each connection.
+  - Persistence inspection (Services, Device Drivers, Scheduled Tasks, Run/RunOnce keys, Startup folder, IFEO) and tamper detection (Defender, `hosts`, firewall).
+- **Secondary Dropper & Multi-Source Threat Intel:**
   - Automatically indexes newly dropped executables inside the sandbox, calculates their SHA-256 hashes, and queries VirusTotal without uploading the files outside.
-- **Static PE & Heuristic Triage:**
-  - Authenticode digital signature validation (valid, broken/mismatched, or unsigned).
-  - PE header entropy analysis, section anomalies, and anti-analysis/hollowing API combination heuristics.
-  - Infostealer, C2, and token-grabber regex pattern matching.
-- **Network Traffic Summaries:**
-  - Automated `tshark` dissection: DNS queries, TLS Server Name Indication (SNI), and HTTP endpoints with categorization (Microsoft background noise, Shared Cloud/CDN, Abused infrastructure, or Unknown).
-- **Comprehensive Reporting:**
+  - Optional **MalwareBazaar & Hybrid Analysis** hash-only enrichment (available automatically as a backup when VirusTotal has no key or hits quota, or per file on demand).
+- **Static PE, Installer Unpacking & YARA Triage:**
+  - Recursive archive decompression and safe **installer payload unpacking** (NSIS, MSI, CAB, SFX under size guards) to triage embedded binaries prior to execution.
+  - **YARA scanning** (`rules/safebox_builtin.yar`) using `yara-python` when available or an offline built-in rule scanner fallback.
+  - Authenticode digital signature validation (valid, broken/mismatched, or unsigned), PE header entropy analysis, section anomalies, anti-analysis API heuristics, and infostealer/C2 string matching.
+- **Reporting, IOC Export & Run Comparison:**
   - Generates structured Markdown (`report.md`), clean standalone HTML (`report.html`), and machine-readable JSON (`state.json`).
-- **Download Folder Watcher:**
-  - Real-time watcher for browser downloads with baseline diffing, stable-size debouncing, and automated triage.
+  - One-click **IOC Export** in **CSV** (spreadsheet-safe) and **STIX 2.1 Bundle** formats (`/api/jobs/{case_id}/iocs`).
+  - **Run Comparison (Diff):** side-by-side comparison between a baseline/official build and a suspect/cracked build (`/api/compare`), highlighting modified hashes, broken signatures, new YARA/static findings, persistence diffs, and extra external domains/IPs.
+- **Workflow & Host Integration:**
+  - Real-time **Download Folder Watcher** with baseline diffing, stable-size debouncing, and automated triage.
+  - Optional **Windows Desktop Notification** upon job completion and **Explorer Right-Click Context Menu** (`HKCU`, reversible from the UI header) backed by `enqueue.py`.
 - **Hardened Local Security:**
   - Bound strictly to `127.0.0.1`, DNS rebinding protection, CSRF prevention (`Sec-Fetch-Site` & `Origin`), strict Content-Security-Policy (`script-src 'self'; style-src 'self'`), and startup secret API token validation (`X-SafeBox-Token` / `HttpOnly` cookie) across all `/api/*` endpoints.
 
@@ -49,17 +53,18 @@ SafeBox is a lightweight, local web-based triage and malware analysis workbench 
                                           |
                         +-----------------+-----------------+
                         |                                   |
-              [Static & VT Stage]                [Windows Sandbox Stage]
+              [Static & Intel Stage]             [Windows Sandbox Stage]
                         |                                   |
-            - 7-Zip safe unpack               - Provision hardened .wsb
-            - Authenticode check              - Map input/tools (read-only)
-            - Static PE / strings             - In-sandbox monitor script
-            - VirusTotal API lookup           - pktmon / pcapng network capture
-                        |                     - Live process & persistence diff
+            - 7-Zip archive & installer       - Provision hardened .wsb (RAM config)
+              unpack (NSIS/MSI/CAB/SFX)       - Map input/tools (read-only)
+            - Authenticode & PE heuristics    - Optional fake cursor / UIA clicks
+            - YARA rules (builtin/yara-py)    - Periodic screen capture + pktmon
+            - VT / MalwareBazaar / HA hash    - Process/net correlation & drop diff
+                        |                                   |
                         +-----------------+-----------------+
                                           |
-                                [Comprehensive Report]
-                           (Markdown, HTML & State JSON)
+                            [Report, IOCs & Diff Engine]
+                       (Markdown, HTML, JSON, CSV & STIX 2.1)
 ```
 
 ---
@@ -102,7 +107,7 @@ SafeBox is a lightweight, local web-based triage and malware analysis workbench 
 
 ## Running Automated Tests
 
-SafeBox includes a complete test suite covering archive decompression, VirusTotal throttling and streaming, sanitization, domain classification, and job lifecycle:
+SafeBox includes an automated unit and API test suite covering archive and installer unpacking, YARA scanning, VirusTotal/MalwareBazaar/Hybrid Analysis lookup and throttling, output quarantine & screenshot validation, IOC export (CSV/STIX 2.1), run comparison diffs, sandbox option/context-menu handling, and CSP/token security:
 
 ```cmd
 pip install -r requirements-dev.txt
