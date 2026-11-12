@@ -778,6 +778,60 @@ def stage_vt(job: Job) -> None:
         job.stage("vt", "done", f"{len(picks)} dosya sorgulandı, {flagged} tanesi en az bir motor tarafından işaretlendi.")
 
 
+def _check_dropped_files_vt(job: Job, beh: Dict[str, Any]) -> None:
+    """Queries VirusTotal by SHA-256 for executables dropped inside the sandbox during analysis.
+    Only hash lookup is performed (no uploads, zero data leakage risk)."""
+    key = vt_client.get_api_key()
+    if not key:
+        return
+    dropped = (beh.get("Files") or {}).get("DroppedHashes") or []
+    if not dropped:
+        return
+
+    existing_shas = {e.get("sha256") for e in job.state.get("vt", []) if e.get("sha256")}
+    new_drops = [d for d in dropped if d.get("SHA256") and d["SHA256"] not in existing_shas]
+    if not new_drops:
+        return
+
+    job.log(f"Sandbox içinde bırakılan {len(new_drops)} yeni çalıştırılabilir dosyanın hash'i VirusTotal'de sorgulanıyor...")
+    quota = False
+    for item in new_drops[:10]:
+        job.check_cancel()
+        if quota:
+            break
+        sha = item["SHA256"]
+        p_name = Path(item.get("Path", "unknown.exe")).name
+        rel_label = f"[bırakılan] {p_name}"
+        entry = {
+            "rel": rel_label,
+            "path": item.get("Path", ""),
+            "sha256": sha,
+            "size": item.get("Size", 0),
+            "status": "Sırada",
+            "result": None,
+            "gui_url": f"https://www.virustotal.com/gui/file/{sha}",
+            "dropped": True,
+        }
+        try:
+            res = vt_client.lookup(sha, key)
+            if res:
+                entry["result"] = res
+                entry["status"] = "VT'de kayıtlı (bırakılan dosya)"
+            else:
+                entry["status"] = "VT'de yok (bırakılan dosya)"
+        except vt_client.VtQuotaError:
+            quota = True
+            entry["status"] = "Sorgulanmadı (VirusTotal kotası doldu)"
+        except Exception as ex:
+            entry["status"] = f"Hata: {ex}"
+        job.state["vt"].append(entry)
+        compute_verdict(job)
+        job.save()
+
+    if quota:
+        job.log(vt_client.QUOTA_MSG)
+
+
 # ======================================================================== 5. sandbox
 def stage_sandbox(job: Job) -> None:
     if not sbm.WSB_EXE.exists():
@@ -887,6 +941,7 @@ def stage_sandbox(job: Job) -> None:
         if beh:
             beh.get("Files", {}).pop("NewFilesSample", None)
             job.state["behavior"] = beh
+            _check_dropped_files_vt(job, beh)
             job.stage("sandbox", "done", f"Tamamlandı. Ağ kaydı: {beh.get('CaptureStatus')}")
         elif job.state["sandbox"].get("monitor_lost"):
             job.stage("sandbox", "error", "İzleyici yanıt vermeyi bıraktı (örnek tarafından durdurulmuş olabilir). Son canlı veriler aşağıda.")
@@ -937,7 +992,7 @@ _STR_LISTS = [("Persistence", "Services"), ("Persistence", "Drivers"), ("Persist
               ("Hosts", "Removed"), ("Firewall", "Added"), ("Files", "NewExecutables"), ("Files", "ModifiedExecutables"),
               ("Network", "NewListening"), ("LanBlock", "Details"), ("LanBlock", "Exempt"), ("LanBlock", "Ranges"),
               ("Quick", "Services"), ("Quick", "Tasks"), ("Quick", "RunKeys"), ("Quick", "Startup"), ("Quick", "Defender"), ("Quick", "Hosts")]
-_OBJ_LISTS = [("Processes",), ("Connections",), ("Network", "Connections"), ("Network", "DnsCache")]
+_OBJ_LISTS = [("Processes",), ("Connections",), ("Network", "Connections"), ("Network", "DnsCache"), ("Files", "DroppedHashes")]
 _INTS = [("Files", "NewCount"), ("Files", "ModifiedCount"), ("SecondsLeft",), ("ProcessCount",), ("SampleProcessCount",),
          ("SuspiciousCount",), ("ConnectionCount",)]
 _BOOLS = [("LanBlock", "Requested"), ("LanBlock", "Applied"), ("LanBlock", "Tampered"), ("StoppedEarly",), ("Admin",)]

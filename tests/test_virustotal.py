@@ -8,7 +8,7 @@ import pytest
 
 import pipeline
 import vt_client
-from conftest import windows_only
+from conftest import bare_job, windows_only
 
 
 def _statuses(job):
@@ -72,6 +72,31 @@ def test_known_malware_turns_verdict_red(tmp_path, fake_vt, run_job):
     job = run_job(s)
     assert job.state["verdict"]["level"] == "red"
     assert any("zararlı yazılım ailesi" in r for r in job.state["verdict"]["red"])
+
+
+def test_dropped_files_queried_on_vt(tmp_path, fake_vt):
+    job = bare_job(tmp_path)
+    dropped_sha = "c" * 64
+    fake_vt.known[dropped_sha] = {
+        "stats": {"malicious": 8, "suspicious": 0, "undetected": 50, "harmless": 0, "total": 58},
+        "suggested_threat_label": "trojan.stealer", "flagged_engines": []
+    }
+    beh = {
+        "Files": {
+            "DroppedHashes": [
+                {"Path": "C:\\Users\\WDAGUtilityAccount\\AppData\\Local\\Temp\\payload.exe", "SHA256": dropped_sha, "Size": 12345}
+            ]
+        }
+    }
+    pipeline._check_dropped_files_vt(job, beh)
+    assert len(job.state["vt"]) == 1
+    e = job.state["vt"][0]
+    assert e["dropped"] is True
+    assert e["sha256"] == dropped_sha
+    assert "payload.exe" in e["rel"]
+    assert e["result"]["stats"]["malicious"] == 8
+    pipeline.compute_verdict(job)
+    assert any("payload.exe" in r for r in job.state["verdict"]["red"])
 
 
 # ---------------------------------------------------------------- A10

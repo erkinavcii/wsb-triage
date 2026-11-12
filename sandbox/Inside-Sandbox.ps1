@@ -467,6 +467,17 @@ $isExec = { param($p) $ExecExt -contains ([IO.Path]::GetExtension($p)).ToLower()
 $newExec = @($newFiles | Where-Object { & $isExec $_ } | Sort-Object)
 $modExec = @($modFiles | Where-Object { & $isExec $_ } | Sort-Object)
 
+$droppedHashes = @()
+foreach ($p in ($newExec | Select-Object -First 100)) {
+    try {
+        if (Test-Path -LiteralPath $p) {
+            $h = (Get-FileHash -LiteralPath $p -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()
+            $sz = (Get-Item -LiteralPath $p -ErrorAction Stop).Length
+            $droppedHashes += [ordered]@{ Path = $p; SHA256 = $h; Size = $sz }
+        }
+    } catch {}
+}
+
 $threats = @()
 try {
     $threats = @(Get-MpThreatDetection -ErrorAction Stop | Where-Object { $_.InitialDetectionTime -ge $startedAt.AddMinutes(-1) } | ForEach-Object {
@@ -515,6 +526,7 @@ $result = [ordered]@{
         ModifiedCount       = $modFiles.Count
         NewExecutables      = @($newExec | Select-Object -First 1000)
         ModifiedExecutables = @($modExec | Select-Object -First 500)
+        DroppedHashes       = @($droppedHashes)
         NewFilesSample      = @($newFiles | Sort-Object | Select-Object -First 1500)
     }
 }
