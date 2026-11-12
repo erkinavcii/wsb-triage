@@ -48,3 +48,4 @@ def test_script_has_pkt_size_and_dropped_hashes():
     ps = (ROOT / "sandbox" / "Inside-Sandbox.ps1").read_text(encoding="utf-8")
     assert "--pkt-size 512" in ps
     assert "DroppedHashes" in ps
+    assert "Capture-Screen" in ps

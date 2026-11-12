@@ -284,6 +284,7 @@ def job_state(case_id: str):
     st["case_dir"] = str(job.case_dir)
     st["has_pcap"] = (job.output_dir / "capture.pcapng").exists()
     st["has_report"] = (job.case_dir / "report.md").exists()
+    st["screenshots"] = pipeline.list_screenshots(job)
     return st
 
 
@@ -370,6 +371,20 @@ def job_iocs(case_id: str, format: str = "stix", include_noise: bool = False):
             headers={"Content-Disposition": f'attachment; filename="iocs_{job.id}.stix.json"'},
         )
     raise HTTPException(400, "Geçersiz format (csv veya stix olmalı).")
+
+
+@app.get("/api/jobs/{case_id}/screenshots/{name}")
+def job_screenshot(case_id: str, name: str):
+    job = _job(case_id)
+    scr_dir = job.output_dir / "screenshots"
+    p = scr_dir / name
+    if not pipeline.is_valid_screenshot_file(p, scr_dir):
+        raise HTTPException(404, "Ekran görüntüsü bulunamadı")
+    return Response(
+        content=p.read_bytes(),
+        media_type="image/png",
+        headers={"Content-Disposition": f'inline; filename="{p.name}"'},
+    )
 
 
 @app.post("/api/jobs/{case_id}/open")

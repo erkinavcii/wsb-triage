@@ -289,7 +289,8 @@ function listBox(title, items, color) {
 
 function renderSandbox(st) {
   const s = st.stages.sandbox, live = (st.sandbox || {}).live, b = st.behavior;
-  const show = s.status === 'running' || live || b;
+  const shots = asArr(st.screenshots || (st.sandbox || {}).screenshots);
+  const show = s.status === 'running' || live || b || shots.length > 0;
   $('sbSection').classList.toggle('hidden', !show);
   if (!show) return;
   $('sbPulse').className = 'w-2.5 h-2.5 rounded-full ' + (s.status === 'running' ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500');
@@ -330,6 +331,18 @@ function renderSandbox(st) {
   $('sbConns').innerHTML = `<tr><th>Saat</th><th>İşlem</th><th>Hedef</th><th>Durum</th></tr>` + conns.slice(0, 200).map(c => `
     <tr class="${c.FromSample ? 'bg-cyan-950/30' : ''}"><td>${esc(c.FirstSeen)}</td><td>${c.FromSample ? '🎯 ' : ''}${esc(c.Process)}</td>
     <td class="mono">${esc(c.Remote)}:${esc(c.Port)}</td><td class="text-slate-400">${esc(c.State)}</td></tr>`).join('');
+  $('sbScreenshotsWrap').classList.toggle('hidden', !shots.length);
+  if (shots.length) {
+    $('sbShotCount').textContent = String(shots.length);
+    const encId = encodeURIComponent(st.id);
+    $('sbScreenshots').innerHTML = shots.map(name => {
+      const url = `/api/jobs/${encId}/screenshots/${encodeURIComponent(name)}`;
+      return `<a href="${url}" target="_blank" rel="noopener noreferrer" class="block space-y-1">
+        <img src="${url}" alt="${esc(name)}" class="sb-thumb" loading="lazy" />
+        <div class="text-[11px] mono text-slate-400 text-center">${esc(name)}</div>
+      </a>`;
+    }).join('');
+  }
 }
 
 const classRank = c => c.startsWith('KÖTÜYE') ? 0 : c.startsWith('BİLİNMEYEN') ? 1 : c.startsWith('Paylaşımlı') ? 2 : 3;

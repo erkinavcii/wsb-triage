@@ -24,6 +24,37 @@ New-Item -ItemType Directory -Force -Path $WorkPath, $SampleDir, $OutputDir | Ou
 $WorkPath = (Get-Item -LiteralPath $WorkPath).FullName
 $SampleDir = (Get-Item -LiteralPath $SampleDir).FullName
 $StopFlag = Join-Path $ToolsDir 'stop.flag'
+$ScreenshotsDir = Join-Path $OutputDir 'screenshots'
+$script:ShotCount = 0
+$script:LastShot = [datetime]::MinValue
+$script:ScreenWarned = $false
+try { Add-Type -AssemblyName System.Windows.Forms, System.Drawing -ErrorAction Stop } catch {}
+
+function Capture-Screen {
+    if ($TestMode -or $script:ShotCount -ge 24) { return }
+    try {
+        $bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+        if (-not $bounds -or $bounds.Width -lt 10 -or $bounds.Height -lt 10) { return }
+        if (-not (Test-Path -LiteralPath $ScreenshotsDir)) { New-Item -ItemType Directory -Force -Path $ScreenshotsDir | Out-Null }
+        $script:ShotCount++
+        $bmp = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
+        $g = [System.Drawing.Graphics]::FromImage($bmp)
+        try {
+            $g.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+            $file = Join-Path $ScreenshotsDir ('scr_{0:D3}.png' -f $script:ShotCount)
+            $bmp.Save($file, [System.Drawing.Imaging.ImageFormat]::Png)
+        } finally {
+            $g.Dispose()
+            $bmp.Dispose()
+        }
+        $script:LastShot = Get-Date
+    } catch {
+        if (-not $script:ScreenWarned) {
+            $script:ScreenWarned = $true
+            Log "Screenshot skipped: $($_.Exception.Message)"
+        }
+    }
+}
 try { $Host.UI.RawUI.WindowTitle = 'SafeBox monitor - do not close' } catch {}
 
 $TimelineFile = Join-Path $OutputDir 'timeline.log'
@@ -426,9 +457,11 @@ if ($targetFile) {
 
 $end = $startedAt.AddSeconds($Duration)
 $stoppedEarly = $false
+Capture-Screen
 while ((Get-Date) -lt $end) {
     Update-Watch $watchStart
     Test-LanBlock
+    if (((Get-Date) - $script:LastShot).TotalSeconds -ge 30) { Capture-Screen }
     $left = [int]($end - (Get-Date)).TotalSeconds
     $sampleProcs = @($Procs.Values | Where-Object { $_.InTree }).Count
     Set-Status ("Izleniyor: {0} sn kaldi, {1} yeni islem ({2} ornekten), {3} baglanti" -f $left, $Procs.Count, $sampleProcs, $Conns.Count)
@@ -438,6 +471,7 @@ while ((Get-Date) -lt $end) {
 }
 Update-Watch $watchStart
 Test-LanBlock
+Capture-Screen
 $endedAt = Get-Date
 Log 'Observation window finished.'
 

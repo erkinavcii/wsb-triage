@@ -157,6 +157,40 @@ def test_report_formats(client, tmp_path, monkeypatch):
     assert client.get("/api/jobs/test-formats/iocs?format=xml").status_code == 400
 
 
+def test_screenshots_quarantine_and_endpoint(client, tmp_path, monkeypatch):
+    case_dir = tmp_path / "cases" / "test-shots"
+    scr_dir = case_dir / "output" / "screenshots"
+    scr_dir.mkdir(parents=True)
+    case_dir.mkdir(exist_ok=True)
+    (case_dir / "state.json").write_text('{"id":"test-shots","status":"done"}', encoding="utf-8")
+    monkeypatch.setattr(pipeline, "CASES_DIR", tmp_path / "cases")
+
+    # Minimal valid PNG header + IHDR bytes
+    valid_png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"\x00" * 20
+    (scr_dir / "scr_001.png").write_bytes(valid_png)
+    # Forged non-PNG & executable inside screenshots/ MUST be quarantined
+    (scr_dir / "scr_002.png").write_bytes(b"<html><script>alert(1)</script></html>")
+    (scr_dir / "dropper.exe").write_bytes(b"MZ" + b"\x00" * 40)
+
+    moved = pipeline.quarantine_output(case_dir / "output")
+    assert (scr_dir / "scr_001.png").exists()
+    assert not (scr_dir / "scr_002.png").exists()
+    assert (scr_dir / "scr_002.png.quarantine").exists()
+    assert (scr_dir / "dropper.exe.quarantine").exists()
+    assert any("scr_002.png" in m for m in moved)
+
+    st = client.get("/api/jobs/test-shots").json()
+    assert st["screenshots"] == ["scr_001.png"]
+
+    r_ok = client.get("/api/jobs/test-shots/screenshots/scr_001.png")
+    assert r_ok.status_code == 200
+    assert r_ok.headers["content-type"] == "image/png"
+    assert r_ok.content == valid_png
+
+    assert client.get("/api/jobs/test-shots/screenshots/scr_002.png").status_code == 404
+    assert client.get("/api/jobs/test-shots/screenshots/bad.png").status_code == 404
+
+
 def test_job_creation_clamps_memory_and_duration(tmp_path, monkeypatch):
     sample = tmp_path / "dummy.bat"
     sample.write_text("@echo off\n", encoding="utf-8")

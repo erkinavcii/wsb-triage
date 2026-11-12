@@ -1043,6 +1043,7 @@ def stage_sandbox(job: Job) -> None:
             job.log("İzleyici durdu; 'kapatma' seçili olmadığı için sandbox açık bırakıldı. İçindekileri ana bilgisayara kopyalamayın.")
         quarantined = quarantine_output(out)
         job.state["sandbox"]["quarantined"] = quarantined
+        job.state["sandbox"]["screenshots"] = list_screenshots(job)
         if quarantined:
             job.log(f"output klasöründe beklenmeyen {len(quarantined)} dosya karantinaya alındı (.quarantine): {', '.join(quarantined[:10])}")
         beh = sanitize_sandbox_json(_read_json(out / "behavior.json"))
@@ -1061,6 +1062,35 @@ def stage_sandbox(job: Job) -> None:
 
 # Files the monitor itself writes into output/. Anything else was put there by something inside the sandbox.
 OUTPUT_ALLOWLIST = {"live.json", "behavior.json", "status.txt", "timeline.log", "capture.pcapng", "procmon.pml", "done.flag"}
+_SCREENSHOT_NAME_RX = re.compile(r"^scr_\d{3}\.png$")
+_MAX_SCREENSHOTS = 30
+_MAX_SCREENSHOT_BYTES = 10 * 1024 * 1024
+
+
+def is_valid_screenshot_file(p: Path, screenshots_dir: Path) -> bool:
+    """True only for non-symlink scr_NNN.png files inside screenshots/ with valid PNG+IHDR headers."""
+    try:
+        if p.parent.resolve() != screenshots_dir.resolve() or p.is_symlink() or not p.is_file():
+            return False
+        if not _SCREENSHOT_NAME_RX.fullmatch(p.name):
+            return False
+        st = p.stat()
+        if st.st_size < 33 or st.st_size > _MAX_SCREENSHOT_BYTES:
+            return False
+        with open(p, "rb") as f:
+            hdr = f.read(24)
+        return len(hdr) == 24 and hdr[:8] == b"\x89PNG\r\n\x1a\n" and hdr[12:16] == b"IHDR"
+    except OSError:
+        return False
+
+
+def list_screenshots(job: Job) -> List[str]:
+    """Returns validated screenshot filenames stored in output/screenshots."""
+    scr_dir = job.output_dir / "screenshots"
+    if not scr_dir.is_dir():
+        return []
+    names = [p.name for p in sorted(scr_dir.iterdir()) if is_valid_screenshot_file(p, scr_dir)]
+    return names[:_MAX_SCREENSHOTS]
 
 
 def quarantine_output(out: Path) -> List[str]:
@@ -1069,8 +1099,20 @@ def quarantine_output(out: Path) -> List[str]:
     moved: List[str] = []
     if not out.exists():
         return moved
+    scr_dir = out / "screenshots"
+    keep_shots: set = set()
+    if scr_dir.is_dir():
+        for sp in sorted(scr_dir.iterdir()):
+            if is_valid_screenshot_file(sp, scr_dir):
+                keep_shots.add(sp)
+                if len(keep_shots) >= _MAX_SCREENSHOTS:
+                    break
     for p in sorted(out.rglob("*"), key=lambda x: len(x.parts), reverse=True):
-        if not p.is_file() or (p.parent == out and p.name in OUTPUT_ALLOWLIST) or p.name.endswith(".quarantine"):
+        if not p.is_file() or p.name.endswith(".quarantine"):
+            continue
+        if p.parent == out and p.name in OUTPUT_ALLOWLIST:
+            continue
+        if p in keep_shots:
             continue
         try:
             target = p.with_name(p.name + ".quarantine")
@@ -1584,6 +1626,9 @@ def write_report(job: Job) -> None:
         L += ["", "### TCP bağlantıları"]
         for c in ((b.get("Network") or {}).get("Connections") or [])[:150]:
             L.append(f"- {c.get('FirstSeen')} {c.get('Process')} → {c.get('Remote')}:{c.get('Port')}" + (" [örnek]" if c.get("FromSample") else ""))
+    shots = list_screenshots(job)
+    if shots:
+        L += ["", f"### Sandbox ekran görüntüleri ({len(shots)})", ""] + [f"- `output/screenshots/{name}`" for name in shots]
     net = s.get("network")
     if net:
         def _ptag(row):
