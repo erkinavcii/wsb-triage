@@ -1,0 +1,181 @@
+"""VirusTotal: what may leave the machine (A1), quota handling (A10), streamed uploads (A11)."""
+import email.parser
+import io
+import shutil
+import zipfile
+
+import pytest
+
+import pipeline
+import vt_client
+from conftest import windows_only
+
+
+def _statuses(job):
+    return {e["rel"]: e["status"] for e in job.state["vt"]}
+
+
+@windows_only
+def test_only_programs_are_uploaded_from_a_folder(tmp_path, fake_vt, run_job, unsigned_exe):
+    d = tmp_path / "pkg"
+    d.mkdir()
+    unsigned_exe(d / "setup.exe")
+    (d / "license.pdf").write_bytes(b"%PDF-1.7 personal contract")   # suspicious name, but a document
+    (d / "foto.jpg").write_bytes(b"\xff\xd8\xff personal photo")
+    job = run_job(d, vt_upload=True)
+    assert fake_vt.uploads == ["setup.exe"]
+    assert "gizlilik" in _statuses(job)["license.pdf"]
+
+
+def test_archive_of_documents_is_not_uploaded(tmp_path, fake_vt, run_job):
+    z = tmp_path / "kisisel.zip"
+    with zipfile.ZipFile(z, "w") as zf:
+        zf.writestr("banka_dokumu.pdf", "%PDF private")
+        zf.writestr("license_key.txt", "ABCD-1234")
+    job = run_job(z, vt_upload=True)
+    assert fake_vt.uploads == []
+    assert "gizlilik" in _statuses(job)["[orijinal] kisisel.zip"]
+
+
+@windows_only
+def test_archive_with_a_program_may_be_uploaded(tmp_path, fake_vt, run_job, unsigned_exe):
+    exe = unsigned_exe(tmp_path / "setup.exe")
+    z = tmp_path / "program.zip"
+    with zipfile.ZipFile(z, "w") as zf:
+        zf.write(exe, "setup.exe")
+    run_job(z, vt_upload=True)
+    assert "program.zip" in fake_vt.uploads
+
+
+@windows_only
+def test_automatic_runs_upload_nothing(tmp_path, fake_vt, run_job, unsigned_exe):
+    d = tmp_path / "pkg"
+    d.mkdir()
+    unsigned_exe(d / "setup.exe")
+    job = run_job(d, vt_upload=False)
+    assert fake_vt.uploads == []
+    assert fake_vt.lookups, "hash lookups still happen"
+    assert "yükleme kapalı" in _statuses(job)["setup.exe"]
+
+
+def test_watcher_starts_jobs_without_upload():
+    src = (pipeline.BASE_DIR / "pipeline.py").read_text(encoding="utf-8")
+    assert '"vt_upload": False' in src.split("def poll_once", 1)[1]
+
+
+def test_known_malware_turns_verdict_red(tmp_path, fake_vt, run_job):
+    s = tmp_path / "loader.bat"
+    s.write_text("@echo off")
+    sha = pipeline._sha256(s)
+    fake_vt.known[sha] = {"stats": {"malicious": 12, "suspicious": 0, "undetected": 50, "harmless": 0, "total": 62},
+                          "suggested_threat_label": "trojan.lumma/stealer", "flagged_engines": []}
+    job = run_job(s)
+    assert job.state["verdict"]["level"] == "red"
+    assert any("zararlı yazılım ailesi" in r for r in job.state["verdict"]["red"])
+
+
+# ---------------------------------------------------------------- A10
+class _Resp:
+    def __init__(self, code, body=None):
+        self.status_code, self._body, self.text = code, body or {}, ""
+
+    def json(self):
+        return self._body
+
+
+def test_second_429_means_quota_and_stops(monkeypatch):
+    calls = []
+    monkeypatch.setattr(vt_client.requests, "get", lambda *a, **k: (calls.append(1), _Resp(429))[1])
+    monkeypatch.setattr(vt_client.time, "sleep", lambda s: None)
+    monkeypatch.setattr(vt_client, "MIN_INTERVAL_SEC", 0)
+    with pytest.raises(vt_client.VtQuotaError):
+        vt_client.lookup("0" * 64, "k")
+    assert len(calls) == 2
+
+
+def test_quota_stops_the_whole_vt_stage(tmp_path, monkeypatch, run_job):
+    calls = []
+    monkeypatch.setattr(vt_client, "get_api_key", lambda: "k")
+    monkeypatch.setattr(vt_client.requests, "get", lambda *a, **k: (calls.append(1), _Resp(429))[1])
+    monkeypatch.setattr(vt_client.time, "sleep", lambda s: None)
+    monkeypatch.setattr(vt_client, "MIN_INTERVAL_SEC", 0)
+    d = tmp_path / "pkg"
+    d.mkdir()
+    for n in range(4):
+        (d / f"tool{n}.bat").write_text(f"@echo {n}")
+    job = run_job(d)
+    assert len(calls) == 2                        # not 2 per file
+    assert "Kota doldu" in job.state["stages"]["vt"]["msg"]
+    assert all("kota" in e["status"].lower() for e in job.state["vt"])
+
+
+def test_404_is_not_found_and_401_is_bad_key(monkeypatch):
+    monkeypatch.setattr(vt_client, "MIN_INTERVAL_SEC", 0)
+    monkeypatch.setattr(vt_client.requests, "get", lambda *a, **k: _Resp(404))
+    assert vt_client.lookup("0" * 64, "k") is None
+    monkeypatch.setattr(vt_client.requests, "get", lambda *a, **k: _Resp(401))
+    with pytest.raises(vt_client.VtError, match="401"):
+        vt_client.lookup("0" * 64, "k")
+
+
+def test_summarize_flags_families_and_crack_tools():
+    data = {"data": {"attributes": {
+        "last_analysis_stats": {"malicious": 5, "suspicious": 1, "undetected": 60, "harmless": 0},
+        "last_analysis_results": {"E1": {"category": "malicious", "result": "HackTool.Crack"},
+                                  "E2": {"category": "undetected", "result": None}},
+        "popular_threat_classification": {"suggested_threat_label": "hacktool.keygen"}}}}
+    s = vt_client.summarize(data, "a" * 64)
+    assert s["stats"]["total"] == 66
+    assert s["looks_like_crack_tool"] and not s["has_dangerous_malware_family"]
+    assert [e["engine"] for e in s["flagged_engines"]] == ["E1"]
+
+
+# ---------------------------------------------------------------- A11
+def test_streaming_multipart_is_valid_and_lazy(tmp_path):
+    f = tmp_path / "sample file.exe"
+    payload = bytes(range(256)) * 4000
+    f.write_bytes(payload)
+    body = vt_client.StreamingMultipart(str(f))
+    try:
+        assert len(body) == body.len
+        chunks = []
+        while True:
+            c = body.read(7777)                      # odd chunk size crosses the part boundaries
+            if not c:
+                break
+            assert len(c) <= 7777
+            chunks.append(c)
+        raw = b"".join(chunks)
+    finally:
+        body.close()
+    assert len(raw) == body.len
+    msg = email.parser.BytesParser().parsebytes(b"Content-Type: " + body.content_type.encode() + b"\r\n\r\n" + raw)
+    parts = msg.get_payload()
+    assert len(parts) == 1
+    assert parts[0].get_param("name", header="content-disposition") == "file"
+    assert parts[0].get_filename() == "sample_file.exe"          # sanitized
+    assert parts[0].get_payload(decode=True) == payload
+
+
+def test_upload_refuses_files_over_the_limit(tmp_path, monkeypatch):
+    f = tmp_path / "big.bin"
+    f.write_bytes(b"x" * 100)
+    monkeypatch.setattr(vt_client, "MAX_UPLOAD", 50)
+    with pytest.raises(vt_client.VtError, match="650"):
+        vt_client.upload(str(f), "k")
+
+
+def test_upload_sends_the_stream(tmp_path, monkeypatch):
+    f = tmp_path / "s.exe"
+    f.write_bytes(b"MZ" + b"\0" * 1000)
+    seen = {}
+
+    def fake_post(url, headers=None, data=None, timeout=None):
+        seen["ctype"] = headers["Content-Type"]
+        seen["body"] = data.read(10 ** 6)
+        return _Resp(200, {"data": {"id": "aid-1"}})
+    monkeypatch.setattr(vt_client.requests, "post", fake_post)
+    monkeypatch.setattr(vt_client, "_throttle", lambda: None)
+    assert vt_client.upload(str(f), "k") == "aid-1"
+    assert seen["ctype"].startswith("multipart/form-data; boundary=")
+    assert b"MZ" in seen["body"]

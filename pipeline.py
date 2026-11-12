@@ -64,6 +64,7 @@ DISK_RESERVE_BYTES = 2 * 1024 ** 3  # keep this much free when extracting
 TSHARK_TIMEOUT_SEC = 300          # per tshark query; a timeout gives a partial network summary, not a failed analysis
 SIGCHECK_BATCH = 500              # files per Authenticode check run
 MONITOR_DEAD_SEC = 180            # no live.json update for this long while observing -> monitor considered killed
+AV_SETTLE_SEC = 3                 # pause before hashing so real-time antivirus can quarantine files first
 
 JOBS: Dict[str, "Job"] = {}
 JOBS_LOCK = threading.Lock()
@@ -553,7 +554,7 @@ def _sha256(path: Path) -> str:
 
 def stage_inventory(job: Job) -> None:
     job.stage("inventory", "running", "Dosyalar hash'leniyor...")
-    time.sleep(3)  # let real-time antivirus act, so quarantined files show up as missing
+    time.sleep(AV_SETTLE_SEC)  # let real-time antivirus act, so quarantined files show up as missing
     inp = job.input_dir
     files = [p for p in inp.rglob("*") if p.is_file()]
     items: List[Dict[str, Any]] = []
@@ -1363,30 +1364,34 @@ class DownloadWatcher:
             if not self.enabled:
                 continue
             try:
-                with self._lock:
-                    for p in Path(self.folder).iterdir():
-                        if not p.is_file() or p.name.lower().endswith(self.IGNORE):
-                            continue
-                        st = p.stat()
-                        key = str(p)
-                        if self._baseline.get(key) == (st.st_size, st.st_mtime_ns):
-                            continue
-                        if any(f["path"] == key for f in self.found):
-                            continue
-                        prev_size, stable = self._seen.get(key, (None, 0))
-                        stable = stable + 1 if prev_size == st.st_size and st.st_size > 0 else 0
-                        self._seen[key] = (st.st_size, stable)
-                        # finished = same size for STABLE_POLLS polls in a row AND no other process holds the file open
-                        if stable >= self.STABLE_POLLS and not _file_in_use(p):
-                            later_part = is_later_volume(p.name)
-                            item = {"path": key, "name": p.name, "size": st.st_size, "time": _now(), "job": None, "later_part": later_part}
-                            self.found.append(item)
-                            if self.auto_start and not later_part:
-                                # automatic runs never upload anything: hash lookups only (the user did not pick this file)
-                                job = create_job(key, {"run_sandbox": False, "vt_upload": False})
-                                item["job"] = job.id
+                self.poll_once()
             except Exception:
                 traceback.print_exc()
+
+    def poll_once(self) -> None:
+        """One scan of the folder (the background loop calls this every 5 s)."""
+        with self._lock:
+            for p in Path(self.folder).iterdir():
+                if not p.is_file() or p.name.lower().endswith(self.IGNORE):
+                    continue
+                st = p.stat()
+                key = str(p)
+                if self._baseline.get(key) == (st.st_size, st.st_mtime_ns):
+                    continue
+                if any(f["path"] == key for f in self.found):
+                    continue
+                prev_size, stable = self._seen.get(key, (None, 0))
+                stable = stable + 1 if prev_size == st.st_size and st.st_size > 0 else 0
+                self._seen[key] = (st.st_size, stable)
+                # finished = same size for STABLE_POLLS polls in a row AND no other process holds the file open
+                if stable >= self.STABLE_POLLS and not _file_in_use(p):
+                    later_part = is_later_volume(p.name)
+                    item = {"path": key, "name": p.name, "size": st.st_size, "time": _now(), "job": None, "later_part": later_part}
+                    self.found.append(item)
+                    if self.auto_start and not later_part:
+                        # automatic runs never upload anything: hash lookups only (the user did not pick this file)
+                        job = create_job(key, {"run_sandbox": False, "vt_upload": False})
+                        item["job"] = job.id
 
 
 load_interrupted()
