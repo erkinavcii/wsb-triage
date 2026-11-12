@@ -228,3 +228,34 @@ def test_dropped_files_vt_rejects_hostile_and_deduplicates_case(tmp_path, fake_v
     assert len(job.state["vt"]) == 2
     assert job.state["vt"][1]["rel"] == "[bırakılan] unknown.exe"
     assert job.state["vt"][1]["size"] == 0
+
+
+def test_intel_client_malwarebazaar_and_hybrid_analysis_fallback(tmp_path, monkeypatch, run_job):
+    import intel_client
+    cfg_file = tmp_path / "config.json"
+    monkeypatch.setattr(vt_client, "CONFIG_PATH", cfg_file)
+    monkeypatch.setattr(vt_client, "get_api_key", lambda: "")
+    intel_client.set_intel_config(mb_api_key="mb-k", ha_api_key="ha-k", mb_enabled=True)
+
+    s = tmp_path / "dropper.bat"
+    s.write_text("@echo evil")
+    sha = pipeline._sha256(s)
+
+    def fake_post(url, data=None, headers=None, timeout=None):
+        assert url == intel_client.MB_API_URL
+        assert headers.get("Auth-Key") == "mb-k"
+        return _Resp(200, {"query_status": "ok", "data": [{"signature": "LummaStealer", "tags": ["stealer"]}]})
+
+    def fake_get(url, headers=None, timeout=None):
+        assert sha in url and headers.get("api-key") == "ha-k"
+        return _Resp(200, {"verdict": "malicious", "threat_score": 95, "vx_family": "Lumma", "av_detect": 40})
+
+    monkeypatch.setattr(intel_client.requests, "post", fake_post)
+    monkeypatch.setattr(intel_client.requests, "get", fake_get)
+
+    job = run_job(s)
+    assert job.state["stages"]["vt"]["status"] == "done"
+    assert job.state["vt"][0]["intel"]["malicious"] is True
+    assert job.state["verdict"]["level"] == "red"
+    assert any("MalwareBazaar" in r for r in job.state["verdict"]["red"])
+    assert any("Hybrid Analysis" in r for r in job.state["verdict"]["red"])

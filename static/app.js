@@ -1,7 +1,7 @@
 const SAFEBOX_TOKEN = (document.querySelector('meta[name="safebox-token"]') || {}).content || "";
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-let activeJobId = null, activeJob = null, pollTimer = null, renderedStaticKey = '', caps = {};
+let activeJobId = null, activeJob = null, pollTimer = null, renderedStaticKey = '', caps = {}, vtModalOpen = false;
 
 async function api(url, opts = {}) {
   opts.headers = opts.headers || {};
@@ -25,6 +25,7 @@ async function loadSystemStatus() {
     caps = await api('/api/system-status');
     $('vtStatusDot').className = 'w-2 h-2 rounded-full ' + (caps.vt_api_configured ? 'bg-emerald-400' : 'bg-amber-400');
     $('vtStatusText').textContent = caps.vt_api_configured ? `VT API aktif (${caps.vt_api_masked})` : 'VT API: anahtar girilmedi';
+    if ($('mbEnabledInput') && !vtModalOpen) $('mbEnabledInput').checked = !!caps.mb_enabled;
     $('sysSubText').textContent = caps.os;
     let h = '';
     h += caps.windows_sandbox_enabled ? badge('✅ Windows Sandbox hazır', 'emerald')
@@ -154,13 +155,14 @@ $('btnCleanup').onclick = async () => {
 };
 
 document.addEventListener('click', e => {
-  const t = e.target.closest('[data-open-job],[data-analyze],[data-close],[data-vt-query],[data-vt-upload]');
+  const t = e.target.closest('[data-open-job],[data-analyze],[data-close],[data-vt-query],[data-vt-upload],[data-intel-query]');
   if (!t) return;
   if (t.dataset.openJob) openJob(t.dataset.openJob);
   else if (t.dataset.analyze) { $('pathInput').value = t.dataset.analyze; startAnalysis(t.dataset.analyze); }
-  else if (t.dataset.close) hideModal(t.dataset.close);
+  else if (t.dataset.close) { if (t.dataset.close === 'vtModal') vtModalOpen = false; hideModal(t.dataset.close); }
   else if (t.dataset.vtQuery) manualVtQuery(parseInt(t.dataset.vtQuery, 10));
   else if (t.dataset.vtUpload) manualVtUpload(parseInt(t.dataset.vtUpload, 10));
+  else if (t.dataset.intelQuery) manualIntelQuery(parseInt(t.dataset.intelQuery, 10));
 });
 
 // ---------------------------------------------------------------- active job
@@ -270,10 +272,11 @@ function renderVt(st) {
   if (!rows.length) return;
   $('vtTable').innerHTML = `<tr><th>Dosya</th><th>Durum</th><th>Zararlı</th><th>Etiket / motorlar</th><th></th></tr>` + rows.map(e => {
     const r = e.result;
+    const intelTxt = e.intel && e.intel.summary ? `<div class="text-rose-300 font-semibold">${esc(e.intel.summary)}</div>` : '';
     const fam = r && r.has_dangerous_malware_family ? '<span class="px-1.5 py-0.5 rounded bg-rose-600/40 text-rose-100 font-bold mr-1">ZARARLI AİLE</span>' : '';
     const engines = r ? r.flagged_engines.slice(0, 4).map(x => `${esc(x.engine)}: ${esc(x.result)}`).join(' | ') : '';
     return `<tr><td class="mono break-all">${esc(e.rel)}</td><td class="text-slate-400">${esc(e.status)}</td><td>${vtCell(r)}</td>
-      <td>${fam}${r ? esc(r.suggested_threat_label) : ''}<div class="text-slate-500">${engines}</div></td>
+      <td>${fam}${r ? esc(r.suggested_threat_label) : ''}${intelTxt}<div class="text-slate-500">${engines}</div></td>
       <td><a class="text-cyan-400 underline whitespace-nowrap" target="_blank" rel="noopener" href="${esc(e.gui_url)}">VT ↗</a></td></tr>`;
   }).join('');
 }
@@ -415,6 +418,7 @@ function renderStatic(st) {
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-3"><div class="space-y-2">${yaras}${strs}${urls}</div><div class="space-y-2">${apisHtml}</div></div>
       <div class="pt-2 border-t border-slate-800/80 flex flex-wrap items-center gap-2 text-xs">
         ${vt ? `<span>VirusTotal: ${vtCell(vt.result)} <span class="text-slate-500">${esc(vt.status)}</span></span>` : `<button data-vt-query="${idx}" class="px-3 py-1.5 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 border border-cyan-500/40 font-semibold">🛡️ VirusTotal ile sorgula</button>`}
+        <button data-intel-query="${idx}" class="px-3 py-1.5 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-300 border border-indigo-500/40 font-semibold">🔍 MB / HA Sor</button>
         <a href="https://www.virustotal.com/gui/file/${esc(sha)}" target="_blank" rel="noopener" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200">VT ↗</a>
         <a href="https://www.hybrid-analysis.com/search?query=${esc(sha)}" target="_blank" rel="noopener" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200">Hybrid Analysis ↗</a>
         <a href="https://app.any.run/submissions/#filehash:${esc(sha)}" target="_blank" rel="noopener" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200">ANY.RUN ↗</a>
@@ -441,9 +445,42 @@ async function manualVtUpload(idx) {
   catch (e) { box.innerHTML = `<span class="text-rose-300">${esc(e.message)}</span>`; }
 }
 
-// ---------------------------------------------------------------- VT modal
-$('btnVtModal').onclick = () => showModal('vtModal');
-$('btnVtSave').onclick = async () => { await post('/api/vt/config', { api_key: $('vtApiKeyInput').value.trim() }); $('vtApiKeyInput').value = ''; hideModal('vtModal'); loadSystemStatus(); };
+async function manualIntelQuery(idx) {
+  const f = activeJob.static[idx], box = $('vtBox_' + idx);
+  box.classList.remove('hidden'); box.innerHTML = '<div class="text-indigo-300 animate-pulse">MalwareBazaar & Hybrid Analysis sorgulanıyor (yalnızca hash)...</div>';
+  try {
+    const d = await api('/api/intel/query/' + f.hashes.sha256);
+    const lines = [];
+    if (d.malwarebazaar) {
+      const m = d.malwarebazaar;
+      lines.push(m.found
+        ? `<div><b class="text-rose-300">MalwareBazaar:</b> Zararlı kayıtlı (${esc(m.family || 'etiketsiz')}) — <a class="text-cyan-400 underline" href="${esc(m.gui_url)}" target="_blank" rel="noopener">detay ↗</a></div>`
+        : `<div><b class="text-slate-300">MalwareBazaar:</b> ${esc(m.message || 'kayıt bulunamadı')}</div>`);
+    }
+    if (d.hybrid_analysis) {
+      const h = d.hybrid_analysis;
+      lines.push(h.found
+        ? `<div><b class="${h.verdict === 'malicious' ? 'text-rose-300' : 'text-amber-300'}">Hybrid Analysis:</b> ${esc(h.verdict)} (skor ${esc(h.threat_score)}/100${h.family ? ', ' + esc(h.family) : ''}) — <a class="text-cyan-400 underline" href="${esc(h.gui_url)}" target="_blank" rel="noopener">detay ↗</a></div>`
+        : `<div><b class="text-slate-300">Hybrid Analysis:</b> ${esc(h.message || 'kayıt bulunamadı')}</div>`);
+    }
+    box.innerHTML = lines.join('');
+  } catch (e) { box.innerHTML = `<span class="text-rose-300">${esc(e.message)}</span>`; }
+}
+
+// ---------------------------------------------------------------- VT / Intel modal
+$('btnVtModal').onclick = () => { vtModalOpen = true; if ($('mbEnabledInput')) $('mbEnabledInput').checked = !!caps.mb_enabled; showModal('vtModal'); };
+$('btnVtSave').onclick = async () => {
+  const payload = {
+    vt_api_key: $('vtApiKeyInput').value.trim() || null,
+    mb_api_key: $('mbApiKeyInput').value.trim() || null,
+    ha_api_key: $('haApiKeyInput').value.trim() || null,
+    mb_enabled: $('mbEnabledInput').checked,
+  };
+  await post('/api/intel/config', payload);
+  $('vtApiKeyInput').value = ''; $('mbApiKeyInput').value = ''; $('haApiKeyInput').value = '';
+  vtModalOpen = false;
+  hideModal('vtModal'); loadSystemStatus();
+};
 
 loadSystemStatus(); loadJobs(); loadWatch();
 setInterval(loadWatch, 5000);

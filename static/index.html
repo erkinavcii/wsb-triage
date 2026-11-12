@@ -186,15 +186,31 @@
   <div id="vtModal" class="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 hidden items-center justify-center p-4">
     <div class="glass-card rounded-2xl max-w-lg w-full p-6 space-y-4">
       <div class="flex items-center justify-between">
-        <h3 class="text-base font-bold text-white">VirusTotal ücretsiz API anahtarı</h3>
+        <h3 class="text-base font-bold text-white">API anahtarları &amp; tehdit istihbaratı</h3>
         <button data-close="vtModal" class="text-slate-400 hover:text-white text-lg">&times;</button>
       </div>
       <ol class="list-decimal list-inside space-y-1 text-xs text-slate-300 bg-slate-900/90 p-4 rounded-xl border border-slate-800">
-        <li><a href="https://www.virustotal.com/gui/join-us" target="_blank" rel="noopener" class="text-cyan-400 underline">virustotal.com</a>'da ücretsiz hesap açın.</li>
-        <li><a href="https://www.virustotal.com/gui/my-apikey" target="_blank" rel="noopener" class="text-cyan-400 underline">API Key</a> sayfasından anahtarı kopyalayın.</li>
-        <li>Aşağıya yapıştırın. Anahtar bu bilgisayarda config.json içinde saklanır.</li>
+        <li><a href="https://www.virustotal.com/gui/join-us" target="_blank" rel="noopener" class="text-cyan-400 underline">virustotal.com</a>'dan ücretsiz API anahtarı alabilirsiniz.</li>
+        <li>VT kotası dolduğunda veya VT anahtarı olmadığında yedek olarak <a href="https://bazaar.abuse.ch/" target="_blank" rel="noopener" class="text-cyan-400 underline">MalwareBazaar</a> ve <a href="https://www.hybrid-analysis.com/" target="_blank" rel="noopener" class="text-cyan-400 underline">Hybrid Analysis</a> yalnızca hash sorgular (dosya yüklemez).</li>
+        <li>Anahtarlar bu bilgisayarda config.json içinde saklanır.</li>
       </ol>
-      <input id="vtApiKeyInput" type="password" placeholder="API anahtarı" class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2.5 text-sm text-white focus:outline-none focus:border-cyan-500" />
+      <div class="space-y-3 text-xs">
+        <div>
+          <label class="text-slate-400 block mb-1">VirusTotal API Anahtarı</label>
+          <input id="vtApiKeyInput" type="password" placeholder="VT API anahtarı (değiştirmek için yazın)" class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2 text-sm text-white focus:outline-none focus:border-cyan-500" />
+        </div>
+        <div>
+          <label class="text-slate-400 block mb-1">MalwareBazaar Auth-Key (isteğe bağlı)</label>
+          <input id="mbApiKeyInput" type="password" placeholder="abuse.ch Auth-Key (varsa)" class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2 text-sm text-white focus:outline-none focus:border-cyan-500" />
+        </div>
+        <div>
+          <label class="text-slate-400 block mb-1">Hybrid Analysis API Anahtarı (isteğe bağlı)</label>
+          <input id="haApiKeyInput" type="password" placeholder="Hybrid Analysis Community API Key" class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2 text-sm text-white focus:outline-none focus:border-cyan-500" />
+        </div>
+        <label class="flex items-center gap-2 text-slate-300 cursor-pointer pt-2">
+          <input type="checkbox" id="mbEnabledInput" /> VT anahtarı yoksa veya kota dolarsa MalwareBazaar / HA yedek hash sorgusunu çalıştır
+        </label>
+      </div>
       <div class="flex justify-end gap-2">
         <button data-close="vtModal" class="px-4 py-2 rounded-xl bg-slate-800 text-xs text-slate-300 hover:bg-slate-700">Kapat</button>
         <button id="btnVtSave" class="px-4 py-2 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-xs font-semibold text-slate-950">Kaydet</button>

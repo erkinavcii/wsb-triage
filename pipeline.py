@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import analyzer
+import intel_client
 import sandbox_manager as sbm
 import vt_client
 
@@ -759,12 +760,7 @@ def _uploadable(r: Dict[str, Any], inv: Dict[str, Any]) -> bool:
     return bool(r.get("is_pe") or r.get("is_script"))
 
 
-def stage_vt(job: Job) -> None:
-    key = vt_client.get_api_key()
-    if not key:
-        job.stage("vt", "skipped", "API anahtarı yok. Sağ üstten anahtar girerseniz bu adım otomatik çalışır.")
-        return
-    inv = _load_inventory(job)
+def _select_vt_picks(job: Job, inv: Dict[str, Any]) -> List[Dict[str, Any]]:
     by_sha: Dict[str, Dict[str, Any]] = {}
     order: List[Dict[str, Any]] = []
     if inv.get("original"):
@@ -781,19 +777,63 @@ def stage_vt(job: Job) -> None:
     for r in order:
         if r.get("sha256") and r["sha256"] not in by_sha:
             by_sha[r["sha256"]] = r
-    picks = list(by_sha.values())[: int(job.opt("max_vt")) + (1 if inv.get("original") else 0)]
+    return list(by_sha.values())[: int(job.opt("max_vt")) + (1 if inv.get("original") else 0)]
 
-    # Phase 1: hash lookups for every pick, so already-known malware shows up immediately.
-    # Phase 2: upload the unknown ones.  Phase 3: wait for all pending scans together.
+
+def _query_extra_intel_for_entries(job: Job, picks: List[Dict[str, Any]], entries: List[Dict[str, Any]], indices: List[int]) -> int:
+    icfg = intel_client.get_intel_config()
+    run_mb = bool(icfg["mb_enabled"] or icfg["mb_api_key"])
+    run_ha = bool(icfg["ha_api_key"])
+    if not (run_mb or run_ha) or not indices:
+        return 0
+    hits = 0
+    for idx in indices:
+        job.check_cancel()
+        r, e = picks[idx], entries[idx]
+        job.stage("vt", "running", f"Ek istihbarat (MalwareBazaar/HA) sorgusu: {r['rel']}")
+        res = intel_client.query_hash_intel(r["sha256"], run_mb=run_mb, run_ha=run_ha)
+        e["intel"] = res
+        if res.get("any_found"):
+            hits += 1
+            if "kota" in e["status"].lower():
+                e["status"] += f" — {res['summary']}"
+            else:
+                e["status"] = res["summary"]
+        elif "kota" in e["status"].lower():
+            e["status"] += " (ek istihbarat temiz)"
+        elif not e["result"]:
+            e["status"] = "VT/MB/HA'da yok"
+        compute_verdict(job)
+        job.save()
+    return hits
+
+
+def stage_vt(job: Job) -> None:
+    key = vt_client.get_api_key()
+    intel_backup = intel_client.has_configured_sources()
+    if not key and not intel_backup:
+        job.stage("vt", "skipped", "API anahtarı yok. Sağ üstten anahtar girerseniz bu adım otomatik çalışır.")
+        return
+    inv = _load_inventory(job)
+    picks = _select_vt_picks(job, inv)
     entries: List[Dict[str, Any]] = [{"rel": r["rel"], "sha256": r["sha256"], "size": r["size"], "status": "Sırada", "result": None,
                                       "gui_url": f"https://www.virustotal.com/gui/file/{r['sha256']}"} for r in picks]
     job.state["vt"] = entries
+    if not key:
+        hits = _query_extra_intel_for_entries(job, picks, entries, list(range(len(picks))))
+        job.stage("vt", "done", f"VT anahtarı yok — ek istihbaratta {len(picks)} dosya hash'i sorgulandı ({hits} eşleşme).")
+        return
+
+    # Phase 1: hash lookups for every pick, so already-known malware shows up immediately.
+    # Phase 2: upload the unknown ones.  Phase 3: wait for all pending scans together.
     unknown: List[int] = []
     quota = False                       # once the quota is used up, every further call is pointless
+    fallback_indices: List[int] = []
     for i, (r, e) in enumerate(zip(picks, entries)):
         job.check_cancel()
         if quota:
             e["status"] = "Sorgulanmadı (VirusTotal kotası doldu)"
+            fallback_indices.append(i)
             continue
         job.stage("vt", "running", f"1/3 Hash sorgusu ({i + 1}/{len(picks)}): {r['rel']} — ücretsiz API dakikada 4 istek kabul eder")
         try:
@@ -802,18 +842,22 @@ def stage_vt(job: Job) -> None:
                 e["status"] = "VT'de kayıtlı"
             elif not job.opt("vt_upload"):
                 e["status"] = "VT'de yok (yükleme kapalı)"
+                fallback_indices.append(i)
             elif not _uploadable(r, inv):
                 e["status"] = "VT'de yok (program değil; gizlilik için yüklenmedi)"
             elif r["size"] > vt_client.MAX_UPLOAD:
                 e["status"] = "VT'de yok (650 MB'tan büyük, yüklenemez)"
+                fallback_indices.append(i)
             else:
                 e["status"] = "VT'de yok — yüklenecek"
                 unknown.append(i)
         except vt_client.VtQuotaError:
             quota = True
             e["status"] = "Sorgulanmadı (VirusTotal kotası doldu)"
+            fallback_indices.append(i)
         except Exception as ex:
             e["status"] = f"Hata: {ex}"
+            fallback_indices.append(i)
         compute_verdict(job)
         job.save()
 
@@ -823,6 +867,7 @@ def stage_vt(job: Job) -> None:
         r, e = picks[i], entries[i]
         if quota:
             e["status"] = "VT'de yok — yüklenmedi (kota doldu)"
+            fallback_indices.append(i)
             continue
         job.stage("vt", "running", f"2/3 Yükleniyor ({n}/{len(unknown)}): {r['rel']} ({r['size'] / 1048576:.1f} MB)")
         try:
@@ -831,8 +876,10 @@ def stage_vt(job: Job) -> None:
         except vt_client.VtQuotaError:
             quota = True
             e["status"] = "VT'de yok — yüklenmedi (kota doldu)"
+            fallback_indices.append(i)
         except Exception as ex:
             e["status"] = f"Yükleme hatası: {ex}"
+            fallback_indices.append(i)
         job.save()
 
     deadline = time.time() + 10 * 60
@@ -849,6 +896,7 @@ def stage_vt(job: Job) -> None:
                     job.save()
             except vt_client.VtQuotaError:
                 quota = True
+                fallback_indices.append(i)
                 break
             except Exception as ex:
                 entries[i]["status"] = f"Hata: {ex}"
@@ -856,8 +904,11 @@ def stage_vt(job: Job) -> None:
             if time.time() >= deadline:
                 break
     for i in pending:
-        entries[i]["status"] = "Yüklendi, tarama sonucu alınamadı (VT linkinden sonra bakın)"
-    flagged = sum(1 for e in job.state["vt"] if e["result"] and e["result"]["stats"]["malicious"] > 0)
+        if i not in fallback_indices:
+            entries[i]["status"] = "Yüklendi, tarama sonucu alınamadı (VT linkinden sonra bakın)"
+    if intel_backup and fallback_indices:
+        _query_extra_intel_for_entries(job, picks, entries, sorted(set(fallback_indices)))
+    flagged = sum(1 for e in job.state["vt"] if (e["result"] and e["result"]["stats"]["malicious"] > 0) or (e.get("intel") or {}).get("malicious"))
     if quota:
         job.log(vt_client.QUOTA_MSG)
         job.stage("vt", "done", f"Kota doldu: {sum(1 for e in entries if e['result'])} / {len(picks)} dosya sorgulanabildi, "
@@ -1446,6 +1497,17 @@ def compute_verdict(job: Job) -> None:
     red: List[str] = []
     notes: List[str] = []
     for e in s.get("vt") or []:
+        intel = e.get("intel") or {}
+        mb = intel.get("malwarebazaar") or {}
+        ha = intel.get("hybrid_analysis") or {}
+        if mb.get("found"):
+            red.append(f"MalwareBazaar: '{e['rel']}' bilinen zararlı örnektir ({mb.get('family') or 'kayıtlı'}).")
+        if ha.get("found"):
+            v_ha = (ha.get("verdict") or "").lower()
+            if v_ha == "malicious" or (ha.get("threat_score") or 0) >= 70:
+                red.append(f"Hybrid Analysis: '{e['rel']}' zararlı olarak sınıflandırılmış ({ha.get('family') or v_ha}).")
+            elif v_ha == "suspicious":
+                notes.append(f"Hybrid Analysis: '{e['rel']}' şüpheli işaretlenmiş ({ha.get('family') or v_ha}).")
         r = e.get("result")
         if not r:
             continue
@@ -1598,7 +1660,8 @@ def write_report(job: Job) -> None:
     for e in s.get("vt") or []:
         r = e.get("result") or {}
         mal = f"{r['stats']['malicious']}/{r['stats']['total']}" if r else "-"
-        L.append(f"| {e['rel']} | {e['status']} | {mal} | {r.get('suggested_threat_label', '') if r else ''} | [VT]({e['gui_url']}) |")
+        lbl = (r.get("suggested_threat_label", "") if r else "") or (e.get("intel") or {}).get("summary", "")
+        L.append(f"| {e['rel']} | {e['status']} | {mal} | {lbl} | [VT]({e['gui_url']}) |")
     L += ["", "## Statik analiz (en riskli 15)", ""]
     yara_rows: List[str] = []
     for st in (s.get("static") or [])[:15]:

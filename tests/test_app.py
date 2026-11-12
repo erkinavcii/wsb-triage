@@ -205,3 +205,22 @@ def test_job_creation_clamps_memory_and_duration(tmp_path, monkeypatch):
     assert j_high.opt("memory_mb") == 65536
     assert j_high.opt("duration_min") == 180
     assert j_high.opt("simulate_user") is True
+
+
+def test_intel_config_and_query_endpoints(client, tmp_path, monkeypatch):
+    import intel_client
+    import vt_client
+    monkeypatch.setattr(vt_client, "CONFIG_PATH", tmp_path / "cfg.json")
+    monkeypatch.setenv("HA_API_KEY", "")
+
+    r_cfg = client.post("/api/intel/config", json={"mb_enabled": True, "mb_api_key": "mb123", "ha_api_key": "ha123"})
+    assert r_cfg.status_code == 200
+    assert r_cfg.json()["mb_enabled"] is True
+    assert r_cfg.json()["mb_configured"] is True
+    assert r_cfg.json()["ha_configured"] is True
+
+    assert client.get("/api/intel/query/not-a-sha").status_code == 400
+    monkeypatch.setattr(intel_client, "query_hash_intel", lambda sha: {"sha256": sha, "any_found": False, "malicious": False, "summary": ""})
+    r_q = client.get("/api/intel/query/" + ("d" * 64))
+    assert r_q.status_code == 200
+    assert r_q.json()["sha256"] == "d" * 64

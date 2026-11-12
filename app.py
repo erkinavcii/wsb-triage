@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import analyzer
+import intel_client
 import pipeline
 import sandbox_manager
 import vt_client
@@ -135,6 +136,13 @@ class ApiKeyRequest(BaseModel):
     api_key: str
 
 
+class IntelConfigRequest(BaseModel):
+    vt_api_key: Optional[str] = None
+    mb_api_key: Optional[str] = None
+    ha_api_key: Optional[str] = None
+    mb_enabled: Optional[bool] = None
+
+
 class VtUploadRequest(BaseModel):
     file_path: str
 
@@ -211,6 +219,10 @@ def system_status():
     caps["vt_api_masked"] = (key[:4] + "..." + key[-4:]) if len(key) > 8 else ""
     caps["procmon"] = any((BASE_DIR / "sandbox" / n).exists() for n in ("Procmon64.exe", "Procmon.exe"))
     caps["yara"] = yara_scanner.rules_status()
+    icfg = intel_client.get_intel_config()
+    caps["mb_enabled"] = icfg["mb_enabled"]
+    caps["mb_api_configured"] = bool(icfg["mb_api_key"])
+    caps["ha_api_configured"] = bool(icfg["ha_api_key"])
     return caps
 
 
@@ -219,6 +231,31 @@ def system_status():
 def save_vt_config(req: ApiKeyRequest):
     vt_client.set_api_key(req.api_key)
     return {"status": "ok", "configured": bool(req.api_key.strip())}
+
+
+@app.post("/api/intel/config")
+def save_intel_config(req: IntelConfigRequest):
+    if req.vt_api_key is not None and req.vt_api_key.strip():
+        vt_client.set_api_key(req.vt_api_key.strip())
+    icfg = intel_client.set_intel_config(
+        mb_api_key=req.mb_api_key.strip() if req.mb_api_key else None,
+        ha_api_key=req.ha_api_key.strip() if req.ha_api_key else None,
+        mb_enabled=req.mb_enabled,
+    )
+    return {
+        "status": "ok",
+        "vt_configured": bool(vt_client.get_api_key()),
+        "mb_enabled": icfg["mb_enabled"],
+        "mb_configured": bool(icfg["mb_api_key"]),
+        "ha_configured": bool(icfg["ha_api_key"]),
+    }
+
+
+@app.get("/api/intel/query/{sha256}")
+def intel_query_hash(sha256: str):
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", sha256):
+        raise HTTPException(400, "Geçersiz SHA-256")
+    return intel_client.query_hash_intel(sha256)
 
 
 @app.get("/api/vt/query/{sha256}")
