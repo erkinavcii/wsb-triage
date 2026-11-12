@@ -59,6 +59,7 @@ DEFAULT_OPTIONS = {
     "max_vt": 12,
     "run_sandbox": True,
     "keep_sandbox_open": False,
+    "simulate_user": False,
     "memory_mb": 4096,
 }
 
@@ -974,6 +975,7 @@ def stage_sandbox(job: Job) -> None:
             "DurationSeconds": duration,
             "CopyMaxMB": COPY_INTO_SANDBOX_MAX_MB,   # bigger samples run in place from the read-only share
             "BlockLan": bool(job.opt("network")),     # internet allowed, home network / host blocked
+            "SimulateUser": bool(job.opt("simulate_user")),
         })
         wsb = job.case_dir / "analysis.wsb"
         wsb.write_text(sbm.build_wsb(job.case_dir, bool(job.opt("network")), int(job.opt("memory_mb")), job.input_dir), encoding="utf-8")

@@ -49,3 +49,4 @@ def test_script_has_pkt_size_and_dropped_hashes():
     assert "--pkt-size 512" in ps
     assert "DroppedHashes" in ps
     assert "Capture-Screen" in ps
+    assert "Invoke-FakeUser" in ps

@@ -73,9 +73,73 @@ function Write-JsonFile([string]$Name, $Obj, [int]$Depth = 6) {
 $cfg = Get-Content -LiteralPath (Join-Path $ToolsDir 'config.json') -Raw | ConvertFrom-Json
 $Duration = [int]$cfg.DurationSeconds
 if ($Duration -lt 10) { $Duration = 600 }
+$SimulateUser = [bool]($cfg.PSObject.Properties['SimulateUser'] -and $cfg.SimulateUser)
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-Log "Monitor started. admin=$isAdmin duration=${Duration}s"
+Log "Monitor started. admin=$isAdmin duration=${Duration}s simulateUser=$SimulateUser"
 Set-Status 'preparing'
+
+$script:SimLast = [datetime]::MinValue
+$script:SimStep = 0
+$script:ClickedBtns = @{}
+$script:AutoClicks = 0
+$AutoClickBtnRx = '(?i)^(next|i.?leri|install|y.?kle|i\s*agree|accept|agree|kabul|devam|continue|finish|bitir|tamam|ok)(\s*>+)*$'
+if ($SimulateUser -and -not $TestMode) {
+    try {
+        Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes -ErrorAction SilentlyContinue
+        Add-Type -TypeDefinition @"
+using System.Runtime.InteropServices;
+public static class SafeBoxInput {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT { public int X; public int Y; }
+    [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT pt);
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
+}
+"@ -ErrorAction SilentlyContinue
+    } catch {}
+}
+
+function Invoke-FakeUser {
+    if (-not $SimulateUser -or $TestMode) { return }
+    if (((Get-Date) - $script:SimLast).TotalSeconds -lt 12) { return }
+    $script:SimLast = Get-Date
+    try {
+        $pt = New-Object SafeBoxInput+POINT
+        if ([SafeBoxInput]::GetCursorPos([ref]$pt)) {
+            $script:SimStep++
+            $dx = if (($script:SimStep % 2) -eq 0) { 18 } else { -18 }
+            $dy = if (($script:SimStep % 3) -eq 0) { 10 } else { -8 }
+            $nx = [Math]::Max(20, $pt.X + $dx)
+            $ny = [Math]::Max(20, $pt.Y + $dy)
+            [void][SafeBoxInput]::SetCursorPos($nx, $ny)
+        }
+    } catch {}
+    try {
+        $root = [System.Windows.Automation.AutomationElement]::RootElement
+        if (-not $root) { return }
+        $wins = $root.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition)
+        foreach ($w in $wins) {
+            $wpid = [int]$w.Current.ProcessId
+            if (-not $TreePids.ContainsKey($wpid)) { continue }
+            $cond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)
+            $btns = $w.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
+            foreach ($b in $btns) {
+                $bname = ([string]$b.Current.Name).Trim()
+                if (-not $bname -or -not ($bname -match $AutoClickBtnRx) -or -not $b.Current.IsEnabled -or $b.Current.IsOffscreen) { continue }
+                $rtId = ($b.GetRuntimeId() -join '.')
+                $key = "$wpid|$rtId|$bname"
+                if ($script:ClickedBtns.ContainsKey($key) -and ((Get-Date) - $script:ClickedBtns[$key]).TotalSeconds -lt 25) { continue }
+                $pat = $null
+                if ($b.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pat)) {
+                    $script:ClickedBtns[$key] = Get-Date
+                    $script:AutoClicks++
+                    $pat.Invoke()
+                    Log "AUTO-CLICK '$bname' (pid=$wpid)"
+                    return
+                }
+            }
+        }
+    } catch {}
+}
 
 # ------------------------------------------------------------------ snapshot pieces
 $RunKeyPaths = @(
@@ -461,6 +525,7 @@ Capture-Screen
 while ((Get-Date) -lt $end) {
     Update-Watch $watchStart
     Test-LanBlock
+    Invoke-FakeUser
     if (((Get-Date) - $script:LastShot).TotalSeconds -ge 30) { Capture-Screen }
     $left = [int]($end - (Get-Date)).TotalSeconds
     $sampleProcs = @($Procs.Values | Where-Object { $_.InTree }).Count

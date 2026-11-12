@@ -201,6 +201,7 @@ def test_job_creation_clamps_memory_and_duration(tmp_path, monkeypatch):
     assert j_low.opt("memory_mb") == 1024
     assert j_low.opt("duration_min") == 1
 
-    j_high = pipeline.create_job(str(sample), {"memory_mb": 999999, "duration_min": 500, "run_sandbox": False})
+    j_high = pipeline.create_job(str(sample), {"memory_mb": 999999, "duration_min": 500, "run_sandbox": False, "simulate_user": True})
     assert j_high.opt("memory_mb") == 65536
     assert j_high.opt("duration_min") == 180
+    assert j_high.opt("simulate_user") is True

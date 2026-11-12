@@ -57,7 +57,8 @@ function options() {
   return {
     password: $('pwInput').value, target: $('targetInput').value.trim(), duration_min: parseInt($('durationInput').value, 10),
     memory_mb: parseInt($('memoryInput').value, 10) || 4096,
-    network: $('optNetwork').checked, vt_upload: $('optUpload').checked, run_sandbox: $('optSandbox').checked, keep_sandbox_open: $('optKeepOpen').checked,
+    network: $('optNetwork').checked, vt_upload: $('optUpload').checked, run_sandbox: $('optSandbox').checked,
+    keep_sandbox_open: $('optKeepOpen').checked, simulate_user: $('optSimUser').checked,
   };
 }
 async function startAnalysis(path, extra = {}) {

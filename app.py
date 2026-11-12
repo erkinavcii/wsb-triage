@@ -157,6 +157,7 @@ class JobRequest(BaseModel):
     max_vt: Optional[int] = 12
     run_sandbox: Optional[bool] = True
     keep_sandbox_open: Optional[bool] = False
+    simulate_user: Optional[bool] = False
     memory_mb: Optional[int] = 4096
 
 
