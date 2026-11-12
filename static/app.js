@@ -335,12 +335,18 @@ function renderSandbox(st) {
 const classRank = c => c.startsWith('KÖTÜYE') ? 0 : c.startsWith('BİLİNMEYEN') ? 1 : c.startsWith('Paylaşımlı') ? 2 : 3;
 const classColor = c => c.startsWith('KÖTÜYE') ? 'text-rose-200 font-bold bg-rose-900/40' : c.startsWith('BİLİNMEYEN') ? 'text-rose-300 font-semibold'
   : c.startsWith('Paylaşımlı') ? 'text-amber-300' : c === 'Adobe' ? 'text-sky-300' : 'text-slate-500';
+function procBadge(row) {
+  const ps = asArr(row && row.processes);
+  if (!ps.length) return '<span class="text-slate-500">—</span>';
+  const cls = row.from_sample ? 'text-cyan-300 font-semibold' : 'text-slate-400';
+  return `<span class="${cls}">${row.from_sample ? '🎯 ' : ''}${esc(ps.slice(0, 3).join(', '))}</span>`;
+}
 function domainTable(title, rows) {
   rows = rows || [];
   const sorted = rows.slice().sort((a, b) => classRank(a.class) - classRank(b.class) || b.count - a.count);
   return `<div><div class="text-xs font-semibold text-slate-300 mb-1">${title} (${rows.length})</div>
-    <div class="overflow-auto max-h-72 rounded-lg border border-slate-800"><table class="tbl w-full text-[11px]"><tr><th>Ad</th><th>Adet</th><th>Sınıf</th></tr>
-    ${sorted.slice(0, 200).map(d => `<tr><td class="mono break-all">${esc(d.name)}</td><td>${d.count}</td>
+    <div class="overflow-auto max-h-72 rounded-lg border border-slate-800"><table class="tbl w-full text-[11px]"><tr><th>Ad</th><th>İşlem</th><th>Adet</th><th>Sınıf</th></tr>
+    ${sorted.slice(0, 200).map(d => `<tr><td class="mono break-all">${esc(d.name)}</td><td>${procBadge(d)}</td><td>${d.count}</td>
       <td class="${classColor(d.class)}">${esc(d.class)}</td></tr>`).join('')}</table></div></div>`;
 }
 function renderNetwork(st) {
@@ -350,9 +356,9 @@ function renderNetwork(st) {
   if (!n) { $('netBody').innerHTML = `<div class="text-xs text-slate-400">Ağ kaydı (capture.pcapng) hazır. Otomatik özet için Wireshark'ı kurun, ardından analizi tekrar açın veya kaydı Wireshark'ta açın.</div>`; return; }
   $('netBody').innerHTML = domainTable('DNS sorguları', n.dns) + domainTable('TLS sunucu adları (SNI)', n.sni)
     + `<div><div class="text-xs font-semibold text-slate-300 mb-1">Şifresiz HTTP istekleri (${n.http.length})</div><div class="text-[11px] mono text-slate-300 max-h-48 overflow-auto space-y-0.5">
-      ${n.http.map(h => `<div class="break-all ${classColor(h.class)}">${esc(h.method)} http://${esc(h.host)}${esc(h.uri)}</div>`).join('') || '<span class="text-slate-500">yok</span>'}</div></div>`
+      ${n.http.map(h => `<div class="break-all ${classColor(h.class)}">${esc(h.method)} http://${esc(h.host)}${esc(h.uri)} ${(h.processes && h.processes.length) ? `← ${procBadge(h)}` : ''}</div>`).join('') || '<span class="text-slate-500">yok</span>'}</div></div>`
     + `<div><div class="text-xs font-semibold text-slate-300 mb-1">TCP bağlantı denemeleri</div><div class="text-[11px] mono text-slate-300 max-h-48 overflow-auto">
-      ${n.tcp_targets.map(t => `<div>${esc(t.target)} ×${t.count}</div>`).join('') || '<span class="text-slate-500">yok</span>'}</div></div>`;
+      ${n.tcp_targets.map(t => `<div>${esc(t.target)} ×${t.count} ${(t.processes && t.processes.length) ? `← ${procBadge(t)}` : ''}</div>`).join('') || '<span class="text-slate-500">yok</span>'}</div></div>`;
 }
 
 // ---------------------------------------------------------------- static cards (SafeBox renderer)

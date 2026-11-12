@@ -1222,7 +1222,104 @@ def _count(values: List[str]) -> List[Dict[str, Any]]:
     return [{"name": k, "count": n, "class": domain_class(k)} for k, n in sorted(c.items(), key=lambda kv: -kv[1])]
 
 
-def network_summary(pcap: Path) -> Optional[Dict[str, Any]]:
+def correlate_network_processes(
+    net: Optional[Dict[str, Any]],
+    behavior: Optional[Dict[str, Any]],
+    domain_ips: Optional[Dict[str, set]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Attaches Sandbox process names (and FromSample flags) to tshark DNS/SNI/HTTP/TCP rows."""
+    if not net:
+        return net
+    conns = ((behavior or {}).get("Network") or {}).get("Connections") or []
+    ip_port_map: Dict[tuple, Dict[str, bool]] = {}
+    ip_map: Dict[str, Dict[str, bool]] = {}
+    for c in conns:
+        if not isinstance(c, dict):
+            continue
+        ip = str(c.get("Remote") or "").strip().lower()
+        proc = str(c.get("Process") or "").strip()
+        if not ip or not proc:
+            continue
+        fs = bool(c.get("FromSample"))
+        try:
+            port = str(int(c.get("Port")))
+        except (TypeError, ValueError):
+            port = ""
+        if port:
+            cur_ep = ip_port_map.setdefault((ip, port), {})
+            cur_ep[proc] = cur_ep.get(proc, False) or fs
+        cur_ip = ip_map.setdefault(ip, {})
+        cur_ip[proc] = cur_ip.get(proc, False) or fs
+
+    dom_ips: Dict[str, set] = {k.lower().rstrip("."): set(v) for k, v in (domain_ips or {}).items()}
+    for row in ((behavior or {}).get("Network") or {}).get("DnsCache") or []:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("Name") or "").strip().lower().rstrip(".")
+        if not name:
+            continue
+        for tok in re.split(r"[,;\s]+", str(row.get("Data") or "")):
+            tok = tok.strip().lower()
+            if _clean_ip(tok):
+                dom_ips.setdefault(name, set()).add(tok)
+
+    def _finish_procs(score_map: Dict[str, bool]) -> tuple[List[str], bool]:
+        ordered = sorted(score_map.items(), key=lambda kv: (not kv[1], kv[0].lower()))
+        return [p for p, _ in ordered[:6]], any(fs for _, fs in ordered)
+
+    def _procs_for_endpoints(endpoints: List[tuple], fallback_domain: str = "") -> tuple[List[str], bool]:
+        merged: Dict[str, bool] = {}
+        for ip, port in endpoints:
+            ip_l = str(ip or "").strip().lower()
+            if not ip_l:
+                continue
+            src = ip_port_map.get((ip_l, str(port or ""))) or ip_map.get(ip_l) or {}
+            for p, fs in src.items():
+                merged[p] = merged.get(p, False) or fs
+        if not merged and fallback_domain:
+            for ip_l in dom_ips.get(fallback_domain.lower().rstrip("."), ()):
+                for p, fs in (ip_map.get(ip_l) or {}).items():
+                    merged[p] = merged.get(p, False) or fs
+        return _finish_procs(merged)
+
+    for d in net.get("dns") or []:
+        dom = str(d.get("name") or "").lower().rstrip(".")
+        procs, fs = _procs_for_endpoints([], dom)
+        if procs:
+            d["processes"] = procs
+            d["from_sample"] = fs
+        else:
+            d.setdefault("processes", [])
+            d.setdefault("from_sample", False)
+
+    for row in net.get("sni") or []:
+        dom = str(row.get("name") or "").lower().rstrip(".")
+        eps = [tuple(x) for x in (row.pop("_endpoints", None) or ())]
+        procs, fs = _procs_for_endpoints(eps, dom)
+        if procs or not row.get("processes"):
+            row["processes"] = procs
+            row["from_sample"] = fs
+
+    for h in net.get("http") or []:
+        host = str(h.get("host") or "").split(":", 1)[0].lower().rstrip(".")
+        eps = [tuple(x) for x in (h.pop("_endpoints", None) or ())]
+        procs, fs = _procs_for_endpoints(eps, host)
+        if procs or not h.get("processes"):
+            h["processes"] = procs
+            h["from_sample"] = fs
+
+    for t in net.get("tcp_targets") or []:
+        raw_t = str(t.get("target") or "")
+        ip_part, _, port_part = raw_t.rpartition(":")
+        procs, fs = _procs_for_endpoints([(ip_part or raw_t, port_part if ip_part else "")])
+        if procs or not t.get("processes"):
+            t["processes"] = procs
+            t["from_sample"] = fs
+
+    return net
+
+
+def network_summary(pcap: Path, behavior: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     tshark = sbm.tshark_path()
     if not tshark or not pcap.exists():
         return None
@@ -1236,24 +1333,64 @@ def network_summary(pcap: Path) -> Optional[Dict[str, Any]]:
             return []
 
     dns = [n for row in q("DNS", "dns.flags.response == 0", ["dns.qry.name"]) for n in row[0].split(",")]
-    sni = [row[0] for row in q("TLS SNI", "tls.handshake.type == 1", ["tls.handshake.extensions_server_name"])]
-    http = q("HTTP", "http.request", ["http.host", "http.request.method", "http.request.uri"])
+    domain_ips: Dict[str, set] = {}
+    for row in q("DNS yanıtı", "dns.flags.response == 1", ["dns.qry.name", "dns.a", "dns.aaaa"]):
+        row += [""] * (3 - len(row))
+        qnames = [x.strip().lower().rstrip(".") for x in row[0].split(",") if x.strip()]
+        ips = [x.strip().lower() for field in (row[1], row[2]) for x in field.split(",") if _clean_ip(x)]
+        for qn in qnames:
+            for ip in ips:
+                domain_ips.setdefault(qn, set()).add(ip)
+
+    sni_names: List[str] = []
+    sni_eps: Dict[str, set] = {}
+    for row in q("TLS SNI", "tls.handshake.type == 1", ["tls.handshake.extensions_server_name", "ip.dst", "ipv6.dst", "tcp.dstport"]):
+        row += [""] * (4 - len(row))
+        sname = row[0].strip()
+        if not sname:
+            continue
+        sni_names.append(sname)
+        ep_ip = (row[1] or row[2]).strip().lower()
+        if ep_ip:
+            sni_eps.setdefault(sname, set()).add((ep_ip, row[3].strip()))
+
+    http = q("HTTP", "http.request", ["http.host", "http.request.method", "http.request.uri", "ip.dst", "ipv6.dst", "tcp.dstport"])
     syn = q("TCP", "tcp.flags.syn == 1 && tcp.flags.ack == 0", ["ip.dst", "ipv6.dst", "tcp.dstport"])
     targets: Dict[str, int] = {}
     for row in syn:
         row += [""] * (3 - len(row))
         t = f"{row[0] or row[1]}:{row[2]}"
         targets[t] = targets.get(t, 0) + 1
-    seen, http_rows = set(), []
+    seen: set = set()
+    http_rows: List[Dict[str, Any]] = []
+    http_eps: Dict[tuple, set] = {}
     for row in http:
-        row += [""] * (3 - len(row))
+        row += [""] * (6 - len(row))
         k = tuple(row[:3])
+        ep_ip = (row[3] or row[4]).strip().lower()
+        if ep_ip:
+            http_eps.setdefault(k, set()).add((ep_ip, row[5].strip()))
         if k not in seen:
             seen.add(k)
-            http_rows.append({"host": row[0], "method": row[1], "uri": row[2][:200], "class": domain_class(row[0])})
-    return {"dns": _count(dns), "sni": _count(sni), "http": http_rows[:200],
-            "tcp_targets": [{"target": k, "count": v} for k, v in sorted(targets.items(), key=lambda kv: -kv[1])[:100]],
-            "partial": failed}
+            http_rows.append({"host": row[0], "method": row[1], "uri": row[2][:200], "class": domain_class(row[0]), "_k": k})
+
+    sni_rows = _count(sni_names)
+    for r in sni_rows:
+        if r["name"] in sni_eps:
+            r["_endpoints"] = list(sni_eps[r["name"]])
+    for h in http_rows:
+        hk = h.pop("_k", None)
+        if hk and hk in http_eps:
+            h["_endpoints"] = list(http_eps[hk])
+
+    summary = {
+        "dns": _count(dns),
+        "sni": sni_rows,
+        "http": http_rows[:200],
+        "tcp_targets": [{"target": k, "count": v} for k, v in sorted(targets.items(), key=lambda kv: -kv[1])[:100]],
+        "partial": failed,
+    }
+    return correlate_network_processes(summary, behavior, domain_ips)
 
 
 SEVERE_RX = re.compile(r"trojan|stealer|backdoor|\brat\b|miner|coinmin|xmrig|redline|lumma|vidar|raccoon|stealc|agenttesla|remcos|njrat|asyncrat|dropper|downloader|ransom|spyware|banker|infostealer", re.I)
@@ -1391,9 +1528,11 @@ def stage_report(job: Job) -> None:
     if pcap.exists():
         if sbm.tshark_path():
             job.stage("report", "running", "Ağ kaydı tshark ile özetleniyor...")
-            job.state["network"] = network_summary(pcap)
+            job.state["network"] = network_summary(pcap, job.state.get("behavior"))
         else:
             job.log("capture.pcapng hazır; otomatik özet için Wireshark kurun (tshark ile gelir).")
+    if job.state.get("network") and job.state.get("behavior"):
+        correlate_network_processes(job.state["network"], job.state.get("behavior"))
     compute_verdict(job)
     write_report(job)
     job.stage("report", "done", "report.md yazıldı.")
@@ -1447,9 +1586,14 @@ def write_report(job: Job) -> None:
             L.append(f"- {c.get('FirstSeen')} {c.get('Process')} → {c.get('Remote')}:{c.get('Port')}" + (" [örnek]" if c.get("FromSample") else ""))
     net = s.get("network")
     if net:
-        L += ["", "## Ağ özeti (tshark)", "", "### DNS"] + [f"- {d['name']} ×{d['count']} — {d['class']}" for d in net["dns"][:100]]
-        L += ["", "### TLS SNI"] + [f"- {d['name']} ×{d['count']} — {d['class']}" for d in net["sni"][:100]]
-        L += ["", "### HTTP"] + [f"- {h['method']} http://{h['host']}{h['uri']} — {h['class']}" for h in net["http"][:100]]
+        def _ptag(row):
+            ps = row.get("processes") or []
+            if not ps:
+                return ""
+            return f" (`{', '.join(ps[:3])}`" + (" [örnek]" if row.get("from_sample") else "") + ")"
+        L += ["", "## Ağ özeti (tshark)", "", "### DNS"] + [f"- {d['name']} ×{d['count']}{_ptag(d)} — {d['class']}" for d in net["dns"][:100]]
+        L += ["", "### TLS SNI"] + [f"- {d['name']} ×{d['count']}{_ptag(d)} — {d['class']}" for d in net["sni"][:100]]
+        L += ["", "### HTTP"] + [f"- {h['method']} http://{h['host']}{h['uri']}{_ptag(h)} — {h['class']}" for h in net["http"][:100]]
     L += ["", "## Sınırlar", "", "- Zararlılar sandbox'ı fark edip sessiz kalabilir veya izleme süresinden uzun bekleyebilir.",
           "- Windows arka plan trafiği kayda karışır; 'gürültü' sınıflandırması tahmindir.", "- Temiz sonuç riski azaltır, güvenli olduğunu kanıtlamaz."]
     (job.case_dir / "report.md").write_text("\n".join(L), encoding="utf-8")

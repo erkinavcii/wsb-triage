@@ -266,3 +266,50 @@ def test_ioc_export_csv_and_stix_dedup_noise_and_safety(tmp_path):
     assert "[domain-name:value = 'api.telegram.org']" in patterns
     assert "[ipv4-addr:value = '198.51.100.22']" in patterns
     assert r"[url:value = 'http://c2.example/gate\'x']" in patterns
+
+
+def test_network_process_correlation(tmp_path):
+    job = bare_job(tmp_path)
+    behavior = {
+        "Network": {
+            "DnsCache": [{"Name": "evil-c2.example", "Data": "198.51.100.50"}],
+            "Connections": [
+                {"Remote": "198.51.100.50", "Port": 443, "Process": "dropper.exe", "FromSample": True},
+                {"Remote": "198.51.100.50", "Port": 80, "Process": "chrome.exe", "FromSample": False},
+                {"Remote": "203.0.113.9", "Port": 80, "Process": "curl.exe", "FromSample": True},
+            ],
+        }
+    }
+    net = {
+        "dns": [
+            {"name": "evil-c2.example", "count": 2, "class": pipeline.CLASS_UNKNOWN},
+            {"name": "pcap-dns.example", "count": 1, "class": pipeline.CLASS_ABUSED},
+        ],
+        "sni": [
+            {"name": "evil-c2.example", "count": 1, "class": pipeline.CLASS_UNKNOWN, "_endpoints": [("198.51.100.50", "443")]},
+        ],
+        "http": [
+            {"host": "raw-ip.example", "method": "GET", "uri": "/payload", "class": pipeline.CLASS_UNKNOWN, "_endpoints": [("203.0.113.9", "80")]},
+        ],
+        "tcp_targets": [
+            {"target": "198.51.100.50:443", "count": 5},
+            {"target": "203.0.113.9:80", "count": 1},
+        ],
+        "partial": [],
+    }
+    res = pipeline.correlate_network_processes(net, behavior, domain_ips={"pcap-dns.example": {"203.0.113.9"}})
+    assert res["dns"][0]["processes"] == ["dropper.exe", "chrome.exe"]
+    assert res["dns"][0]["from_sample"] is True
+    assert res["dns"][1]["processes"] == ["curl.exe"]
+    assert res["sni"][0]["processes"] == ["dropper.exe"]
+    assert res["http"][0]["processes"] == ["curl.exe"]
+    assert res["tcp_targets"][0]["processes"] == ["dropper.exe"]
+    assert res["tcp_targets"][1]["processes"] == ["curl.exe"]
+
+    job.state["network"] = res
+    job.state["behavior"] = behavior
+    pipeline.compute_verdict(job)
+    pipeline.write_report(job)
+    rep = (job.case_dir / "report.md").read_text(encoding="utf-8")
+    assert "evil-c2.example ×2 (`dropper.exe, chrome.exe` [örnek])" in rep
+    assert "GET http://raw-ip.example/payload (`curl.exe` [örnek])" in rep
