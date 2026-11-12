@@ -313,3 +313,47 @@ def test_network_process_correlation(tmp_path):
     rep = (job.case_dir / "report.md").read_text(encoding="utf-8")
     assert "evil-c2.example ×2 (`dropper.exe, chrome.exe` [örnek])" in rep
     assert "GET http://raw-ip.example/payload (`curl.exe` [örnek])" in rep
+
+
+def test_compare_jobs_official_vs_crack(tmp_path):
+    base = bare_job(tmp_path, case_id="official-run")
+    target = bare_job(tmp_path, case_id="crack-run")
+
+    pipeline._write_json(base.case_dir / "inventory.json", {
+        "original": None,
+        "files": [
+            {"rel": "app.exe", "size": 1000, "sha256": "1" * 64, "sig": {"status": "Valid"}},
+            {"rel": "lib.dll", "size": 500, "sha256": "2" * 64, "sig": {"status": "Valid"}},
+        ],
+    })
+    pipeline._write_json(target.case_dir / "inventory.json", {
+        "original": None,
+        "files": [
+            {"rel": "app.exe", "size": 1000, "sha256": "1" * 64, "sig": {"status": "Valid"}},
+            {"rel": "lib.dll", "size": 520, "sha256": "3" * 64, "sig": {"status": "HashMismatch"}},
+            {"rel": "patcher.exe", "size": 800, "sha256": "4" * 64, "sig": {"status": "Unknown"}},
+        ],
+    })
+    base.state["static"] = [{"rel": "lib.dll", "risk_score": 0, "yara_matches": [], "risk_reasons": []}]
+    target.state["static"] = [
+        {"rel": "lib.dll", "risk_score": 65, "yara_matches": [{"rule": "SafeBox_Patch_Keygen_Artifacts"}], "risk_reasons": ["HashMismatch"]},
+        {"rel": "patcher.exe", "risk_score": 80, "yara_matches": [], "risk_reasons": ["Yüksek entropi"]},
+    ]
+    base.state["behavior"] = {"Persistence": {"Tasks": ["Updater"], "Services": [], "RunKeys": [], "Drivers": [], "Startup": []}}
+    target.state["behavior"] = {
+        "Persistence": {"Tasks": ["Updater", "StealerKeep"], "Services": [], "RunKeys": ["HKCU\\Run::X"], "Drivers": [], "Startup": []},
+        "Files": {"NewExecutables": ["C:\\Temp\\stealer.exe"]},
+    }
+    base.state["network"] = {"dns": [{"name": "vendor.example", "count": 1, "class": pipeline.CLASS_UNKNOWN}], "sni": [], "http": [], "tcp_targets": []}
+    target.state["network"] = {"dns": [{"name": "vendor.example", "count": 1, "class": pipeline.CLASS_UNKNOWN}, {"name": "c2.evil", "count": 2, "class": pipeline.CLASS_ABUSED}], "sni": [], "http": [], "tcp_targets": []}
+
+    diff = pipeline.compare_jobs(base, target)
+    assert len(diff["files"]["modified"]) == 1
+    assert diff["files"]["modified"][0]["rel"] == "lib.dll"
+    assert diff["files"]["modified"][0]["sig_broken"] is True
+    assert diff["files"]["added"][0]["rel"] == "patcher.exe"
+    assert diff["behavior_diff"]["tasks"] == ["StealerKeep"]
+    assert diff["behavior_diff"]["runkeys"] == ["HKCU\\Run::X"]
+    assert diff["behavior_diff"]["dropped_executables"] == ["C:\\Temp\\stealer.exe"]
+    assert [d["value"] for d in diff["network_diff"]["extra_domains"]] == ["c2.evil"]
+    assert len(diff["highlights"]) >= 4

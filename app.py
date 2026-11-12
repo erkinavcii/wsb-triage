@@ -308,6 +308,13 @@ def jobs():
     return pipeline.list_jobs()
 
 
+@app.get("/api/compare")
+def compare(base: str, target: str):
+    if base == target:
+        raise HTTPException(400, "Karşılaştırmak için iki farklı analiz seçin.")
+    return pipeline.compare_jobs(_job(base), _job(target))
+
+
 def _job(case_id: str) -> pipeline.Job:
     job = pipeline.get_job(case_id)
     if not job:

@@ -2084,6 +2084,140 @@ def export_iocs_stix(job: Job, include_noise: bool = False) -> Dict[str, Any]:
     }
 
 
+def compare_jobs(base_job: Job, target_job: Job) -> Dict[str, Any]:
+    """Computes static, signature, YARA, behavioral, and network deltas from base (official) to target (patched/crack)."""
+    b_st = base_job.snapshot()
+    t_st = target_job.snapshot()
+
+    def _inv_map(job: Job) -> Dict[str, Dict[str, Any]]:
+        inv = _load_inventory(job)
+        out_map: Dict[str, Dict[str, Any]] = {}
+        for rec in inv.get("files") or []:
+            rel = str(rec.get("rel") or "").strip()
+            if rel:
+                out_map[rel.lower()] = rec
+        return out_map
+
+    b_files = _inv_map(base_job)
+    t_files = _inv_map(target_job)
+    added_files: List[Dict[str, Any]] = []
+    removed_files: List[str] = []
+    modified_files: List[Dict[str, Any]] = []
+
+    for k, tr in sorted(t_files.items()):
+        br = b_files.get(k)
+        t_sig = ((tr.get("sig") or {}).get("status")) or "Unknown"
+        if br is None:
+            added_files.append({"rel": tr.get("rel", ""), "size": tr.get("size", 0), "sha256": tr.get("sha256", ""), "sig": t_sig})
+        else:
+            b_sha = (br.get("sha256") or "").lower()
+            t_sha = (tr.get("sha256") or "").lower()
+            b_sig = ((br.get("sig") or {}).get("status")) or "Unknown"
+            if b_sha and t_sha and b_sha != t_sha:
+                modified_files.append({
+                    "rel": tr.get("rel", ""),
+                    "base_sha256": b_sha,
+                    "target_sha256": t_sha,
+                    "base_sig": b_sig,
+                    "target_sig": t_sig,
+                    "sig_broken": (b_sig == "Valid" and t_sig != "Valid") or t_sig == "HashMismatch",
+                })
+    for k, br in sorted(b_files.items()):
+        if k not in t_files:
+            removed_files.append(str(br.get("rel") or ""))
+
+    b_static = {str(x.get("rel") or "").lower(): x for x in (b_st.get("static") or [])}
+    t_static = {str(x.get("rel") or "").lower(): x for x in (t_st.get("static") or [])}
+    static_deltas: List[Dict[str, Any]] = []
+    for k, ts in sorted(t_static.items()):
+        bs = b_static.get(k) or {}
+        b_score = int(bs.get("risk_score") or 0)
+        t_score = int(ts.get("risk_score") or 0)
+        b_yara = {m.get("rule") for m in (bs.get("yara_matches") or []) if m.get("rule")}
+        t_yara = [m.get("rule") for m in (ts.get("yara_matches") or []) if m.get("rule") and m.get("rule") not in b_yara]
+        b_reasons = set(bs.get("risk_reasons") or [])
+        new_reasons = [r for r in (ts.get("risk_reasons") or []) if r not in b_reasons]
+        if (not bs and t_score >= 20) or (t_score > b_score) or t_yara:
+            static_deltas.append({
+                "rel": ts.get("rel", ""),
+                "base_score": b_score if bs else None,
+                "target_score": t_score,
+                "score_delta": t_score - b_score,
+                "new_yara": t_yara,
+                "new_reasons": new_reasons[:5],
+            })
+    static_deltas.sort(key=lambda x: (-len(x["new_yara"]), -x["score_delta"], -x["target_score"]))
+
+    b_beh = b_st.get("behavior") or {}
+    t_beh = t_st.get("behavior") or {}
+
+    def _diff_list(b_items, t_items) -> List[str]:
+        bset = {str(x) for x in (b_items or [])}
+        seen = set()
+        res = []
+        for x in (t_items or []):
+            s_val = str(x)
+            if s_val not in bset and s_val not in seen:
+                seen.add(s_val)
+                res.append(s_val)
+        return res
+
+    b_per, t_per = b_beh.get("Persistence") or {}, t_beh.get("Persistence") or {}
+    behavior_diff = {
+        "has_behavior_both": bool(b_beh and t_beh),
+        "services": _diff_list(b_per.get("Services"), t_per.get("Services")),
+        "drivers": _diff_list(b_per.get("Drivers"), t_per.get("Drivers")),
+        "tasks": _diff_list(b_per.get("Tasks"), t_per.get("Tasks")),
+        "runkeys": _diff_list((b_per.get("RunKeys") or []) + (b_per.get("Startup") or []), (t_per.get("RunKeys") or []) + (t_per.get("Startup") or [])),
+        "defender": _diff_list((b_beh.get("Defender") or {}).get("Added") or [], (t_beh.get("Defender") or {}).get("Added") or []),
+        "hosts": _diff_list((b_beh.get("Hosts") or {}).get("Added"), (t_beh.get("Hosts") or {}).get("Added")),
+        "firewall": _diff_list((b_beh.get("Firewall") or {}).get("Added"), (t_beh.get("Firewall") or {}).get("Added")),
+        "dropped_executables": _diff_list((b_beh.get("Files") or {}).get("NewExecutables"), (t_beh.get("Files") or {}).get("NewExecutables")),
+        "suspicious_processes": _diff_list(
+            [f"{p.get('Name')}: {p.get('CommandLine') or ''}" for p in (b_beh.get("Processes") or []) if isinstance(p, dict) and p.get("Suspicious")],
+            [f"{p.get('Name')}: {p.get('CommandLine') or ''}" for p in (t_beh.get("Processes") or []) if isinstance(p, dict) and p.get("Suspicious")],
+        ),
+    }
+
+    b_iocs = collect_iocs(base_job)
+    t_iocs = collect_iocs(target_job)
+    b_net_vals = {(x["type"], x["value"]) for x in b_iocs if x["type"] in ("domain", "ipv4", "ipv6")}
+    extra_domains = [x for x in t_iocs if x["type"] == "domain" and ("domain", x["value"]) not in b_net_vals]
+    extra_ips = [x for x in t_iocs if x["type"] in ("ipv4", "ipv6") and (x["type"], x["value"]) not in b_net_vals]
+
+    highlights: List[str] = []
+    if modified_files:
+        broken = sum(1 for m in modified_files if m["sig_broken"])
+        highlights.append(f"{len(modified_files)} dosya resmi sürümden farklı hash'e sahip" + (f" ({broken} imzası bozulmuş/HashMismatch)" if broken else "") + ".")
+    if added_files:
+        highlights.append(f"Hedef pakette resmi sürüme ek {len(added_files)} yeni dosya var.")
+    if static_deltas:
+        yara_hits = sum(len(d["new_yara"]) for d in static_deltas)
+        highlights.append(f"{len(static_deltas)} dosyada statik risk artışı" + (f" ve {yara_hits} yeni YARA eşleşmesi" if yara_hits else "") + ".")
+    pers_cnt = sum(len(behavior_diff[k]) for k in ("services", "drivers", "tasks", "runkeys", "defender", "firewall"))
+    if pers_cnt:
+        highlights.append(f"Hedef sandbox'ta fazladan {pers_cnt} kalıcılık/güvenlik değişikliği bıraktı.")
+    if extra_domains or extra_ips:
+        highlights.append(f"Hedef fazladan {len(extra_domains)} alan adı ve {len(extra_ips)} IP ile iletişim kurdu.")
+
+    return {
+        "base": {"id": base_job.id, "sample": b_st.get("sample", ""), "verdict": (b_st.get("verdict") or {}).get("level", "pending")},
+        "target": {"id": target_job.id, "sample": t_st.get("sample", ""), "verdict": (t_st.get("verdict") or {}).get("level", "pending")},
+        "highlights": highlights,
+        "files": {
+            "modified": modified_files[:100],
+            "added": added_files[:100],
+            "removed": removed_files[:100],
+        },
+        "static_deltas": static_deltas[:40],
+        "behavior_diff": behavior_diff,
+        "network_diff": {
+            "extra_domains": extra_domains[:100],
+            "extra_ips": extra_ips[:100],
+        },
+    }
+
+
 # ======================================================================== downloads watcher
 def _file_in_use(path: Path) -> bool:
     """True if another process still has the file open (e.g. a downloader writing to it).

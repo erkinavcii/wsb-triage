@@ -1,7 +1,7 @@
 const SAFEBOX_TOKEN = (document.querySelector('meta[name="safebox-token"]') || {}).content || "";
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-let activeJobId = null, activeJob = null, pollTimer = null, renderedStaticKey = '', caps = {}, vtModalOpen = false;
+let activeJobId = null, activeJob = null, pollTimer = null, renderedStaticKey = '', caps = {}, vtModalOpen = false, recentJobs = [];
 
 async function api(url, opts = {}) {
   opts.headers = opts.headers || {};
@@ -140,6 +140,7 @@ const statusTr = { running: 'çalışıyor', done: 'bitti', error: 'hata', waiti
 async function loadJobs() {
   try {
     const jobs = await api('/api/jobs');
+    recentJobs = jobs || [];
     $('jobsList').innerHTML = jobs.length ? jobs.map(j => `
       <button data-open-job="${esc(j.id)}" class="w-full text-left flex items-center justify-between gap-2 p-2 rounded-lg ${j.id === activeJobId ? 'bg-slate-800 border-cyan-500/50' : 'bg-slate-900 border-slate-800'} border hover:border-slate-600">
         <div class="min-w-0"><div class="text-slate-200 truncate">${esc(j.sample.split(/[\\/]/).pop())}</div><div class="text-slate-500">${esc(j.created)} • ${esc(statusTr[j.status] || j.status)}</div></div>
@@ -465,6 +466,49 @@ async function manualIntelQuery(idx) {
     }
     box.innerHTML = lines.join('');
   } catch (e) { box.innerHTML = `<span class="text-rose-300">${esc(e.message)}</span>`; }
+}
+
+// ---------------------------------------------------------------- Compare two jobs
+if ($('btnCompareModal')) {
+  $('btnCompareModal').onclick = async () => {
+    await loadJobs();
+    const optsHtml = recentJobs.map(j => `<option value="${esc(j.id)}">${esc(j.sample.split(/[\\/]/).pop())} (${esc(j.created)})</option>`).join('');
+    $('cmpBase').innerHTML = optsHtml;
+    $('cmpTarget').innerHTML = optsHtml;
+    if (recentJobs.length >= 2) { $('cmpBase').selectedIndex = 1; $('cmpTarget').selectedIndex = 0; }
+    $('compareResult').innerHTML = recentJobs.length < 2 ? '<div class="text-amber-300">Karşılaştırma için en az 2 analiz gereklidir.</div>' : '';
+    showModal('compareModal');
+  };
+}
+if ($('btnRunCompare')) {
+  $('btnRunCompare').onclick = async () => {
+    const baseId = $('cmpBase').value, targetId = $('cmpTarget').value;
+    if (!baseId || !targetId) return;
+    $('compareResult').innerHTML = '<div class="text-cyan-300 animate-pulse">Farklar hesaplanıyor...</div>';
+    try {
+      const d = await api(`/api/compare?base=${encodeURIComponent(baseId)}&target=${encodeURIComponent(targetId)}`);
+      const hi = d.highlights.length
+        ? `<div class="p-3 rounded-xl bg-amber-950/30 border border-amber-500/40 space-y-1">${d.highlights.map(x => `<div class="text-amber-200">• ${esc(x)}</div>`).join('')}</div>`
+        : `<div class="p-3 rounded-xl bg-slate-900 border border-slate-800 text-slate-400">Belirgin fark tespit edilmedi.</div>`;
+      const modHtml = d.files.modified.map(m => `<div class="mono text-[11px] break-all">${m.sig_broken ? '🚨 ' : '📝 '}${esc(m.rel)} (${esc(m.base_sig)} → ${esc(m.target_sig)})</div>`).join('');
+      const addHtml = d.files.added.map(a => `<div class="mono text-[11px] break-all text-cyan-300">+ ${esc(a.rel)} (${esc(a.sig)})</div>`).join('');
+      const fileCount = (d.files.modified || []).length + (d.files.added || []).length;
+      const stHtml = d.static_deltas.map(s => `<div class="text-[11px]">• <b>${esc(s.rel)}</b>: skor ${s.base_score ?? 'yok'} → ${s.target_score}${s.new_yara.length ? ` <span class="text-rose-300">[YARA: ${esc(s.new_yara.join(', '))}]</span>` : ''}</div>`).join('');
+      const htmlBox = (title, cnt, body, color) => `<div class="p-3 rounded-lg bg-slate-900 border ${cnt ? `border-${color}-500/40` : 'border-slate-800'}">
+        <div class="text-xs font-semibold text-${color}-300 mb-1">${esc(title)} (${cnt})</div>
+        <div class="text-[11px] text-slate-300 space-y-1 max-h-36 overflow-y-auto">${body || '<span class="text-slate-500">yok</span>'}</div></div>`;
+      const behPairs = [
+        ['Yeni kalıcılık (Servis/Görev/Run)', (d.behavior_diff.services || []).concat(d.behavior_diff.tasks || [], d.behavior_diff.runkeys || [])],
+        ['Defender / Firewall / hosts farkı', (d.behavior_diff.defender || []).concat(d.behavior_diff.firewall || [], d.behavior_diff.hosts || [])],
+        ['Ek bırakılan dosyalar', d.behavior_diff.dropped_executables || []],
+        ['Ek ağ hedefleri (Domain/IP)', (d.network_diff.extra_domains || []).map(x => x.value).concat((d.network_diff.extra_ips || []).map(x => x.value))],
+      ];
+      const behHtml = behPairs.map(([title, items]) => listBox(title, items, items.length ? 'rose' : 'slate')).join('');
+      $('compareResult').innerHTML = hi
+        + `<div class="grid grid-cols-1 md:grid-cols-2 gap-3">${htmlBox('Değişen / eklenen dosyalar', fileCount, modHtml + addHtml, fileCount ? 'amber' : 'slate')}${htmlBox('Statik risk & YARA artışı', (d.static_deltas || []).length, stHtml, (d.static_deltas || []).length ? 'rose' : 'slate')}</div>`
+        + `<div class="grid grid-cols-1 md:grid-cols-2 gap-3">${behHtml}</div>`;
+    } catch (e) { $('compareResult').innerHTML = `<div class="text-rose-300">${esc(e.message)}</div>`; }
+  };
 }
 
 // ---------------------------------------------------------------- VT / Intel modal

@@ -224,3 +224,16 @@ def test_intel_config_and_query_endpoints(client, tmp_path, monkeypatch):
     r_q = client.get("/api/intel/query/" + ("d" * 64))
     assert r_q.status_code == 200
     assert r_q.json()["sha256"] == "d" * 64
+
+
+def test_compare_endpoint(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline, "CASES_DIR", tmp_path / "cases")
+    for cid in ("case-a", "case-b"):
+        d = tmp_path / "cases" / cid
+        d.mkdir(parents=True)
+        (d / "state.json").write_text(f'{{"id":"{cid}","sample":"{cid}.exe","status":"done","verdict":{{"level":"green"}}}}', encoding="utf-8")
+    assert client.get("/api/compare?base=case-a&target=case-a").status_code == 400
+    assert client.get("/api/compare?base=case-a&target=missing").status_code == 404
+    r = client.get("/api/compare?base=case-a&target=case-b")
+    assert r.status_code == 200
+    assert r.json()["base"]["id"] == "case-a" and r.json()["target"]["id"] == "case-b"
