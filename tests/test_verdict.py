@@ -357,3 +357,30 @@ def test_compare_jobs_official_vs_crack(tmp_path):
     assert diff["behavior_diff"]["dropped_executables"] == ["C:\\Temp\\stealer.exe"]
     assert [d["value"] for d in diff["network_diff"]["extra_domains"]] == ["c2.evil"]
     assert len(diff["highlights"]) >= 4
+
+
+def test_desktop_notification_safe_env_passing(tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(pipeline, "_NOTIFY_ALLOW", True)
+    monkeypatch.setattr(pipeline.subprocess, "Popen", lambda cmd, **kw: seen.append((cmd, kw)))
+
+    job = bare_job(tmp_path, case_id="n1")
+    job.state["sample"] = "C:\\samples\\bad';powershell -enc EVIL setup.exe"
+    job.state["status"] = "done"
+    job.state["verdict"] = {"level": "red", "red": ["Defender kapatıldı\r\n$(whoami)"], "notes": []}
+    pipeline._maybe_notify_job(job)
+
+    assert len(seen) == 1
+    cmd, kw = seen[0]
+    assert "-Command" in cmd and pipeline._NOTIFY_PS in cmd
+    # Hostile characters never reach command line arguments, only sanitized env vars
+    assert "EVIL" not in " ".join(cmd)
+    assert "EVIL" in kw["env"]["SAFEBOX_NOTIFY_TITLE"]
+    assert "\n" not in kw["env"]["SAFEBOX_NOTIFY_MSG"]
+    assert kw["env"]["SAFEBOX_NOTIFY_ICON"] == "Error"
+
+    # Opt-out disables notifications
+    seen.clear()
+    job.state["options"]["notify"] = False
+    pipeline._maybe_notify_job(job)
+    assert seen == []

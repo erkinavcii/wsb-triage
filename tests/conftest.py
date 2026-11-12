@@ -32,6 +32,7 @@ def isolated(tmp_path, monkeypatch):
         raise AssertionError("a test tried to reach the network")
     monkeypatch.setattr(vt_client.requests, "get", no_network)
     monkeypatch.setattr(vt_client.requests, "post", no_network)
+    monkeypatch.setattr(pipeline, "_NOTIFY_ALLOW", False)
     with pipeline.JOBS_LOCK:
         pipeline.JOBS.clear()
     yield cases

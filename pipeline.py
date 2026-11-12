@@ -61,6 +61,7 @@ DEFAULT_OPTIONS = {
     "run_sandbox": True,
     "keep_sandbox_open": False,
     "simulate_user": False,
+    "notify": True,
     "memory_mb": 4096,
 }
 
@@ -325,6 +326,67 @@ def run_job(job: Job) -> None:
     finally:
         compute_verdict(job)
         job.save()
+        if job.state.get("status") in ("done", "waiting_sandbox", "error"):
+            _maybe_notify_job(job)
+
+
+_NOTIFY_PS = (
+    "Add-Type -AssemblyName System.Windows.Forms, System.Drawing; "
+    "$n = New-Object System.Windows.Forms.NotifyIcon; "
+    "$ic = $env:SAFEBOX_NOTIFY_ICON; "
+    "$n.Icon = if ($ic -eq 'Error') { [System.Drawing.SystemIcons]::Error } "
+    "elseif ($ic -eq 'Warning') { [System.Drawing.SystemIcons]::Warning } "
+    "else { [System.Drawing.SystemIcons]::Information }; "
+    "$n.BalloonTipIcon = $ic; "
+    "$n.BalloonTipTitle = [string]$env:SAFEBOX_NOTIFY_TITLE; "
+    "$n.BalloonTipText = [string]$env:SAFEBOX_NOTIFY_MSG; "
+    "$n.Visible = $true; $n.ShowBalloonTip(7000); Start-Sleep -Seconds 7; $n.Dispose()"
+)
+
+
+_NOTIFY_ALLOW = True
+
+
+def notify_desktop(title: str, message: str, level: str = "info") -> bool:
+    """Fires a non-blocking Windows system tray notification using constant PowerShell + env vars."""
+    if os.name != "nt" or not _NOTIFY_ALLOW:
+        return False
+    icon = {"red": "Error", "error": "Error", "yellow": "Warning", "warning": "Warning"}.get(level, "Info")
+    env = os.environ.copy()
+    env["SAFEBOX_NOTIFY_TITLE"] = re.sub(r"[\r\n\x00]+", " ", str(title or "SafeBox"))[:80]
+    env["SAFEBOX_NOTIFY_MSG"] = re.sub(r"[\r\n\x00]+", " ", str(message or ""))[:220]
+    env["SAFEBOX_NOTIFY_ICON"] = icon
+    try:
+        subprocess.Popen(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", _NOTIFY_PS],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=NO_WINDOW,
+        )
+        return True
+    except OSError:
+        return False
+
+
+def _maybe_notify_job(job: Job) -> None:
+    if not job.opt("notify"):
+        return
+    s = job.snapshot()
+    v = s.get("verdict") or {}
+    lvl = v.get("level") or "pending"
+    sample_name = Path(s.get("sample") or "örnek").name
+    st = s.get("status")
+    if lvl == "red":
+        first = (v.get("red") or ["Kırmızı bayrak tespit edildi"])[0]
+        notify_desktop(f"SafeBox KRİTİK: {sample_name}", first, level="red")
+    elif st == "error":
+        notify_desktop(f"SafeBox hata: {sample_name}", "Analiz hata ile sonlandı; ayrıntılar için panele bakın.", level="error")
+    elif lvl == "yellow":
+        first = (v.get("notes") or ["İncelenmesi gereken bulgular var"])[0]
+        notify_desktop(f"SafeBox inceleme: {sample_name}", first, level="yellow")
+    elif st == "done":
+        notify_desktop(f"SafeBox tamamlandı: {sample_name}", "Otomatik kontroller kırmızı bayrak bulmadı.", level="info")
 
 
 def request_cancel(job: Job) -> None:
@@ -408,6 +470,8 @@ def start_sandbox_later(job: Job) -> None:
         finally:
             compute_verdict(job)
             job.save()
+            if job.state.get("status") in ("done", "error"):
+                _maybe_notify_job(job)
     threading.Thread(target=_run, daemon=True).start()
 
 

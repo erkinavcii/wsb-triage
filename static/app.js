@@ -60,6 +60,7 @@ function options() {
     memory_mb: parseInt($('memoryInput').value, 10) || 4096,
     network: $('optNetwork').checked, vt_upload: $('optUpload').checked, run_sandbox: $('optSandbox').checked,
     keep_sandbox_open: $('optKeepOpen').checked, simulate_user: $('optSimUser').checked,
+    notify: $('optNotify') ? $('optNotify').checked : true,
   };
 }
 async function startAnalysis(path, extra = {}) {
