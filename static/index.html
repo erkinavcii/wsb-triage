@@ -210,17 +210,22 @@
   </div>
 
   <script>
+    window.__SAFEBOX_TOKEN__ = "";
     const $ = id => document.getElementById(id);
     const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     let activeJobId = null, activeJob = null, pollTimer = null, renderedStaticKey = '', caps = {};
 
     async function api(url, opts = {}) {
+      opts.headers = opts.headers || {};
+      if (window.__SAFEBOX_TOKEN__ && !opts.headers['X-SafeBox-Token']) {
+        opts.headers['X-SafeBox-Token'] = window.__SAFEBOX_TOKEN__;
+      }
       const r = await fetch(url, opts);
       let d = null; try { d = await r.json(); } catch (e) {}
       if (!r.ok) throw new Error((d && d.detail) || ('HTTP ' + r.status));
       return d;
     }
-    const post = (url, body) => api(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+    const post = (url, body) => api(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-SafeBox-Token': window.__SAFEBOX_TOKEN__ }, body: JSON.stringify(body || {}) });
     const showModal = id => { $(id).classList.remove('hidden'); $(id).classList.add('flex'); };
     const hideModal = id => { $(id).classList.add('hidden'); $(id).classList.remove('flex'); };
     const badge = (text, color) => `<span class="text-xs px-3 py-1.5 rounded-xl bg-${color}-500/15 text-${color}-300 border border-${color}-500/30 font-medium">${text}</span>`;

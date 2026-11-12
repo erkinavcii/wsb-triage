@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 from pathlib import Path
@@ -21,6 +22,7 @@ UPLOADS_DIR = BASE_DIR / "uploads"
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 STATIC_DIR = BASE_DIR / "static"
 PORT = int(os.environ.get("SAFEBOX_PORT", "8765"))
+API_TOKEN = os.environ.get("SAFEBOX_TOKEN") or secrets.token_hex(16)
 
 app = FastAPI(title="SafeBox - Zararlı Yazılım & Sandbox Analiz Merkezi")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -44,10 +46,19 @@ async def local_only(request: Request, call_next):
         site = request.headers.get("sec-fetch-site")
         if (origin and origin not in ALLOWED_ORIGINS) or (site and site not in ("same-origin", "none")):
             return JSONResponse({"detail": "Başka bir siteden gelen istek reddedildi."}, status_code=403)
-    # 3) Upload size: checked before the body is read (Starlette spools the whole upload to a temp file first).
+
+    # 3) Local API Token check: protect mutating API endpoints (/api/jobs, /api/watch, etc.)
+    # Browser UI sends X-SafeBox-Token (passed via initial index HTML) or cookie
+    if request.url.path.startswith("/api/") and request.method not in ("GET", "HEAD", "OPTIONS"):
+        token = request.headers.get("X-SafeBox-Token") or request.cookies.get("safebox_token")
+        if not token or not secrets.compare_digest(token, API_TOKEN):
+            return JSONResponse({"detail": "Yetkisiz erişim: API belirteci (token) eksik veya geçersiz."}, status_code=401)
+
+    # 4) Upload size: checked before the body is read (Starlette spools the whole upload to a temp file first).
     if request.url.path == "/api/upload":
         problem = _upload_problem(request.headers.get("content-length"))
         if problem:
+            return JSONResponse({"detail": problem[1]}, status_code=problem[0])
             return JSONResponse({"detail": problem[1]}, status_code=problem[0])
     response = await call_next(request)
     # Content-Security-Policy & security headers
@@ -127,7 +138,10 @@ class WatchRequest(BaseModel):
 # ------------------------------------------------------------------ pages / status
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    resp = HTMLResponse(html.replace('window.__SAFEBOX_TOKEN__ = "";', f'window.__SAFEBOX_TOKEN__ = "{API_TOKEN}";'))
+    resp.set_cookie("safebox_token", API_TOKEN, httponly=True, samesite="strict")
+    return resp
 
 
 @app.get("/api/system-status")

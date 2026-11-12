@@ -9,7 +9,10 @@ BASE = f"http://127.0.0.1:{app_module.PORT}"
 
 @pytest.fixture
 def client():
-    return TestClient(app_module.app, base_url=BASE)
+    # Provide the valid token in cookies / headers by default in test client
+    c = TestClient(app_module.app, base_url=BASE)
+    c.headers.update({"X-SafeBox-Token": app_module.API_TOKEN})
+    return c
 
 
 def test_index_is_served(client):
@@ -19,6 +22,23 @@ def test_index_is_served(client):
     assert "/static/tailwind.js" in r.text
     assert "Content-Security-Policy" in r.headers
     assert "default-src 'none'" in r.headers["Content-Security-Policy"]
+    assert app_module.API_TOKEN in r.text
+
+
+def test_api_token_protection(client):
+    # Post without token -> 401
+    bad_client = TestClient(app_module.app, base_url=BASE)
+    r = bad_client.post("/api/watch", json={"enabled": False})
+    assert r.status_code == 401
+    assert "API belirteci" in r.text
+
+    # Post with invalid token -> 401
+    r = bad_client.post("/api/watch", json={"enabled": False}, headers={"X-SafeBox-Token": "wrong-token"})
+    assert r.status_code == 401
+
+    # Post with valid token in header -> passes auth
+    r = bad_client.post("/api/watch", json={"enabled": False}, headers={"X-SafeBox-Token": app_module.API_TOKEN})
+    assert r.status_code == 200
 
 
 def test_foreign_host_is_refused(client):
