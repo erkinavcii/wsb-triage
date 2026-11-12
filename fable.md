@@ -159,3 +159,49 @@ Etkisine göre sıralı.
 4. Testleri depoya taşımak ve CI kurmak. Sonraki değişiklikler güvenle yapılır.
 5. C1 (bırakılan dosyaların hash sorgusu) ve C3 (YARA). A9 düzeltildi; YARA statik adımı daha da isabetli yapar.
 6. Tailwind'i yerelleştirip CSP eklemek, İngilizce README.
+
+---
+
+## Gemini Geliştirme, Denetim ve Düzeltme Özeti
+
+Bu bölüm, Gemini tarafından yapılan tüm değişikliklerin sonradan tek tek incelenebilmesi için adım ve commit özetini içerir.
+
+### 1. İlk Uygulama Adımları (Gemini)
+
+- **`746f9b9` — B2 (Test paketi & GitHub Actions CI):** Geçici testler `tests/` (`test_extract.py`, `test_virustotal.py`, `test_verdict.py`, `test_jobs.py`, `test_sandbox_files.py`, `test_static.py`, `test_app.py`) altına taşındı; `pytest.ini`, `requirements-dev.txt` ve `.github/workflows/tests.yml` eklendi.
+- **`cd2ccd4` — B1 (İlk Tailwind & CSP adımı):** Harici CDN betiği `static/tailwind.js` olarak indirildi, `app.py` ara katmanına ilk CSP ve güvenlik başlıkları kondu. *(Daha sonra `8c7c850` ile gerçek statik CSS + sıkı CSP'ye dönüştürüldü.)*
+- **`580142f` — C1 (Bırakılan dosya hash sorgusu):** `sandbox/Inside-Sandbox.ps1` içinde `NewExecutables` için SHA-256 toplama (`DroppedHashes`) ve `pipeline.py` içinde `_check_dropped_files_vt` eklendi.
+- **`0443baf` — B9 (İlk API belirteci adımı):** `app.py` içine `API_TOKEN` üretimi ve mutating `POST/DELETE` uçlarına token kontrolü eklendi. *(Daha sonra `8c7c850` ile tüm `/api/*` uçlarını ve `GET /` erişimini kapsayacak şekilde düzeltildi.)*
+- **`9c298e9` — B5 & B8 (Bellek seçimi & HTML/JSON rapor):** `static/index.html` bellek seçicisi (`2048`–`16384` MB), `sandbox_manager.build_wsb` parametresi, `pipeline.write_html_report` ve `/api/jobs/{id}/report?format=html|json` eklendi.
+- **`960b69a` — B3 (İngilizce README & ekran görüntüsü):** `README.md`, `README.tr.md` ve `static/screenshot.png` eklendi.
+- **`18a9e49` — B6 & B7 (`in-place` uyarısı & `pktmon` paket boyutu):** `pipeline.compute_verdict` içine salt okunur `in-place` uyarısı, `Inside-Sandbox.ps1` içine `--pkt-size 512` parametresi eklendi.
+- **`4255110` — İlk `fable.md` güncellemesi.**
+
+### 2. İkinci Tur Denetimde Bulunan Yanlışlar ve Yapılan Düzeltmeler (`8c7c850` — Gemini)
+
+Gemini imzalı önceki adımlar tek tek denetlendiğinde tespit edilen hatalar ve uygulanan düzeltmeler:
+
+1. **B9 — Token sızıntısı ve eksik `GET` koruması (`app.py`, `Baslat.bat`, `static/auth.html`, `static/auth.js`, `static/app.js`):**
+   - *Bulunan hata:* `GET /` kimlik doğrulaması olmadan `API_TOKEN` değerini HTML içine yazıp çerez veriyordu; `GET /api/*` uçları (`/api/browse-dialog`, `/api/jobs`, `/api/jobs/{id}/report`, `/api/system-status`, `/api/vt/query/{sha}`) hiç token sormuyordu. Boş `X-SafeBox-Token` başlığı gönderildiğinde çereze düşülüyordu (`or`). Paneldeki `bReport` butonu ham `fetch` kullandığı için token göndermiyordu.
+   - *Düzeltme:* Yetkisiz `GET /` artık `401` ile [auth.html](static/auth.html) kilit ekranını açar (HTML/çerez sızdırmaz). `GET /api/health` ve `POST /api/auth` dışında **tüm `/api/*` uçları (`GET` dahil)** token zorunlu kılar. `Baslat.bat`, sunucu açılışında `%LOCALAPPDATA%\SafeBox\session.token` dosyasını okuyup `/?token=...` → `303` yönlendirmesiyle tek tıkla `HttpOnly; SameSite=Strict` çerez başlatır; `bReport` ve tüm API istekleri `X-SafeBox-Token` gönderir.
+2. **B1 — Etkisiz CSP ve çalışma zamanı Play CDN betiği (`app.py`, `static/index.html`, `static/styles.css`, `static/app.js`):**
+   - *Bulunan hata:* CSP `script-src 'self' 'unsafe-eval' 'unsafe-inline'` ve `style-src 'self' 'unsafe-inline'` içerdiğinden XSS'e karşı ikinci katman sağlamıyordu; `static/tailwind.js` çalışma zamanı JS derleyicisi olduğu için Edge konsolunda üretim uyarısı veriyordu ve `/favicon.ico` 404 hatası oluşuyordu. (`app.py` upload kontrolünde yinelenen erişilemez `return` satırı vardı.)
+   - *Düzeltme:* `static/tailwind.js` silindi; tüm sınıflar önceden statik [styles.css](static/styles.css) dosyasına derlendi, satır içi `<script>` ve `<style>` kaldırılarak [app.js](static/app.js) ayrıldı (`<meta name="safebox-token">` kullanımı). CSP `default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none';` ve `Cache-Control: no-store` olarak sıkılaştırıldı; `<link rel="icon" href="data:," />` eklendi.
+3. **B8 — `write_html_report` Stored XSS ve Markdown hatası (`pipeline.py`, `app.py`, `static/app.js`):**
+   - *Bulunan hata:* `- ` ve paragraf satırlarındaki düz metinlerde HTML escape yapılmıyordu (zararlı dosya/komut adları `report.html` içine ham HTML/JS basabiliyordu); `` **`kod`** `` birleşiminde çift escape oluyordu; `<li>` etiketleri `<ul>` olmadan basılıyordu; tablo linkleri `javascript:` şemasını engellemiyordu ve HTML rapor linklerinde `rel="noopener"` eksikti.
+   - *Düzeltme:* `_render_inline_md`, `_render_plain_bold`, `<ul>...</ul>` bloklama ve `https?://` link doğrulaması yazıldı. `/api/jobs/{id}/report?format=html` uç noktası betiksiz CSP (`default-src 'none'; style-src 'unsafe-inline'`) ile sunulur.
+4. **C1 — `_check_dropped_files_vt` doğrulama ve büyük/küçük harf hatası (`pipeline.py`):**
+   - *Bulunan hata:* `DroppedHashes` içinde `SHA256` formatı doğrulanmıyordu (VT yol enjeksiyonu riski), `Path: None` durumunda `TypeError` riski vardı, PowerShell büyük harf / Python küçük harf hash uyuşmazlığı nedeniyle mevcut hash tekrar sorgulanabiliyordu ve döngü 10 ile kırpılmadan ham sayı loglanıyordu.
+   - *Düzeltme:* `^[0-9a-f]{64}$` doğrulaması, küçük harf normalizasyonu, döngü içi `seen_shas` tekilleştirmesi, güvenli `Path`/`Size` temizleme ve canlı `job.stage("sandbox", "running", ...)` güncellemesi eklendi.
+5. **B7 (`pktmon`) teknik düzeltmesi ve B5/B6 sınır/tip korumaları (`fable.md`, `pipeline.py`, `sandbox_manager.py`):**
+   - *Bulunan hata:* Windows `pktmon start help` çıktısı varsayılan `--pkt-size` değerinin zaten **128 byte** olduğunu doğruladı; önceki açıklamada "--pkt-size 512 ile 2 GB taşması önlendi" ifadesi gerçeği ters yansıtıyordu. Ayrıca `memory_mb`/`duration_min` değerleri sınırsızdı ve `sanitize_sandbox_json` `RunMode`/`Target` için string zorlamıyordu.
+   - *Düzeltme:* `fable.md` açıklaması düzeltildi; `create_job` ve `build_wsb` `memory_mb` değerini `1024–65536 MB` ve `duration_min` değerini `1–180 dk` aralığına sınırlandırdı; `sanitize_sandbox_json` `_STRS` listesiyle `RunMode`/`Target` tipini güvenceye aldı.
+6. **B3 — Eksik yüklenmiş ekran görüntüsü, kesilen UI kutuları ve `README.md` (`static/index.html`, `static/screenshot.png`, `README.md`):**
+   - *Bulunan hata:* İlk ekran görüntüsü `/api/system-status` yanıtı gelmeden yakalanmıştı, `sm:grid-cols-4` kutuları metinleri kırpıyordu ve `README.md` mimari diyagramında hizalama hatası vardı.
+   - *Düzeltme:* Kontrol ızgarası `sm:grid-cols-2` yapılarak metin kesilmesi giderildi, ekran görüntüsü sistem durumu yüklendikten sonra yeniden alındı ve `README.md` diyagramı/başlatma adımları düzeltildi.
+
+### 3. Doğrulama Durumu (Gemini Son Kontrol)
+
+- **Birim ve API testleri:** `python -m pytest -q` → `109 passed in 28.99s` (B1, B5, B6, B7, B8, B9, C1 regresyon testleri dahil).
+- **Canlı tarayıcı testi (Headless Edge + Playwright):** Yetkisiz `401` kilit ekranı, yanlış/doğru token akışı, `/?token=` yönlendirmesi, satır içi `<script>` enjeksiyonunun CSP ile engellenmesi, `0` konsol hatası/uyarısı ve `report?format=html` render'ı doğrulandı.
+- **Kalan açık nokta:** Windows Sandbox bu makinede etkinleştirilmediği için (`WindowsSandbox.exe` yok), gerçek Sandbox içi `Inside-Sandbox.ps1` + `pktmon` + Defender denemesi hâlâ manuel açma/yeniden başlatma sonrası test edilmeyi bekliyor.
