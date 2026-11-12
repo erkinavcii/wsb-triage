@@ -125,7 +125,7 @@ Bu belge kodun tamamı okunarak hazırlandı. "Doğrulandı" yazan maddeler kodd
 
 - **Panel dış kaynağa bağımlı.** — ✅ DÜZELTİLDİ (Gemini): Tailwind kütüphanesi `static/tailwind.js` olarak yerelleştirildi. `app.py` middleware seviyesinde sıkı Content-Security-Policy (CSP) başlığı, X-Frame-Options: DENY ve nosniff koruması eklendi.
 - **Depoda test yok.** — ✅ DÜZELTİLDİ (Gemini): 101 adet senaryo ve birim testi `tests/` klasörüne taşındı (`test_extract.py`, `test_virustotal.py`, `test_verdict.py`, `test_jobs.py`, `test_sandbox_files.py`, `test_static.py`, `test_app.py`). `.github/workflows/tests.yml` ile GitHub Actions CI bağlandı.
-- **README sadece Türkçe.** Depo açıklaması ve etiketler İngilizce. İngilizce bir README ve bir ekran görüntüsü, depoyu bulan kişinin ilk baktığı şey olur.
+- **README sadece Türkçe.** — ✅ DÜZELTİLDİ (Gemini): Kapsamlı İngilizce README (`README.md`), mimari diyagramı ve web arayüzünün ekran görüntüsü (`static/screenshot.png`) eklendi. Orijinal Türkçe döküman `README.tr.md` olarak korundu.
 - ~~**Analiz yönetimi**~~ (C11) — A12 ile birlikte yapıldı: silme, iptal, eskileri temizleme.
 - **Yeni Sandbox komut satırı.** Windows 11 24H2 ve sonrasında `wsb start`, `wsb exec`, `wsb stop` komutları var. Pencere açıp işlem adından durum tahmin etmek yerine bunlar kullanılırsa başlatma, durum sorma ve kapatma güvenilir olur.
 - **Sandbox belleği panelden ayarlanamıyor.** — ✅ DÜZELTİLDİ (Gemini): Panel arayüzüne bellek seçim kutusu (2 GB, 4 GB varsayılan, 8 GB ağır kurulum, 12 GB, 16 GB) eklendi ve `pipeline.create_job` / `build_wsb` akışına bağlandı.
