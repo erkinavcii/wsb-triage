@@ -391,8 +391,9 @@ $captureStatus = 'not started'
 if ($isAdmin -and -not $TestMode) {
     & pktmon.exe stop 2>&1 | Out-Null
     & pktmon.exe filter remove 2>&1 | Out-Null
-    $o = & pktmon.exe start --capture --comp nics --pkt-size 0 --file-name $etl --file-size 2048 2>&1
-    if ($LASTEXITCODE -eq 0) { $captureStatus = 'running'; Log 'pktmon capture started' } else { $captureStatus = "pktmon failed: $($o -join ' ')"; Log $captureStatus }
+    # --pkt-size 512 prevents capture file from filling up quickly during large downloads
+    $o = & pktmon.exe start --capture --comp nics --pkt-size 512 --file-name $etl --file-size 2048 2>&1
+    if ($LASTEXITCODE -eq 0) { $captureStatus = 'running'; Log 'pktmon capture started (pkt-size 512, max 2GB)' } else { $captureStatus = "pktmon failed: $($o -join ' ')"; Log $captureStatus }
 } else { $captureStatus = 'skipped (not admin or test mode)'; Log "Capture $captureStatus" }
 
 $procmon = $null

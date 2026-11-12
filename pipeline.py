@@ -1231,6 +1231,9 @@ def compute_verdict(job: Job) -> None:
         conns = [c for c in (b.get("Network") or {}).get("Connections") or [] if c.get("FromSample")]
         if conns:
             notes.append(f"Örneğin başlattığı işlemler {len(conns)} ağ bağlantısı açtı.")
+        run_mode = b.get("RunMode") or ""
+        if "in-place" in run_mode:
+            notes.append("Kurulum boyutu büyük olduğu için salt okunur paylaşılan klasörden yerinde çalıştırıldı. Kurulum kendi klasörüne dosya yazmaya çalıştıysa hata vermiş olabilir.")
     elif live:
         q = live.get("Quick") or {}
         if q.get("Defender"):
