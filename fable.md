@@ -85,7 +85,11 @@ Bu belge kodun tamamı okunarak hazırlandı. "Doğrulandı" yazan maddeler kodd
 - **Sorun:** Küçük görünen bir arşiv açılınca yüzlerce GB olabilir (zip bombası) ve diski doldurur.
 - **Düzeltme:** Açmadan önce `7z l` ile toplam boyutu okuyup boş alanla karşılaştırmak.
 
-### A9. Statik puan neredeyse her dosyada yüksek çıkıyor (orta, doğrulandı)
+### A9. Statik puan neredeyse her dosyada yüksek çıkıyor (orta) — ✅ DÜZELTİLDİ
+
+> **Düzeltme:** Tek tek API'ler artık puan getirmiyor; zararlılara özgü birleşimler puanlanıyor (süreç enjeksiyonu, process hollowing, indir-çalıştır, tuş kaydı, parola kasası, hata ayıklayıcıdan gizlenme). Metin izleri tek eşleşmede hafif, aynı kategoride birden fazla farklı izde ağır; her ek iz puanı artırıyor. `CryptUnprotectData` metin deseninden çıkarıldı (sistem DLL'lerinde zaten yazıyor). Entropi sadece kod bölümlerinde sayılıyor. Scriptler "imzasız" diye puan almıyor.
+>
+> **Ölçüm** (23 temiz Microsoft dosyası): ortalama 31 → 7, "orta" (≥35) 11 → 2, "yüksek" (≥65) 2 → 0. `winhttp.dll` 75 → 10. Sentetik örnekler: bilgi çalan benzeri 100, gizli PowerShell + Defender istisnalı yükleyici 70, sıradan kurulum scripti 6. Kalan iki "orta": `kernel32.dll` (bu API'leri sağlayan çekirdek DLL) ve `msedge.exe` (tarayıcılar alt işlemlerine gerçekten kod enjekte eder).
 
 - **Nerede:** `analyzer.py:25-47` ve metin desenleri
 - **Sorun:** `IsDebuggerPresent`, `QueryPerformanceCounter`, `ShellExecute`, `RegSetValueEx` hemen her Windows programında bulunur. `notepad.exe` bile 20 puan alıyor. `Login Data`, `Local State` gibi metinler Chromium gömülü her programda var ve "kritik" sayılıyor. `.bat` dosyaları imzalanamadığı halde "imzasız" diye puan alıyor. Puan ayırt edici değil.
@@ -99,27 +103,30 @@ Bu belge kodun tamamı okunarak hazırlandı. "Doğrulandı" yazan maddeler kodd
 - **Sorun:** Her 429 yanıtında 60 saniye bekleyip 4 kez deniyor. Günlük kota (ücretsiz hesapta 500 istek) dolduysa her dosya için 4 dakika boşa gider.
 - **Düzeltme:** Yanıttaki hata kodunu okuyup günlük kota dolmuşsa adımı hemen "kota doldu" diye bitirmek.
 
-### A11. Büyük dosya yüklemesi belleği dolduruyor (düşük)
+### A11. Büyük dosya yüklemesi belleği dolduruyor (düşük) — ✅ DÜZELTİLDİ
+
+> **Düzeltme:** Yükleme gövdesi diskten parça parça okunarak gönderiliyor (`vt_client.StreamingMultipart`, ek paket gerekmedi). Ölçüm: 300 MB'lık yüklemede Python bellek tepe noktası 637 MB → 2 MB. Gövde geçerli multipart olarak çözülüyor.
 
 - **Nerede:** `vt_client.py`, `upload`
 - **Sorun:** `requests` çok parçalı gövdeyi bellekte oluşturur. 600 MB'lık bir yükleme 600 MB'tan fazla RAM kullanır.
 - **Düzeltme:** `requests-toolbelt` ile akış halinde yükleme ya da yükleme sınırını 200 MB'a indirmek.
 
-### A12. Küçük sorunlar
+### A12. Küçük sorunlar — ✅ biri hariç DÜZELTİLDİ
 
-- **Arşiv şifresi saklanıyor.** `state.json` içinde düz metin duruyor ve API yanıtında dönüyor. İş bitince silinmeli.
-- **"Bayrak yok" yanıltabilir.** Sandbox çalışmasa da VirusTotal bittiyse sonuç yeşil görünüyor. Sonuç kutusu hangi adımların gerçekten çalıştığını da söylemeli.
-- **Durum okuma yarışı.** İş parçacığı durumu değiştirirken API aynı anda okuyor. Nadiren "dictionary changed size" hatası verebilir. Değişiklikler de kilit altında yapılmalı.
-- **Analizler hiç silinmiyor.** `cases/` ve `uploads/` sürekli büyüyor. Her arşiv analizi açılmış dosyaların bir kopyasını bırakıyor.
-- **İş iptal edilemiyor.** Sırada bekleyen ya da VirusTotal'i bekleyen bir analizi durdurmanın yolu yok.
-- **`Baslat.bat` tarayıcıyı sunucudan önce açıyor.** Port doluysa pencere anlaşılmaz bir hatayla kapanıyor.
-- **Defender sinyalleri sandbox'ta işe yaramayabilir.** Windows Sandbox içinde Defender genelde çalışmaz. "Defender tespitleri" ve "Defender değişiklikleri" kutuları boş kalabilir. Gerçek denemede bakılmalı.
+- ✅ **Arşiv şifresi saklanıyor.** Şifre artık sadece bellekte tutuluyor; `state.json`'a ve API yanıtlarına hiç girmiyor (`has_password` bayrağı kalıyor).
+- ✅ **"Bayrak yok" yanıltabilir.** VirusTotal ya da sandbox çalışmadıysa bu not olarak yazılıyor; yeşil sonuç sadece bütün kontroller çalıştığında çıkıyor (`verdict.not_run`).
+- ✅ **Durum okuma yarışı.** Durum, eşzamanlı yazmaya dayanıklı tek bir `snapshot()` ile okunuyor ve kaydediliyor. Test: sürekli değişen durumda 2000 okuma, 0 hata.
+- ✅ **Analizler hiç silinmiyor.** Panelde "🗑 Sil" (analiz klasörü + panele yüklenen kopya; kullanıcının kendi dosyasına dokunulmaz) ve "30 günden eskileri sil".
+- ✅ **İş iptal edilemiyor.** "✖ İptal et": güvenli noktalarda (adım arası, dosya döngüleri, VT sorguları, sandbox sırası) duruyor. Sandbox çalışırken iptal, izlemeyi erken bitirip o ana kadarki sonuçları raporluyor. Test: VT adımının ortasında 0,9 sn'de durdu.
+- ✅ **`Baslat.bat`.** Panel zaten açıksa sadece tarayıcıyı açıyor; Python ya da paketler eksikse ne yapılacağını söylüyor; tarayıcıyı sunucu yanıt verince açıyor; hata olursa pencereyi açık tutuyor.
+- ⏳ **Defender sinyalleri sandbox'ta işe yaramayabilir.** Windows Sandbox içinde Defender genelde çalışmaz. "Defender tespitleri" ve "Defender değişiklikleri" kutuları boş kalabilir. Gerçek denemede bakılmalı.
 
 ## B. Geliştirilebilecek yerler
 
 - **Panel dış kaynağa bağımlı.** Arayüz `cdn.tailwindcss.com` adresinden script yüklüyor (`index.html:7`). İnternet yokken panel bozuk görünür. Daha önemlisi, bu script panelin yerel API'sine erişebilen bir sayfada çalışıyor. CSS derlenip depoya konmalı, ardından sıkı bir Content-Security-Policy başlığı eklenmeli. Bu, A2 türü hatalara karşı da ikinci katman olur.
 - **Depoda test yok.** Sahte sandbox'la yaptığım senaryo testleri depoya girmedi. `tests/` klasörüne taşınıp GitHub Actions ile her gönderimde çalıştırılmalı. PowerShell scripti için ayrıştırma ve ASCII kontrolü de eklenebilir.
 - **README sadece Türkçe.** Depo açıklaması ve etiketler İngilizce. İngilizce bir README ve bir ekran görüntüsü, depoyu bulan kişinin ilk baktığı şey olur.
+- ~~**Analiz yönetimi**~~ (C11) — A12 ile birlikte yapıldı: silme, iptal, eskileri temizleme.
 - **Yeni Sandbox komut satırı.** Windows 11 24H2 ve sonrasında `wsb start`, `wsb exec`, `wsb stop` komutları var. Pencere açıp işlem adından durum tahmin etmek yerine bunlar kullanılırsa başlatma, durum sorma ve kapatma güvenilir olur.
 - **Sandbox belleği panelden ayarlanamıyor.** API'de seçenek var, arayüzde yok. Varsayılan 4 GB, Photoshop gibi kurulumlar için az.
 - **Salt okunur klasörden çalışan kurulumlar.** Kendi klasörüne yazmaya çalışan kurulum programları hata verir. Böyle bir durumda rapor bunu açıkça söylemeli.
@@ -148,7 +155,7 @@ Etkisine göre sıralı.
 
 1. Sandbox'ı açıp gerçek bir uçtan uca deneme yapmak, çıkan sorunları düzeltmek.
 2. ~~A1 ve A2~~ — düzeltildi.
-3. ~~A3, A4, A5, A6, A7~~ (ve A8, A10) — düzeltildi. Açık kalanlar: A9, A11, A12.
+3. ~~A3–A12~~ — düzeltildi (A12'deki Defender maddesi gerçek Sandbox denemesini bekliyor).
 4. Testleri depoya taşımak ve CI kurmak. Sonraki değişiklikler güvenle yapılır.
-5. C1 (bırakılan dosyaların hash sorgusu) ve A9 ile birlikte C3 (YARA).
+5. C1 (bırakılan dosyaların hash sorgusu) ve C3 (YARA). A9 düzeltildi; YARA statik adımı daha da isabetli yapar.
 6. Tailwind'i yerelleştirip CSP eklemek, İngilizce README.

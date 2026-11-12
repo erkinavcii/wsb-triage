@@ -1,8 +1,11 @@
 """VirusTotal API v3 client: rate-limited lookups, uploads (up to 650 MB) and analysis polling."""
+import io
 import json
 import os
+import re
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -144,6 +147,40 @@ def lookup(sha256: str, key: Optional[str] = None) -> Optional[Dict[str, Any]]:
     return summarize(data, sha256) if data else None
 
 
+class StreamingMultipart:
+    """File-like multipart/form-data body (one 'file' field) read lazily from disk. requests sends a file-like object
+    with a length in chunks, so memory use stays at a few KB whatever the file size."""
+
+    def __init__(self, path: str, field: str = "file"):
+        name = re.sub(r'[^\w.\-]', "_", Path(path).name) or "sample.bin"
+        self.boundary = uuid.uuid4().hex
+        head = (f"--{self.boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; filename=\"{name}\"\r\n"
+                f"Content-Type: application/octet-stream\r\n\r\n").encode("ascii")
+        tail = f"\r\n--{self.boundary}--\r\n".encode("ascii")
+        self._file = open(path, "rb")
+        self._parts = [io.BytesIO(head), self._file, io.BytesIO(tail)]
+        self.len = len(head) + os.path.getsize(path) + len(tail)
+        self.content_type = f"multipart/form-data; boundary={self.boundary}"
+
+    def __len__(self) -> int:
+        return self.len
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            size = 1024 * 1024
+        out = b""
+        while self._parts and len(out) < size:
+            chunk = self._parts[0].read(size - len(out))
+            if chunk:
+                out += chunk
+            else:
+                self._parts.pop(0)
+        return out
+
+    def close(self) -> None:
+        self._file.close()
+
+
 def upload(file_path: str, key: Optional[str] = None) -> str:
     """Uploads a file and returns the analysis id."""
     key = key or get_api_key()
@@ -157,8 +194,13 @@ def upload(file_path: str, key: Optional[str] = None) -> str:
             raise VtError("Büyük dosya yükleme adresi alınamadı.")
         url = u["data"]
     _throttle()
-    with open(file_path, "rb") as f:
-        resp = requests.post(url, headers={"x-apikey": key}, files={"file": (Path(file_path).name, f)}, timeout=3600)
+    # requests' files= builds the whole multipart body in memory (a 600 MB upload = 600+ MB of RAM);
+    # this streams it from disk with a known Content-Length instead.
+    body = StreamingMultipart(file_path)
+    try:
+        resp = requests.post(url, headers={"x-apikey": key, "Content-Type": body.content_type}, data=body, timeout=3600)
+    finally:
+        body.close()
     if resp.status_code == 429:
         raise VtQuotaError(QUOTA_MSG)
     if resp.status_code not in (200, 201):

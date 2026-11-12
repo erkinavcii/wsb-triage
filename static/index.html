@@ -118,7 +118,10 @@
         <div id="watchList" class="space-y-1.5 max-h-48 overflow-y-auto text-xs text-slate-400">—</div>
       </div>
       <div class="glass-card rounded-2xl p-5 space-y-3">
-        <h3 class="text-sm font-semibold text-white">🗂️ Geçmiş analizler</h3>
+        <div class="flex items-center justify-between gap-2">
+          <h3 class="text-sm font-semibold text-white">🗂️ Geçmiş analizler</h3>
+          <button id="btnCleanup" class="text-[11px] px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300" title="Bitmiş analizlerin klasörlerini siler; orijinal dosyalara dokunulmaz.">30 günden eskileri sil</button>
+        </div>
         <div id="jobsList" class="space-y-1.5 max-h-60 overflow-y-auto text-xs text-slate-400">—</div>
       </div>
     </section>
@@ -334,7 +337,7 @@
       green: '<span class="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300">bayrak yok</span>',
       pending: '<span class="px-2 py-0.5 rounded bg-slate-700 text-slate-300">...</span>',
     };
-    const statusTr = { running: 'çalışıyor', done: 'bitti', error: 'hata', waiting_sandbox: 'sandbox bekliyor', interrupted: 'yarıda kaldı' };
+    const statusTr = { running: 'çalışıyor', done: 'bitti', error: 'hata', waiting_sandbox: 'sandbox bekliyor', interrupted: 'yarıda kaldı', cancelled: 'iptal edildi' };
     async function loadJobs() {
       try {
         const jobs = await api('/api/jobs');
@@ -345,6 +348,12 @@
           </button>`).join('') : 'Henüz analiz yok.';
       } catch (e) {}
     }
+
+    $('btnCleanup').onclick = async () => {
+      if (!confirm('30 günden eski, bitmiş bütün analizlerin klasörleri kalıcı olarak silinecek. Devam?')) return;
+      try { const d = await post('/api/jobs-cleanup', { days: 30 }); alert(`${d.deleted.length} analiz silindi.`); loadJobs(); }
+      catch (e) { alert(e.message); }
+    };
 
     document.addEventListener('click', e => {
       const t = e.target.closest('[data-open-job],[data-analyze],[data-close],[data-vt-query],[data-vt-upload]');
@@ -399,12 +408,27 @@
       if (sbStatus === 'running') btn += `<button class="px-3 py-1.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-xs text-rose-200 border border-rose-500/40" id="bStop">⏹ İzlemeyi şimdi bitir</button>`;
       else if (st.status !== 'running' && ['waiting', 'unavailable', 'error', 'done'].includes(sbStatus))
         btn += `<button class="px-3 py-1.5 rounded-lg bg-gradient-to-r from-indigo-500 to-purple-600 text-xs font-semibold text-white" id="bSandbox">🚀 ${sbStatus === 'done' ? "Sandbox'ta tekrar çalıştır" : "Sandbox'ta çalıştır"}</button>`;
+      if (st.status === 'running' && sbStatus !== 'running')
+        btn += `<button class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-rose-200 border border-rose-500/30" id="bCancel">✖ İptal et</button>`;
+      if (st.status !== 'running')
+        btn += `<button class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-rose-900/60 text-xs text-slate-300" id="bDelete" title="Analiz klasörünü siler. Seçtiğin orijinal dosya/klasöre dokunulmaz.">🗑 Sil</button>`;
       $('jobButtons').innerHTML = btn;
       const id = st.id, enc = encodeURIComponent(id);
       $('bOpenFolder').onclick = () => post(`/api/jobs/${enc}/open?what=folder`);
       if ($('bReport')) $('bReport').onclick = async () => { $('reportText').textContent = await (await fetch(`/api/jobs/${enc}/report`)).text(); showModal('reportModal'); };
       if ($('bPcap')) $('bPcap').onclick = () => post(`/api/jobs/${enc}/open?what=pcap`).catch(e => alert(e.message));
       if ($('bStop')) $('bStop').onclick = () => post(`/api/jobs/${enc}/stop`);
+      if ($('bCancel')) $('bCancel').onclick = async () => {
+        if (!confirm('Analiz iptal edilsin mi? Çalışan adım güvenli bir noktada durur.')) return;
+        try { await post(`/api/jobs/${enc}/cancel`); } catch (e) { alert(e.message); }
+      };
+      if ($('bDelete')) $('bDelete').onclick = async () => {
+        if (!confirm("Bu analizin klasörü (açılmış dosyalar, ağ kaydı, rapor) kalıcı olarak silinecek. Orijinal dosyana dokunulmaz.\n\nSilinsin mi?")) return;
+        try {
+          await api(`/api/jobs/${enc}`, { method: 'DELETE' });
+          activeJobId = null; $('jobSection').classList.add('hidden'); loadJobs();
+        } catch (e) { alert(e.message); }
+      };
       if ($('bSandbox')) $('bSandbox').onclick = async () => {
         if (!confirm("Örnek Windows Sandbox içinde ÇALIŞTIRILACAK. Ana bilgisayarınızda hiçbir şey çalışmaz; süre bitince sandbox silinir. Devam?")) return;
         try { await post(`/api/jobs/${enc}/sandbox`); setTimeout(pollJob, 800); } catch (e) { alert(e.message); }

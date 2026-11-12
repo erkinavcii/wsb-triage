@@ -17,6 +17,7 @@ import subprocess
 import threading
 import time
 import traceback
+import uuid
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -73,6 +74,10 @@ class PipelineError(Exception):
     pass
 
 
+class Cancelled(Exception):
+    """Raised at a safe point after the user pressed 'İptal'."""
+
+
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -96,10 +101,27 @@ def _write_json(path: Path, data: Any) -> None:
 
 # ======================================================================== Job
 class Job:
-    def __init__(self, case_dir: Path, state: Dict[str, Any]):
+    def __init__(self, case_dir: Path, state: Dict[str, Any], password: str = ""):
         self.case_dir = case_dir
         self.state = state
         self.lock = threading.RLock()
+        # The archive password lives only in memory: never in state.json, never in API responses.
+        self.password = password
+
+    def check_cancel(self) -> None:
+        if self.state.get("cancel_requested"):
+            raise Cancelled()
+
+    def snapshot(self) -> Dict[str, Any]:
+        """Deep copy of the state that is safe to serialize while worker threads keep changing it."""
+        for _ in range(20):
+            try:
+                with self.lock:
+                    return json.loads(json.dumps(self.state, ensure_ascii=False))
+            except RuntimeError:          # "dictionary changed size during iteration" from an unlocked writer
+                time.sleep(0.01)
+        with self.lock:
+            return json.loads(json.dumps(self.state, ensure_ascii=False))
 
     @property
     def id(self) -> str:
@@ -123,8 +145,9 @@ class Job:
         return self.case_dir / "tools"
 
     def save(self) -> None:
+        snap = self.snapshot()
         with self.lock:
-            _write_json(self.case_dir / "state.json", self.state)
+            _write_json(self.case_dir / "state.json", snap)
 
     def log(self, msg: str) -> None:
         with self.lock:
@@ -175,12 +198,16 @@ def create_job(sample_path: str, options: Optional[Dict[str, Any]] = None) -> Jo
         raise PipelineError(f"Dosya veya klasör bulunamadı: {src}")
     opts = dict(DEFAULT_OPTIONS)
     opts.update({k: v for k, v in (options or {}).items() if k in DEFAULT_OPTIONS and v is not None})
+    password = opts.pop("password", "") or ""
+    opts["has_password"] = bool(password)
     safe = re.sub(r"[^\w.-]", "_", src.name)[:40] or "sample"
     case_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}_{safe}"
+    if (CASES_DIR / case_id).exists():      # two jobs for the same file within one second
+        case_id = f"{case_id}_{uuid.uuid4().hex[:4]}"
     case_dir = CASES_DIR / case_id
     for sub in ("input", "output", "tools"):
         (case_dir / sub).mkdir(parents=True, exist_ok=True)
-    job = Job(case_dir, _new_state(case_id, str(src.resolve()), opts))
+    job = Job(case_dir, _new_state(case_id, str(src.resolve()), opts), password)
     job.save()
     with JOBS_LOCK:
         JOBS[case_id] = job
@@ -241,13 +268,24 @@ def load_interrupted() -> None:
 
 
 # ======================================================================== runner
+def _mark_cancelled(job: Job, current: Optional[str]) -> None:
+    job.log("Analiz kullanıcı tarafından iptal edildi.")
+    for key, st in job.state["stages"].items():
+        if st["status"] in ("pending", "running", "queued", "waiting"):
+            job.stage(key, "skipped", "İptal edildi." if key == current or st["status"] != "pending" else "İptal nedeniyle atlandı.")
+    job.state["status"] = "cancelled"
+    job.state.pop("cancel_requested", None)
+
+
 def run_job(job: Job) -> None:
     current = None
     try:
         for key, fn in (("extract", stage_extract), ("inventory", stage_inventory), ("static", stage_static), ("vt", stage_vt)):
+            job.check_cancel()
             current = key
             fn(job)
             compute_verdict(job)
+        job.check_cancel()
         current = "sandbox"
         if job.opt("run_sandbox"):
             stage_sandbox(job)
@@ -256,6 +294,8 @@ def run_job(job: Job) -> None:
         current = "report"
         stage_report(job)
         job.state["status"] = "waiting_sandbox" if job.state["stages"]["sandbox"]["status"] == "waiting" else "done"
+    except Cancelled:
+        _mark_cancelled(job, current)
     except Exception as e:
         job.log(f"HATA ({current}): {e}")
         if current:
@@ -265,6 +305,62 @@ def run_job(job: Job) -> None:
     finally:
         compute_verdict(job)
         job.save()
+
+
+def request_cancel(job: Job) -> None:
+    """Stops a running analysis at the next safe point. A running sandbox is ended early (results so far are kept)."""
+    with job.lock:
+        if job.state["status"] != "running":
+            raise PipelineError("Bu analiz çalışmıyor.")
+        job.state["cancel_requested"] = True
+    if job.state["stages"]["sandbox"]["status"] == "running":
+        request_stop(job)
+    job.log("İptal isteği alındı.")
+
+
+def delete_job(case_id: str) -> None:
+    job = get_job(case_id)
+    if not job:
+        raise PipelineError("Analiz bulunamadı.")
+    if job.state["status"] == "running":
+        raise PipelineError("Çalışan bir analiz silinemez; önce iptal edin.")
+    case_dir = job.case_dir.resolve()
+    if case_dir.parent != CASES_DIR.resolve():          # never delete anything outside cases/
+        raise PipelineError("Geçersiz analiz klasörü.")
+    sample = Path(job.state.get("sample", ""))
+    with JOBS_LOCK:
+        JOBS.pop(case_id, None)
+    shutil.rmtree(case_dir, ignore_errors=True)
+    # a file dropped onto the panel lives in uploads/<name>/: remove it too if no other analysis uses it
+    uploads = (BASE_DIR / "uploads").resolve()
+    try:
+        up_dir = sample.resolve().parent
+    except OSError:
+        return
+    if up_dir.parent == uploads and not any(
+            (_read_json(d / "state.json") or {}).get("sample") == str(sample) for d in CASES_DIR.iterdir() if d.is_dir()):
+        shutil.rmtree(up_dir, ignore_errors=True)
+
+
+def cleanup_jobs(days: int) -> List[str]:
+    """Deletes finished analyses older than `days` days. Returns the deleted ids."""
+    limit = time.time() - days * 86400
+    removed = []
+    for d in list(CASES_DIR.iterdir()):
+        st = _read_json(d / "state.json") if d.is_dir() else None
+        if not st or st.get("status") == "running":
+            continue
+        try:
+            created = datetime.strptime(st["created"], "%Y-%m-%d %H:%M:%S").timestamp()
+        except (KeyError, ValueError):
+            continue
+        if created < limit:
+            try:
+                delete_job(d.name)
+                removed.append(d.name)
+            except PipelineError:
+                pass
+    return removed
 
 
 def start_sandbox_later(job: Job) -> None:
@@ -283,6 +379,8 @@ def start_sandbox_later(job: Job) -> None:
             stage_sandbox(job)
             stage_report(job)
             job.state["status"] = "done"
+        except Cancelled:
+            _mark_cancelled(job, "sandbox")
         except Exception as e:
             job.log(f"HATA (sandbox): {e}")
             job.stage("sandbox", "error", str(e))
@@ -353,7 +451,7 @@ def stage_extract(job: Job) -> None:
         pass
     elif is_archive:
         sz = sbm.seven_zip_path()
-        pw = job.opt("password") or ""
+        pw = job.password or ""
         if sz:
             ver = _seven_zip_version(sz)
             if ver is not None and ver < 25.0:
@@ -461,6 +559,7 @@ def stage_inventory(job: Job) -> None:
     items: List[Dict[str, Any]] = []
     for i, p in enumerate(files, 1):
         if i % 100 == 0:
+            job.check_cancel()
             job.stage("inventory", "running", f"Hash: {i} / {len(files)} dosya")
         rec = {"rel": str(p.relative_to(inp)), "path": str(p), "size": 0, "sha256": None, "is_pe": False,
                "is_script": p.suffix.lower() in SCRIPT_EXT, "name_flag": bool(NAME_RX.search(p.name)) or p.name.lower() in analyzer.SUSPICIOUS_FILENAMES,
@@ -538,6 +637,7 @@ def stage_static(job: Job) -> None:
         picks = sorted((r for r in inv["files"] if r["is_pe"] and r["sha256"]), key=lambda r: -r["size"])[:5]
     results = []
     for i, r in enumerate(picks, 1):
+        job.check_cancel()
         job.stage("static", "running", f"İnceleniyor ({i}/{len(picks)}): {r['rel']}")
         try:
             res = analyzer.analyze_single_file(r["path"], r["sig"] or {"status": "Unknown", "message": "", "signer": "", "issuer": ""})
@@ -602,6 +702,7 @@ def stage_vt(job: Job) -> None:
     unknown: List[int] = []
     quota = False                       # once the quota is used up, every further call is pointless
     for i, (r, e) in enumerate(zip(picks, entries)):
+        job.check_cancel()
         if quota:
             e["status"] = "Sorgulanmadı (VirusTotal kotası doldu)"
             continue
@@ -629,6 +730,7 @@ def stage_vt(job: Job) -> None:
 
     pending: Dict[int, str] = {}
     for n, i in enumerate(unknown, 1):
+        job.check_cancel()
         r, e = picks[i], entries[i]
         if quota:
             e["status"] = "VT'de yok — yüklenmedi (kota doldu)"
@@ -647,6 +749,7 @@ def stage_vt(job: Job) -> None:
     deadline = time.time() + 10 * 60
     while pending and time.time() < deadline and not quota:
         for i, aid in list(pending.items()):
+            job.check_cancel()
             job.stage("vt", "running", f"3/3 VirusTotal taramaları bekleniyor ({len(pending)} dosya kaldı): {picks[i]['rel']}")
             try:
                 if vt_client.analysis_done(aid, key):
@@ -684,7 +787,7 @@ def stage_sandbox(job: Job) -> None:
         job.stage("sandbox", "queued", "Sırada: başka bir analizin sandbox'ı bitince otomatik başlayacak.")
         job.log("Sandbox meşgul, sıraya alındı.")
         while not SANDBOX_LOCK.acquire(timeout=5):
-            pass
+            job.check_cancel()          # cancelling while queued just leaves the queue
         job.log("Sıra geldi, sandbox hazırlanıyor.")
     try:
         if sbm.sandbox_state() is True:
@@ -767,6 +870,9 @@ def stage_sandbox(job: Job) -> None:
             job.state["sandbox"]["live"] = live
         if max_gap > 60:
             job.state["sandbox"]["monitor_max_gap"] = int(max_gap)
+        if job.state.pop("cancel_requested", None):
+            # cancel during the sandbox = stop observing now, but keep and report what was collected
+            job.log("İptal: izleme erken bitirildi, o ana kadar toplanan sonuçlar raporlanıyor.")
         if not job.opt("keep_sandbox_open"):
             job.log("Sandbox kapatılıyor (içindeki her şey silinir).")
             sbm.stop_sandbox()
@@ -1090,8 +1196,20 @@ def compute_verdict(job: Job) -> None:
             notes.append(f"{len(cloud)} paylaşımlı bulut/CDN adresi (Windows'un kendi trafiği de olabilir, zararlılar da kullanır): {', '.join(cloud[:8])}")
         if net.get("partial"):
             notes.append(f"Ağ özeti kısmi: {', '.join(net['partial'])} sorgusu zaman aşımına uğradı (kayıt çok büyük). Tamamı için kaydı Wireshark'ta açın.")
-    level = "red" if red else ("yellow" if notes else ("green" if s["stages"]["vt"]["status"] == "done" or b else "pending"))
-    s["verdict"] = {"level": level, "red": red, "notes": notes}
+    # Coverage: "no red flags" must not look like a clean bill of health when checks did not actually run.
+    stg = s["stages"]
+    finished = s.get("status") not in ("running",)
+    missing = []
+    if finished:
+        if stg["vt"]["status"] != "done":
+            missing.append("VirusTotal")
+            notes.append(f"VirusTotal kontrolü yapılmadı ({stg['vt'].get('msg') or stg['vt']['status']}).")
+        if stg["sandbox"]["status"] != "done":
+            missing.append("Sandbox")
+            notes.append("Sandbox adımı çalışmadı: dosyanın davranışı (işlemler, ağ, kalıcılık) incelenmedi; "
+                         "bu sonuç sadece statik kontrollere dayanıyor.")
+    level = "red" if red else ("yellow" if notes else ("green" if finished else "pending"))
+    s["verdict"] = {"level": level, "red": red, "notes": notes, "not_run": missing}
 
 
 def stage_report(job: Job) -> None:

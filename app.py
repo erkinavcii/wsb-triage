@@ -192,8 +192,7 @@ def _job(case_id: str) -> pipeline.Job:
 @app.get("/api/jobs/{case_id}")
 def job_state(case_id: str):
     job = _job(case_id)
-    with job.lock:
-        st = json.loads(json.dumps(job.state, ensure_ascii=False))
+    st = job.snapshot()
     st["case_dir"] = str(job.case_dir)
     st["has_pcap"] = (job.output_dir / "capture.pcapng").exists()
     st["has_report"] = (job.case_dir / "report.md").exists()
@@ -208,6 +207,35 @@ def job_run_sandbox(case_id: str):
     except pipeline.PipelineError as e:
         raise HTTPException(409, str(e))
     return {"status": "started"}
+
+
+@app.post("/api/jobs/{case_id}/cancel")
+def job_cancel(case_id: str):
+    try:
+        pipeline.request_cancel(_job(case_id))
+    except pipeline.PipelineError as e:
+        raise HTTPException(409, str(e))
+    return {"status": "ok"}
+
+
+@app.delete("/api/jobs/{case_id}")
+def job_delete(case_id: str):
+    try:
+        pipeline.delete_job(case_id)
+    except pipeline.PipelineError as e:
+        raise HTTPException(409, str(e))
+    return {"status": "deleted"}
+
+
+class CleanupRequest(BaseModel):
+    days: int = 30
+
+
+@app.post("/api/jobs-cleanup")
+def jobs_cleanup(req: CleanupRequest):
+    if req.days < 1:
+        raise HTTPException(400, "En az 1 gün.")
+    return {"deleted": pipeline.cleanup_jobs(req.days)}
 
 
 @app.post("/api/jobs/{case_id}/stop")
