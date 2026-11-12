@@ -1413,8 +1413,13 @@ def write_report(job: Job) -> None:
         mal = f"{r['stats']['malicious']}/{r['stats']['total']}" if r else "-"
         L.append(f"| {e['rel']} | {e['status']} | {mal} | {r.get('suggested_threat_label', '') if r else ''} | [VT]({e['gui_url']}) |")
     L += ["", "## Statik analiz (en riskli 15)", ""]
+    yara_rows: List[str] = []
     for st in (s.get("static") or [])[:15]:
         L.append(f"- **{st['rel']}** — risk {st['risk_score']}/100, imza: {(st.get('signature') or {}).get('status')}; " + "; ".join(st.get("risk_reasons", [])[:4]))
+        for ym in st.get("yara_matches") or []:
+            yara_rows.append(f"- **{st['rel']}** → `{ym.get('rule')}` ({ym.get('severity')}): {ym.get('description', '')}")
+    if yara_rows:
+        L += ["", "### YARA eşleşmeleri", ""] + yara_rows
     b = s.get("behavior")
     if b:
         L += ["", "## Sandbox davranışı", "", f"- Çalıştırılan: `{b.get('Target')}` ({b.get('RunMode')})",

@@ -56,3 +56,27 @@ def test_unsigned_suspicious_dll_name_adds_points(tmp_path):
     res = analyzer.analyze_single_file(str(dll), UNSIGNED)
     assert any("amtlib.dll" in r for r in res["risk_reasons"])
     assert res["risk_score"] >= 45                     # unsigned (20) + hijack name (25)
+
+
+def test_yara_matches_ransomware_and_wide_strings(tmp_path):
+    import yara_scanner
+    status = yara_scanner.rules_status()
+    assert status["rules_count"] >= 6
+
+    sample = tmp_path / "locker.bin"
+    # Mix UTF-16LE (wide) and ASCII strings to test both encodings
+    sample.write_bytes("vssadmin.exe".encode("utf-16le") + b" /quiet delete shadows /all")
+    res = analyzer.analyze_single_file(str(sample), VALID)
+    matched = [y["rule"] for y in res["yara_matches"]]
+    assert "SafeBox_Ransomware_Shadow_Delete" in matched
+    assert res["risk_score"] >= 35
+    assert any("YARA [SafeBox_Ransomware_Shadow_Delete]" in r for r in res["risk_reasons"])
+
+
+@windows_only
+def test_clean_system_files_trigger_no_yara():
+    import yara_scanner
+    for name in ("notepad.exe", "whoami.exe"):
+        p = SYSTEM32 / name
+        if p.exists():
+            assert yara_scanner.scan_bytes(p.read_bytes(), name) == []

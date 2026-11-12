@@ -32,6 +32,9 @@ async function loadSystemStatus() {
     h += caps.seven_zip ? badge('✅ 7-Zip', 'emerald') : `<a href="https://www.7-zip.org" target="_blank" rel="noopener">${badge('⚠️ 7-Zip yok (RAR/7z için gerekli) ↗', 'amber')}</a>`;
     h += caps.tshark ? badge('✅ Wireshark / tshark', 'emerald') : `<a href="https://www.wireshark.org/download.html" target="_blank" rel="noopener">${badge('ℹ️ Wireshark yok (ağ özeti için) ↗', 'slate')}</a>`;
     h += caps.procmon ? badge('✅ Procmon', 'emerald') : '';
+    if (caps.yara && caps.yara.rules_count) {
+      h += badge(`✅ YARA (${caps.yara.rules_count} kural)`, 'emerald');
+    }
     if (caps.virtualbox_installed && caps.virtualbox_vms.length) {
       h += `<select id="vmSelect" class="text-xs bg-slate-900 border border-slate-700 rounded-xl px-2 py-1.5">${caps.virtualbox_vms.map(v => `<option>${esc(v.name)}</option>`).join('')}</select>
             <button id="btnHarden" class="text-xs px-3 py-1.5 rounded-xl bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-300 border border-indigo-500/40">🛡️ VM'i izole et + snapshot</button>`;
@@ -373,6 +376,9 @@ function renderStatic(st) {
     const strs = (f.string_findings || []).length ? f.string_findings.map(s => `<div class="p-2.5 rounded-lg border ${s.severity === 'critical' ? 'bg-rose-950/30 border-rose-500/40 text-rose-200' : 'bg-amber-950/30 border-amber-500/40 text-amber-200'} text-xs">
         <div class="font-bold">🚨 ${esc(s.category)}</div><div class="text-slate-300 text-[11px]">${esc(s.description)}</div><div class="mono text-[11px] text-cyan-300">${esc(s.matches.join(' | '))}</div></div>`).join('')
       : '<div class="text-xs text-slate-500">Bilinen stealer / RAT / anti-VM izi yok.</div>';
+    const yaras = (f.yara_matches || []).length ? f.yara_matches.map(y => `<div class="p-2.5 rounded-lg border ${y.severity === 'critical' ? 'bg-rose-950/30 border-rose-500/40 text-rose-200' : 'bg-amber-950/30 border-amber-500/40 text-amber-200'} text-xs">
+        <div class="font-bold">🎯 YARA: ${esc(y.rule)}</div><div class="text-slate-300 text-[11px]">${esc(y.description)}</div>${y.strings && y.strings.length ? `<div class="mono text-[11px] text-cyan-300">${esc(y.strings.join(' | '))}</div>` : ''}</div>`).join('')
+      : '';
     const urls = (f.interesting_urls || []).length ? `<div class="text-[11px] mono text-slate-400 break-all">URL'ler: ${f.interesting_urls.map(esc).join(' • ')}</div>` : '';
     return `<div class="glass-card rounded-2xl p-5 space-y-3">
       <div class="flex flex-wrap items-start justify-between gap-3 border-b border-slate-800/80 pb-3">
@@ -384,7 +390,7 @@ function renderStatic(st) {
         <div class="px-3 py-1.5 rounded-xl border font-bold text-xs ${riskClass(f.risk_score)}">Statik risk ${f.risk_score}/100</div>
       </div>
       <ul class="list-disc list-inside text-xs text-slate-300 space-y-0.5">${f.risk_reasons.map(r => `<li>${esc(r)}</li>`).join('')}</ul>
-      <div class="grid grid-cols-1 lg:grid-cols-2 gap-3"><div class="space-y-2">${strs}${urls}</div><div class="space-y-2">${apisHtml}</div></div>
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-3"><div class="space-y-2">${yaras}${strs}${urls}</div><div class="space-y-2">${apisHtml}</div></div>
       <div class="pt-2 border-t border-slate-800/80 flex flex-wrap items-center gap-2 text-xs">
         ${vt ? `<span>VirusTotal: ${vtCell(vt.result)} <span class="text-slate-500">${esc(vt.status)}</span></span>` : `<button data-vt-query="${idx}" class="px-3 py-1.5 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 border border-cyan-500/40 font-semibold">🛡️ VirusTotal ile sorgula</button>`}
         <a href="https://www.virustotal.com/gui/file/${esc(sha)}" target="_blank" rel="noopener" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200">VT ↗</a>

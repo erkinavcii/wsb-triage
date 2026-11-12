@@ -11,6 +11,8 @@ from typing import Dict, List, Any, Optional
 
 import pefile
 
+import yara_scanner
+
 EXECUTABLE_EXTENSIONS = {
     ".exe", ".dll", ".msi", ".scr", ".sys", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".wsf", ".hta"
 }
@@ -356,6 +358,13 @@ def analyze_single_file(file_path: str, sig_info: Optional[Dict[str, Any]] = Non
         risk_score += SEVERITY_POINTS.get(finding["severity"], 6) + finding.get("extra_points", 0)
         risk_reasons.append(f"{finding['category']} ({finding['distinct']} farklı iz, {finding['severity']}): {', '.join(finding['matches'][:4])}")
 
+    yara_matches = yara_scanner.scan_bytes(sample_data, path_obj.name)
+    if yara_matches:
+        risk_score += min(45, sum(m.get("score", 15) for m in yara_matches))
+        for ym in yara_matches:
+            strs_txt = f" [{', '.join(ym['strings'][:4])}]" if ym.get("strings") else ""
+            risk_reasons.append(f"YARA [{ym['rule']}] ({ym['severity']}): {ym['description']}{strs_txt}")
+
     risk_score = min(100, risk_score)
     if risk_score >= 65:
         risk_level = "YÜKSEK RİSK (Tehlikeli / Şüpheli)"
@@ -375,6 +384,7 @@ def analyze_single_file(file_path: str, sig_info: Optional[Dict[str, Any]] = Non
         "signature": sig_info,
         "pe_info": pe_info,
         "string_findings": string_findings,
+        "yara_matches": yara_matches,
         "interesting_urls": interesting_urls,
         "risk_score": risk_score,
         "risk_level": risk_level,

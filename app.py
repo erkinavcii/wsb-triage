@@ -18,6 +18,7 @@ import analyzer
 import pipeline
 import sandbox_manager
 import vt_client
+import yara_scanner
 
 BASE_DIR = Path(__file__).parent.resolve()
 UPLOADS_DIR = BASE_DIR / "uploads"
@@ -208,6 +209,7 @@ def system_status():
     caps["vt_api_configured"] = bool(key)
     caps["vt_api_masked"] = (key[:4] + "..." + key[-4:]) if len(key) > 8 else ""
     caps["procmon"] = any((BASE_DIR / "sandbox" / n).exists() for n in ("Procmon64.exe", "Procmon.exe"))
+    caps["yara"] = yara_scanner.rules_status()
     return caps
 
 
