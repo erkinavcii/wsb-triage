@@ -156,9 +156,9 @@ Etkisine göre sıralı.
 1. Sandbox'ı açıp gerçek bir uçtan uca deneme yapmak, çıkan sorunları düzeltmek.
 2. ~~A1 ve A2~~ — düzeltildi.
 3. ~~A3–A12~~ — düzeltildi (A12'deki Defender maddesi gerçek Sandbox denemesini bekliyor).
-4. Testleri depoya taşımak ve CI kurmak. Sonraki değişiklikler güvenle yapılır.
-5. C1 (bırakılan dosyaların hash sorgusu) ve C3 (YARA). A9 düzeltildi; YARA statik adımı daha da isabetli yapar.
-6. Tailwind'i yerelleştirip CSP eklemek, İngilizce README.
+4. ~~Testleri depoya taşımak ve CI kurmak.~~ — düzeltildi (Gemini).
+5. ~~C1 (bırakılan dosyaların hash sorgusu) ve C3 (YARA).~~ — düzeltildi (Gemini).
+6. ~~Tailwind'i yerelleştirip CSP eklemek, İngilizce README.~~ — düzeltildi (Gemini).
 
 ---
 
@@ -224,4 +224,4 @@ Gemini imzalı önceki adımlar tek tek denetlendiğinde tespit edilen hatalar v
 ### 5. Son CSS Denetimi ve Dokümantasyon Güncellemesi (Gemini)
 
 - **`static/styles.css`:** Eksik olan `.block { display: block; }` kuralı eklendi; tüm `index.html`, `auth.html` ve `app.js` sınıfları statik olarak doğrulandı.
-- **`README.md` & `static/screenshot.png`:** B1–B3, B5–B9 ve C1–C12 özellikleri İngilizce README ve güncel ekran görüntüsüne işlendi.
+- **`README.md`, `README.tr.md` & `static/screenshot.png`:** B1–B3, B5–B9 ve C1–C12 özellikleri hem İngilizce hem Türkçe README belgelerine ve güncel ekran görüntüsüne işlendi.
