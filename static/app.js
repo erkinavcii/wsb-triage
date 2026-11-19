@@ -33,8 +33,12 @@ async function loadSystemStatus() {
     h += caps.seven_zip ? badge('✅ 7-Zip', 'emerald') : `<a href="https://www.7-zip.org" target="_blank" rel="noopener">${badge('⚠️ 7-Zip yok (RAR/7z için gerekli) ↗', 'amber')}</a>`;
     h += caps.tshark ? badge('✅ Wireshark / tshark', 'emerald') : `<a href="https://www.wireshark.org/download.html" target="_blank" rel="noopener">${badge('ℹ️ Wireshark yok (ağ özeti için) ↗', 'slate')}</a>`;
     h += caps.procmon ? badge('✅ Procmon', 'emerald') : '';
-    if (caps.yara && caps.yara.rules_count) {
-      h += badge(`✅ YARA (${caps.yara.rules_count} kural)`, 'emerald');
+    if (caps.yara) {
+      const y = caps.yara, probs = asArr(y.problems);
+      const tip = esc([y.hint, ...probs].filter(Boolean).join('\n'));
+      const n = asNum(y.rules_count);
+      if (y.engine === 'yara-python' && !probs.length) h += badge(`✅ YARA (${n} kural)`, 'emerald');
+      else h += `<span title="${tip}">${badge(`⚠️ YARA (${n} kural${probs.length ? `, ${probs.length} atlandı` : ''}${y.engine !== 'yara-python' ? ', yerleşik motor' : ''})`, 'amber')}</span>`;
     }
     h += caps.context_menu
       ? `<button id="btnCtxMenu" class="text-xs px-3 py-1.5 rounded-xl bg-emerald-500/15 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/30 font-medium" title="Dosya Gezgini sağ tık menüsünü kaldır">✅ Sağ tık menüsü aktif</button>`

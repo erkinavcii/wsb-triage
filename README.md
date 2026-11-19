@@ -29,7 +29,7 @@ SafeBox is a lightweight, local web-based triage and malware analysis workbench 
   - Optional **MalwareBazaar & Hybrid Analysis** hash-only enrichment (available automatically as a backup when VirusTotal has no key or hits quota, or per file on demand).
 - **Static PE, Installer Unpacking & YARA Triage:**
   - Recursive archive decompression and safe **installer payload unpacking** (NSIS, MSI, CAB, SFX under size guards) to triage embedded binaries prior to execution.
-  - **YARA scanning** (`rules/safebox_builtin.yar`) using `yara-python` when available or an offline built-in rule scanner fallback.
+  - **YARA scanning** (`rules/safebox_builtin.yar`) using `yara-python` (installed via `requirements.txt`); without it, a built-in fallback runs simple rules only and lists the ones it skips.
   - Authenticode digital signature validation (valid, broken/mismatched, or unsigned), PE header entropy analysis, section anomalies, anti-analysis API heuristics, and infostealer/C2 string matching.
 - **Reporting, IOC Export & Run Comparison:**
   - Generates structured Markdown (`report.md`), clean standalone HTML (`report.html`), and machine-readable JSON (`state.json`).

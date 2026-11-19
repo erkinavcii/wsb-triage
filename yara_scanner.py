@@ -31,7 +31,13 @@ def _files_signature(files: List[Path]) -> Tuple[Tuple[str, float, int], ...]:
 
 
 # ------------------------------------------------------------------ built-in .yar subset parser
-_RULE_RX = re.compile(r"(?:^|\n)\s*rule\s+([A-Za-z_]\w*)\s*\{(.*?)\n\s*\}", re.S)
+# rule header: optional private/global, optional ": tag1 tag2"; body runs to the '}' that is followed by the next
+# rule or the end of the file (bodies can contain '}' in hex strings, and rules may be written on one line).
+_RULE_RX = re.compile(
+    r"(?:^|(?<=[\s}]))(?:(?:private|global)\s+)*rule\s+([A-Za-z_]\w*)(?:\s*:\s*[A-Za-z_][\w ]*?)?\s*\{(.*?)\}"
+    r"(?=\s*(?:(?:private|global)\s+)*rule\s|\s*\Z)",   # lookahead only: the next rule's text must stay unconsumed
+    re.S,
+)
 
 
 def _decode_yara_literal(raw: str) -> bytes:
@@ -83,6 +89,8 @@ def _compile_string_variants(literal_bytes: bytes, mods: List[str]) -> List[re.P
             variants.append(literal_bytes.decode("utf-8").encode("utf-16le"))
         except UnicodeDecodeError:
             pass
+    if "fullword" in mods:   # YARA: the match must not be preceded or followed by an alphanumeric character
+        return [re.compile(rb"(?<![A-Za-z0-9])" + re.escape(v) + rb"(?![A-Za-z0-9])", flags) for v in variants if v]
     return [re.compile(re.escape(v), flags) for v in variants if v]
 
 
@@ -95,6 +103,9 @@ def _parse_yar_file(path: Path) -> List[Dict[str, Any]]:
     parsed: List[Dict[str, Any]] = []
     for m in _RULE_RX.finditer(text):
         rule_name, body = m.group(1), m.group(2)
+        # put section keywords and each "$id =" on their own line, so one-line rules parse like multi-line ones
+        body = re.sub(r"\b(meta|strings|condition)\s*:", r"\n\1:\n", body)
+        body = re.sub(r"\s+(?=\$[A-Za-z_]\w*\s*=)", "\n", body)
         sections = {"meta": "", "strings": "", "condition": ""}
         cur = None
         for line in body.splitlines():
@@ -116,32 +127,69 @@ def _parse_yar_file(path: Path) -> List[Dict[str, Any]]:
                     meta[mi.group(1)] = int(mi.group(2))
 
         patterns: Dict[str, List[re.Pattern]] = {}
+        unsupported: List[str] = []
         for line in sections["strings"].splitlines():
+            if not line.strip():
+                continue
             sm = re.match(r'^(\$[A-Za-z_]\w*)\s*=\s*"((?:[^"\\]|\\.)*)"(.*)$', line)
             if sm:
                 ident = sm.group(1)
                 raw_bytes = _decode_yara_literal(sm.group(2))
                 mods = [w.lower() for w in sm.group(3).split()]
+                bad_mods = [w for w in mods if w not in _SUPPORTED_STRING_MODS]
+                if bad_mods:
+                    unsupported.append(f"{ident}: desteklenmeyen değiştirici {', '.join(bad_mods)}")
+                    continue
                 patterns[ident] = _compile_string_variants(raw_bytes, mods)
                 continue
-            hm = re.match(r"^(\$[A-Za-z_]\w*)\s*=\s*\{\s*([0-9A-Fa-f\s]+)\s*\}", line)
+            hm = re.match(r"^(\$[A-Za-z_]\w*)\s*=\s*\{\s*([0-9A-Fa-f\s]+)\s*\}\s*$", line)
             if hm:
                 try:
                     raw_hex = bytes.fromhex(hm.group(2))
                     patterns[hm.group(1)] = [re.compile(re.escape(raw_hex))]
+                    continue
                 except ValueError:
                     pass
+            ident = (re.match(r"^(\$[A-Za-z_]\w*)", line) or [None, line[:30]])[1]
+            unsupported.append(f"{ident}: hex joker/atlama/regex dizisi desteklenmiyor")
 
         cond = " ".join(sections["condition"].split())
-        if cond and patterns:
-            parsed.append({
-                "name": rule_name,
-                "source": path.name,
-                "meta": meta,
-                "patterns": patterns,
-                "condition": cond,
-            })
+        if cond:
+            problem = _condition_problem(cond, list(patterns.keys()))
+            if problem:
+                unsupported.append(problem)
+        if not patterns and not unsupported:
+            unsupported.append("hiç dizi (string) yok")
+        parsed.append({
+            "name": rule_name,
+            "source": path.name,
+            "meta": meta,
+            "patterns": patterns,
+            "condition": cond,
+            "unsupported": unsupported,   # non-empty -> the built-in engine skips the rule and says why
+        })
     return parsed
+
+
+_SUPPORTED_STRING_MODS = {"ascii", "wide", "nocase", "fullword", "private"}
+
+
+def _condition_problem(cond: str, ids: List[str]) -> Optional[str]:
+    """Why the built-in evaluator cannot run this condition faithfully, or None.
+    It supports only $vars, 'any/all/N of (them|($a, $b*))', and/or/not and parentheses."""
+    for ref in set(re.findall(r"\$[A-Za-z_]\w*\*?", cond)):
+        base = ref.rstrip("*")
+        if ref.endswith("*"):
+            if not any(i.startswith(base) for i in ids):
+                return f"koşul tanımsız diziye bakıyor: {ref}"
+        elif base not in ids:
+            return f"koşul tanımsız ya da desteklenmeyen diziye bakıyor: {ref}"
+    probe = re.sub(r"\b(any|all|\d+)\s+of\s+(them|\([^)]+\))", " True ", cond, flags=re.I)
+    probe = re.sub(r"\$[A-Za-z_]\w*", " True ", probe)
+    leftover = re.sub(r"\b(?:True|False|and|or|not)\b|[()\s]+", "", probe)
+    if leftover:
+        return f"koşul desteklenmiyor (ör. filesize, uint16, #sayım, @konum, modüller): {cond[:80]}"
+    return None
 
 
 def _eval_builtin_condition(cond: str, hits: Dict[str, bool], all_ids: List[str]) -> bool:
@@ -196,25 +244,47 @@ def _load_ruleset():
     sig = _files_signature(files)
     if sig == _CACHE_KEY and _CACHE_RULES is not None:
         return _CACHE_RULES
+    global _LOAD_PROBLEMS
+    problems: List[str] = []
     if _yara is not None and files:
-        compiled = _yara.compile(filepaths={p.stem: str(p) for p in files})
-        _CACHE_RULES = ("yara-python", compiled, files)
+        # one file at a time: a broken user rule file must not take down the panel or the static stage
+        compiled_list = []
+        for p in files:
+            try:
+                compiled_list.append(_yara.compile(filepath=str(p)))
+            except Exception as e:   # yara.SyntaxError, yara.Error
+                problems.append(f"{p.name}: derlenemedi, atlandı ({str(e)[:160]})")
+        _CACHE_RULES = ("yara-python", compiled_list, files)
     else:
         rules: List[Dict[str, Any]] = []
         for p in files:
-            rules.extend(_parse_yar_file(p))
+            try:
+                for r in _parse_yar_file(p):
+                    if r["unsupported"]:
+                        problems.append(f"{p.name}/{r['name']}: yerleşik motor çalıştıramıyor, atlandı ({'; '.join(r['unsupported'])[:160]})")
+                    else:
+                        rules.append(r)
+            except Exception as e:
+                problems.append(f"{p.name}: okunamadı, atlandı ({str(e)[:160]})")
         _CACHE_RULES = ("builtin", rules, files)
+    _LOAD_PROBLEMS = problems
     _CACHE_KEY = sig
     return _CACHE_RULES
 
 
+_LOAD_PROBLEMS: List[str] = []
+
+
 def rules_status() -> Dict[str, Any]:
     engine, rules, files = _load_ruleset()
-    count = sum(len(_parse_yar_file(p)) for p in files) if engine == "yara-python" else len(rules)
+    count = sum(len(list(c)) for c in rules) if engine == "yara-python" else len(rules)
     return {
         "engine": engine,
         "rules_count": count,
         "files": [p.name for p in files],
+        "problems": list(_LOAD_PROBLEMS),   # skipped files/rules and why; shown in the panel
+        "hint": "" if engine == "yara-python" else
+                "yara-python kurulu değil: yerleşik motor sadece basit kuralları çalıştırır. 'pip install yara-python' önerilir.",
     }
 
 
@@ -225,7 +295,13 @@ def scan_bytes(data: bytes, file_name: str = "") -> List[Dict[str, Any]]:
     engine, rules, _ = _load_ruleset()
     matches: List[Dict[str, Any]] = []
     if engine == "yara-python":
-        for m in rules.match(data=data):
+        found = []
+        for compiled in rules:
+            try:
+                found.extend(compiled.match(data=data, timeout=30))
+            except Exception:   # a slow/odd rule must not fail the analysis
+                continue
+        for m in found:
             meta = dict(getattr(m, "meta", {}) or {})
             matched_strs: List[str] = []
             for s in getattr(m, "strings", ()) or ():

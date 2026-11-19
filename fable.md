@@ -1,8 +1,35 @@
 # wsb-triage — genel inceleme
 
-İnceleme tarihi: 11 Kasım 2026, commit `cb78e43`.
+İlk inceleme: 11 Kasım 2026, commit `cb78e43`. Son güncelleme: 19 Kasım 2026.
 
-Bu belge kodun tamamı okunarak hazırlandı. "Doğrulandı" yazan maddeler kodda ya da küçük bir denemeyle teyit edildi. Hiçbir madde henüz düzeltilmedi.
+Bu belge kodun tamamı okunarak hazırlandı. "Doğrulandı" yazan maddeler kodda ya da küçük bir denemeyle teyit edildi. A bölümünün tamamı, B ve C'nin neredeyse tamamı düzeltildi/yapıldı; her maddenin altında ne yapıldığı yazıyor.
+
+## Durum özeti (19 Kasım 2026)
+
+- **Testler:** 128 test yerelde geçiyor.
+- **CI:** 13 Kasım'daki son GitHub Actions çalışması **başarısızdı** (`test_signatures_are_read`: imza kontrolü CI makinesinde sessizce "Unknown" dönüyordu). Hata artık görünür ve olası neden giderildi (aşağıda D1); CI'nin yeşile dönüp dönmediği bir sonraki gönderimde görülecek.
+- **İkinci inceleme (19 Kasım):** Gemini'nin eklediği B/C değişiklikleri incelendi. Sağlam olanlar: API belirteci, CSP, bildirimler, ekran görüntüsü doğrulaması, sağ tık menüsü, otomatik tıklama, panelde güvenli gösterim. Bulunan dört sorun ve düzeltmeleri **D** bölümünde.
+
+## D. İkinci incelemede bulunanlar (19 Kasım 2026)
+
+### D1. İmza kontrolü sessizce başarısız olabiliyor — ✅ DÜZELTİLDİ
+
+- **Sorun:** PowerShell imza scripti hata verirse (modül yüklenemezse, script çalışmazsa) her dosya sessizce "Unknown", yani imzasız sayılıyordu. CI'de tam olarak bu oldu; kullanıcı bilgisayarında olsaydı raporlar fark edilmeden yanlış olurdu.
+- **Düzeltme:** Script hatayı dosya başına "Error" durumu ve mesajıyla yazıyor; script hiç çalışmazsa PowerShell'in kendi hata metni kaydediliyor; envantere uyarı, sonuç kutusuna not düşülüyor. Windows PowerShell 5.1 tam yoluyla ve miras alınan `PSModulePath` olmadan başlatılıyor (PowerShell 7'nin modül yolu karışmasın diye). **Kök neden kesin değil:** `PSModulePath` teorisi yerelde taklit edilerek yeniden üretilemedi; CI bir sonraki çalışmada başarısız olursa test çıktısı artık PowerShell'in hata mesajını gösterecek.
+
+### D2. Ağ kaydı TLS sunucu adlarını kaybedebiliyordu — ✅ DÜZELTİLDİ
+
+- **Sorun:** B7'de `--pkt-size 0` (paketin tamamı) `512`'ye indirilmiş ve bu "kesilmeyi önlüyor" diye belgelenmişti; `pktmon` yardımına göre `0` tam paket, varsayılan 128 bayttır — yani değişiklik kaydı küçültüyordu. Kuantum sonrası anahtarlı TLS ClientHello 1,5–2 KB'tır ve istemciler uzantı sırasını karıştırır; sunucu adı (SNI) 512 baytın dışında kalabilir.
+- **Düzeltme:** `--pkt-size 4096`: normal paketler ve TLS el sıkışması tam kalıyor, sadece büyük indirmelerin 64 KB'a varan birleştirilmiş paketleri kırpılıyor. Gerçek sandbox kaydıyla doğrulanmadı.
+
+### D3. YARA kuralları sessizce çalışmayabiliyordu — ✅ DÜZELTİLDİ
+
+- **Sorun:** `yara-python` bağımlılıklarda yoktu, yerleşik ayrıştırıcı kullanılıyordu. Bu ayrıştırıcı tek satırlık, etiketli (`rule X : tag`) ya da `private/global` kuralları hiç görmüyor; hex joker/atlama, regex, `filesize`, `uint16`, `#sayım` kullanan kuralları uyarısız "eşleşmedi" sayıyordu. `yara-python` kuruluyken söz dizimi hatalı tek bir `.yar` dosyası `/api/system-status`'u ve statik analizi çökertirdi.
+- **Düzeltme:** `yara-python` `requirements.txt`'e eklendi. Her kural dosyası ayrı derleniyor, bozuk olan atlanıp nedeniyle listeleniyor. Yerleşik motor tek satırlık/etiketli kuralları okuyor, `fullword` destekliyor, çalıştıramadığı kuralı atlayıp nedenini bildiriyor. Panel rozeti yerleşik motor ya da atlanan kural varsa sarı uyarı gösteriyor. Test: depodaki 6 kuralda iki motor birebir aynı sonucu veriyor.
+
+### D4. Bu belge güncel değildi — ✅ DÜZELTİLDİ
+
+- Başlıktaki "Hiçbir madde henüz düzeltilmedi" cümlesi ve CI'nin kırmızı olduğunun yazılmaması düzeltildi (bu bölüm ve yukarıdaki özet).
 
 ## Önce bilinmesi gereken
 
@@ -130,7 +157,7 @@ Bu belge kodun tamamı okunarak hazırlandı. "Doğrulandı" yazan maddeler kodd
 - **Yeni Sandbox komut satırı.** ⏸ *(Kullanıcı isteğiyle şimdilik bekletildi.)* Windows 11 24H2 ve sonrasında `wsb start`, `wsb exec`, `wsb stop` komutları var. Pencere açıp işlem adından durum tahmin etmek yerine bunlar kullanılırsa başlatma, durum sorma ve kapatma güvenilir olur.
 - **Sandbox belleği panelden ayarlanamıyor.** — ✅ DÜZELTİLDİ (Gemini): Panel arayüzüne 2 GB–16 GB RAM seçim kutusu eklendi; backend `pipeline.create_job` ve `sandbox_manager.build_wsb` bellek (1024–65536 MB) ve süre (1–180 dk) değerlerini sınırlandırıp doğrular.
 - **Salt okunur klasörden çalışan kurulumlar.** — ✅ DÜZELTİLDİ (Gemini): 1 GB üstü kurulumlar `in-place` çalıştırıldığında `compute_verdict` rapora uyarı ekler; `sanitize_sandbox_json` `RunMode`/`Target` alanlarını stringe zorlayarak tip zehirlenmesini engeller.
-- **Ağ kaydı tavanı.** — ✅ DÜZELTİLDİ (Gemini): `Inside-Sandbox.ps1` içindeki `pktmon start` komutuna `--pkt-size 512` eklendi (Windows `pktmon` varsayılanı olan 128 byte'ta HTTP/TLS SNI başlıklarının kesilmesini önlerken tam paketlerin 2 GB kaydı gereksiz şişirmesini 512 byte ile sınırlar). *Not: Çok büyük indirmelerde 2 GB döngüsel tampon hâlâ dolabilir.*
+- **Ağ kaydı tavanı.** — ✅ DÜZELTİLDİ (Gemini; değer D2'de 4096'ya çıkarıldı, aşağıdaki açıklamadaki 512 gerekçesi yanlıştı): `Inside-Sandbox.ps1` içindeki `pktmon start` komutuna `--pkt-size 512` eklendi (Windows `pktmon` varsayılanı olan 128 byte'ta HTTP/TLS SNI başlıklarının kesilmesini önlerken tam paketlerin 2 GB kaydı gereksiz şişirmesini 512 byte ile sınırlar). *Not: Çok büyük indirmelerde 2 GB döngüsel tampon hâlâ dolabilir.*
 - **Rapor dili ve biçimi.** — ✅ DÜZELTİLDİ (Gemini): HTML (`report.html`) ve JSON (`state.json`) dışa aktarma eklendi. `write_html_report` tüm düz metin, liste, kod/kalın blokları ve tablo linklerini XSS'e karşı temizler (`javascript:` engelli); `report?format=html` betiksiz (`default-src 'none'; style-src 'unsafe-inline'`) CSP ile sunulur.
 - **Yerel API'de kimlik doğrulama yok.** — ✅ DÜZELTİLDİ (Gemini): Tüm `/api/*` uç noktaları (`GET` dahil; yalnızca `/api/health` ve `/api/auth` hariç) ve `GET /` rastgele `API_TOKEN` ile korunur; yetkisiz `GET /` token veya çerez sızdırmaz (`401`). `Baslat.bat` `%LOCALAPPDATA%\SafeBox\session.token` üzerinden tek tıkla otomatik oturum açar; tarayıcı/API istekleri `X-SafeBox-Token` ve `HttpOnly; SameSite=Strict` çerezle doğrulanır.
 
@@ -206,7 +233,7 @@ Gemini imzalı önceki adımlar tek tek denetlendiğinde tespit edilen hatalar v
 - **Statik CSS & Canlı Tarayıcı Testi (Headless Edge + Playwright):** Tüm HTML/JS sınıfları statik `static/styles.css` içinde doğrulandı (eksik `.block` sınıfı eklendi); canlı yerel sunucuda yetkisiz `401` kilit ekranı, yanlış/doğru belirteç akışı, `/?token=` yönlendirmesi, `YARA (6 kural)` rozeti, sağ tık menü düğmesi (`#btnCtxMenu`), sahte kullanıcı hareketi (`#optSimUser`) ve bildirim (`#optNotify`) seçenekleri, `Karşılaştır` ve `MalwareBazaar / Hybrid Analysis` modalları, `CSV / STIX 2.1` IOC indirme bağlantıları, sıkı CSP ile satır içi `<script>` engellemesi, normal UI akışında `0` konsol hatası/uyarısı ve `report?format=html` render'ı doğrulandı (`static/screenshot.png` güncellendi).
 - **Kalan açık noktalar:**
   1. **B4 (`wsb` CLI):** Kullanıcı isteği üzerine (`web cli kalsın şimdilik`) atlandı ve bekletildi.
-  2. **Gerçek Windows Sandbox içi deneme:** Bu makinede `WindowsSandbox.exe` etkin olmadığı için gerçek Sandbox açıldıktan/yeniden başlatıldıktan sonra `Inside-Sandbox.ps1` (ekran görüntüsü, sahte kullanıcı hareketi, işlem-ağ eşleme, `pktmon` + `--pkt-size 512`) ve Defender davranışı canlı doğrulanmayı bekliyor.
+  2. **Gerçek Windows Sandbox içi deneme:** Bu makinede `WindowsSandbox.exe` etkin olmadığı için gerçek Sandbox açıldıktan/yeniden başlatıldıktan sonra `Inside-Sandbox.ps1` (ekran görüntüsü, sahte kullanıcı hareketi, işlem-ağ eşleme, `pktmon` + `--pkt-size 4096`) ve Defender davranışı canlı doğrulanmayı bekliyor.
 
 ### 4. Yeni Özellik Uygulamaları (Bölüm C — Gemini)
 

@@ -156,8 +156,33 @@ def test_signatures_are_read(tmp_path, unsigned_exe):
     bad = str(unsigned_exe(tmp_path / "w.exe"))
     res, timed_out = pipeline.check_signatures(tmp_path, [good, bad])
     assert timed_out == 0
-    assert res[good]["status"] == "Valid"
+    assert res[good]["status"] == "Valid", res[good]          # on failure, show PowerShell's own error text
     assert res[bad]["status"] != "Valid"
+
+
+@windows_only
+def test_signature_check_failure_is_loud(tmp_path, monkeypatch):
+    """If PowerShell cannot run the check, files get status 'Error' with the reason - never a silent 'Unknown'."""
+    real_run = subprocess.run
+
+    def broken(args, **kw):
+        if any("_sigcheck.ps1" in str(a) for a in args):
+            return real_run(args[:1] + ["-NoProfile", "-Command", "[Console]::Error.WriteLine('module could not be loaded'); exit 1"], **kw)
+        return real_run(args, **kw)
+
+    monkeypatch.setattr(pipeline.subprocess, "run", broken)
+    f = str(Path(sbm.WSB_EXE).parent / "whoami.exe")
+    res, _ = pipeline.check_signatures(tmp_path, [f])
+    assert res[f]["status"] == "Error"
+    assert "module could not be loaded" in res[f]["message"]
+
+
+def test_signature_errors_reach_the_verdict(tmp_path):
+    job = bare_job(tmp_path)
+    job.state["status"] = "done"
+    job.state["inventory"] = {"sig_errors": 5, "sig_error_msg": "Microsoft.PowerShell.Security yuklenemedi"}
+    pipeline.compute_verdict(job)
+    assert any("imzası kontrol edilemedi" in n for n in job.state["verdict"]["notes"])
 
 
 def test_in_place_run_mode_note_and_non_string_safety(tmp_path):

@@ -486,9 +486,12 @@ $captureStatus = 'not started'
 if ($isAdmin -and -not $TestMode) {
     & pktmon.exe stop 2>&1 | Out-Null
     & pktmon.exe filter remove 2>&1 | Out-Null
-    # --pkt-size 512 prevents capture file from filling up quickly during large downloads
-    $o = & pktmon.exe start --capture --comp nics --pkt-size 512 --file-name $etl --file-size 2048 2>&1
-    if ($LASTEXITCODE -eq 0) { $captureStatus = 'running'; Log 'pktmon capture started (pkt-size 512, max 2GB)' } else { $captureStatus = "pktmon failed: $($o -join ' ')"; Log $captureStatus }
+    # --pkt-size 4096: every normal packet (<= ~1514 bytes) and a full TLS ClientHello (1.5-2 KB with post-quantum
+    # key shares; SNI can sit anywhere because clients shuffle extensions) are kept whole. Only the huge offloaded
+    # segments of big downloads (up to 64 KB) are cut, which keeps the 2 GB ring buffer from filling quickly.
+    # (512 bytes was too short: the server name of modern TLS connections could be lost.)
+    $o = & pktmon.exe start --capture --comp nics --pkt-size 4096 --file-name $etl --file-size 2048 2>&1
+    if ($LASTEXITCODE -eq 0) { $captureStatus = 'running'; Log 'pktmon capture started (pkt-size 4096, max 2GB)' } else { $captureStatus = "pktmon failed: $($o -join ' ')"; Log $captureStatus }
 } else { $captureStatus = 'skipped (not admin or test mode)'; Log "Capture $captureStatus" }
 
 $procmon = $null

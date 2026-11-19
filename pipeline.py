@@ -639,20 +639,43 @@ def stage_extract(job: Job) -> None:
 
 
 # ======================================================================== 2. inventory
+# Failures must be loud: a check that silently returns nothing makes every program look unsigned.
 SIGCHECK_PS1 = r"""param([string]$ListFile, [string]$OutFile)
-$ErrorActionPreference = 'SilentlyContinue'
+$ErrorActionPreference = 'Stop'
+$fatal = $null
+try { Import-Module Microsoft.PowerShell.Security -ErrorAction Stop }
+catch { $fatal = "Microsoft.PowerShell.Security yuklenemedi: " + $_.Exception.Message }
 $out = New-Object System.Collections.ArrayList
 foreach ($p in [IO.File]::ReadAllLines($ListFile)) {
     if (-not $p) { continue }
-    $s = Get-AuthenticodeSignature -LiteralPath $p
-    $signer = ''; $issuer = ''
-    if ($s -and $s.SignerCertificate) { $signer = $s.SignerCertificate.Subject; $issuer = $s.SignerCertificate.Issuer }
-    $st = 'Unknown'; $msg = ''
-    if ($s) { $st = [string]$s.Status; $msg = $s.StatusMessage }
+    $st = 'Error'; $msg = ''; $signer = ''; $issuer = ''
+    if ($fatal) { $msg = $fatal }
+    else {
+        try {
+            $s = Get-AuthenticodeSignature -LiteralPath $p -ErrorAction Stop
+            $st = [string]$s.Status; $msg = [string]$s.StatusMessage
+            if ($s.SignerCertificate) { $signer = $s.SignerCertificate.Subject; $issuer = $s.SignerCertificate.Issuer }
+        } catch { $msg = "Get-AuthenticodeSignature: " + $_.Exception.Message }
+    }
     [void]$out.Add([pscustomobject]@{ Path = $p; Status = $st; Message = $msg; Signer = $signer; Issuer = $issuer })
 }
 [IO.File]::WriteAllText($OutFile, (ConvertTo-Json -InputObject @($out) -Depth 3 -Compress), (New-Object System.Text.UTF8Encoding($false)))
 """
+
+
+def _windows_powershell() -> List[str]:
+    """Windows PowerShell 5.1 by full path, so a PowerShell 7 on PATH can't be picked up instead."""
+    exe = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    return [str(exe) if exe.exists() else "powershell"]
+
+
+def _windows_powershell_env() -> Dict[str, str]:
+    """Environment without an inherited PSModulePath. When the panel is started from PowerShell 7 (or on CI runners),
+    PSModulePath lists PowerShell 7 module folders, and Windows PowerShell 5.1 may load their incompatible copy of
+    Microsoft.PowerShell.Security. Without the variable, 5.1 uses its own default module path."""
+    env = dict(os.environ)
+    env.pop("PSModulePath", None)
+    return env
 
 
 def check_signatures(case_dir: Path, paths: List[str], progress=None):
@@ -672,12 +695,22 @@ def check_signatures(case_dir: Path, paths: List[str], progress=None):
             lst.write_text("\n".join(batch), encoding="utf-8-sig")
             out.unlink(missing_ok=True)
             try:
-                subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps1), "-ListFile", str(lst), "-OutFile", str(out)],
-                               capture_output=True, timeout=max(120, len(batch) // 2), creationflags=NO_WINDOW)
+                proc = subprocess.run(_windows_powershell() + ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps1),
+                                                                 "-ListFile", str(lst), "-OutFile", str(out)],
+                                      capture_output=True, text=True, errors="replace", env=_windows_powershell_env(),
+                                      timeout=max(120, len(batch) // 2), creationflags=NO_WINDOW)
             except subprocess.TimeoutExpired:
                 timed_out += len(batch)
                 continue
-            for item in _read_json(out) or []:
+            items = _read_json(out)
+            if not isinstance(items, list):
+                # the script itself did not run (or crashed before writing): keep PowerShell's own error text
+                why = ((proc.stderr or "") + (proc.stdout or "")).strip().splitlines()
+                detail = " ".join(why[-3:])[:400] or f"çıkış kodu {proc.returncode}"
+                for p in batch:
+                    res[p] = {"status": "Error", "message": f"PowerShell imza kontrolü çalışmadı: {detail}", "signer": "", "issuer": ""}
+                continue
+            for item in items:
                 res[item["Path"]] = {"status": item.get("Status") or "Unknown", "message": item.get("Message") or "",
                                      "signer": item.get("Signer") or "", "issuer": item.get("Issuer") or ""}
     finally:
@@ -735,6 +768,9 @@ def stage_inventory(job: Job) -> None:
         job.case_dir, to_sign, lambda done, total: job.stage("inventory", "running", f"Dijital imza: {done} / {total} dosya"))
     if sig_timeouts:
         job.log(f"UYARI: {sig_timeouts} dosyanın imza kontrolü zaman aşımına uğradı; bunlar 'Unknown' (imzasız gibi) sayıldı.")
+    sig_errors = [v for v in sigs.values() if v.get("status") == "Error"]
+    if sig_errors:
+        job.log(f"UYARI: {len(sig_errors)} dosyanın dijital imzası kontrol edilemedi: {sig_errors[0]['message'][:300]}")
     for r in items:
         if r["path"] in sigs:
             r["sig"] = sigs[r["path"]]
@@ -752,6 +788,7 @@ def stage_inventory(job: Job) -> None:
     missing = [r for r in items if r["missing"]]
     job.state["inventory"] = {
         "files": len(items), "pe": len(pe), "unsigned": len(unsigned), "hash_mismatch": len(mismatch), "missing": len(missing),
+        "sig_errors": len(sig_errors), "sig_error_msg": sig_errors[0]["message"][:300] if sig_errors else "",
         "original_sha256": original["sha256"] if original else None,
         "unsigned_list": [{"rel": r["rel"], "status": (r["sig"] or {}).get("status", "Unknown"), "sha256": r["sha256"]} for r in unsigned[:80]],
         "missing_list": [r["rel"] for r in missing[:50]],
@@ -1590,6 +1627,9 @@ def compute_verdict(job: Job) -> None:
         red.append(f"{inv['missing']} dosya açıldıktan sonra kayboldu — büyük ihtimalle Windows Defender karantinaya aldı.")
     if inv.get("hash_mismatch"):
         notes.append(f"{inv['hash_mismatch']} dosyanın imzası bozuk (HashMismatch) — orijinal dosya sonradan değiştirilmiş (crack/yama).")
+    if inv.get("sig_errors"):
+        notes.append(f"{inv['sig_errors']} dosyanın dijital imzası kontrol edilemedi, bu yüzden imzasız sayıldı "
+                     f"(imza sonuçları güvenilir değil): {inv.get('sig_error_msg', '')}")
     for st in s.get("static") or []:
         crit = [f["category"] for f in st.get("string_findings", []) if f.get("severity") == "critical"]
         if not crit:
