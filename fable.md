@@ -4,11 +4,12 @@
 
 Bu belge kodun tamamı okunarak hazırlandı. "Doğrulandı" yazan maddeler kodda ya da küçük bir denemeyle teyit edildi. A bölümünün tamamı, B ve C'nin neredeyse tamamı düzeltildi/yapıldı; her maddenin altında ne yapıldığı yazıyor.
 
-## Durum özeti (19 Kasım 2026)
+## Durum özeti (20 Kasım 2026)
 
-- **Testler:** 128 test yerelde geçiyor.
+- **Testler:** **149 test** (`149 passed, 0 skipped, 0 failed` — `python -m pytest -v`) yerelde geçiyor (`128` mevcut + `21` yeni E1–E17 regresyon testi), ayrıca `node --check static/app.js` ve PowerShell 5.1 AST/ASCII kontrolleri temiz.
 - **CI:** 13 Kasım'daki son GitHub Actions çalışması **başarısızdı** (`test_signatures_are_read`: imza kontrolü CI makinesinde sessizce "Unknown" dönüyordu). Hata artık görünür ve olası neden giderildi (aşağıda D1); CI'nin yeşile dönüp dönmediği bir sonraki gönderimde görülecek.
 - **İkinci inceleme (19 Kasım):** Gemini'nin eklediği B/C değişiklikleri incelendi. Sağlam olanlar: API belirteci, CSP, bildirimler, ekran görüntüsü doğrulaması, sağ tık menüsü, otomatik tıklama, panelde güvenli gösterim. Bulunan dört sorun ve düzeltmeleri **D** bölümünde.
+- **Üçüncü inceleme (19–20 Kasım):** Kodda kalan somut hatalar/kopukluklar ve projenin temel amacına (ön tespit + alternatif ortamda çalıştırma) yönelik eksik özellikler **E** bölümüne eklendi; **E1–E17 maddelerinin tamamı uygulandı** (`E7` canlı WSB ve `E8` canlı VirtualBox misafir çalıştırması kod + mock testleri itibarıyla tamamlanmış olup canlı uçtan uca çalıştırma ortam/VM kurulumu beklemektedir).
 
 ## D. İkinci incelemede bulunanlar (19 Kasım 2026)
 
@@ -252,3 +253,56 @@ Gemini imzalı önceki adımlar tek tek denetlendiğinde tespit edilen hatalar v
 
 - **`static/styles.css`:** Eksik olan `.block { display: block; }` kuralı eklendi; tüm `index.html`, `auth.html` ve `app.js` sınıfları statik olarak doğrulandı.
 - **`README.md`, `README.tr.md` & `static/screenshot.png`:** B1–B3, B5–B9 ve C1–C12 özellikleri hem İngilizce hem Türkçe README belgelerine ve güncel ekran görüntüsüne işlendi.
+
+---
+
+## E. Üçüncü İnceleme — Açık Hatalar ve Eksik Özellikler (19–20 Kasım 2026)
+
+Bu bölümdeki açık hata ve eksik özellik maddelerinin (**E1–E17**) tamamı 20 Kasım 2026 tarihinde koda uygulanmış, CSP/CSS uyumluluğu ve **149 testlik** pytest paketiyle doğrulanmıştır (`E7` canlı WSB ve `E8` canlı VirtualBox misafir çalıştırması dışında — bunların kod ve mock testleri tam olup canlı ortam doğrulaması hostta Sandbox özelliğinin açılmasını veya VM misafir oturum bilgilerini beklemektedir).
+
+### 1. Kodda Tespit Edilen Açık Hatalar ve Kopukluklar
+
+- **E1. YARA eşleşmeleri ve yüksek statik risk puanı nihai karara (`verdict`) yansımıyor — ✅ UYGULANDI:**
+  - `compute_verdict` artık kritik/yüksek YARA eşleşmelerini, `spoof_flags` (kritik/yüksek), `format_findings` (yüksek/kritik) ve imzasız yüksek statik risk puanlarını (`>= 75` kırmızı, `>= 65` sarı not) doğrudan karara işliyor (`tests/test_verdict.py` ile doğrulandı).
+- **E2. IOC dışa aktarmada statik SHA-256 yanlış anahtardan okunuyor — ✅ UYGULANDI:**
+  - `collect_iocs`, `st.get("sha256") or (st.get("hashes") or {}).get("sha256")` ile statik sonuçtaki gerçek iç içe SHA-256 hash'ini ve `interesting_ips` IPv4 IOC'lerini CSV/STIX 2.1 çıktısına aktarıyor (`tests/test_verdict.py` ile doğrulandı).
+- **E3. Sandbox'ın topladığı 3 yüksek sinyalli davranış alanı kullanılmıyor — ✅ UYGULANDI:**
+  - `Files.ModifiedExecutables`, `Network.NewListening` ve `Hosts.Removed` artık `compute_verdict`, `write_report`, `compare_jobs` ve `static/app.js` sandbox panelinde tam olarak işleniyor (`tests/test_verdict.py` ile doğrulandı).
+- **E4. Statik dosya kartlarındaki VirusTotal rozetleri canlı güncellenmiyor — ✅ UYGULANDI:**
+  - `static/app.js` içinde `renderedStaticKey` VT durum/sonuç özetini de içeriyor; VT sorguları tamamlandığında statik dosya kartları sayfa yenilenmeden anında güncelleniyor.
+- **E5. Sandbox'ta bırakılan (`DroppedHashes`) dosyalar MalwareBazaar / Hybrid Analysis yedeğine düşmüyor — ✅ UYGULANDI:**
+  - `_check_dropped_files_vt` artık VT anahtarı yokken, VT'de kayıt bulunamadığında veya VT kotası dolduğunda `intel_client.query_hash_intel` (MalwareBazaar / Hybrid Analysis) yedeğini çalıştırıyor (`tests/test_virustotal.py` ile doğrulandı).
+- **E6. Küçük kod ve arayüz tutarsızlıkları — ✅ UYGULANDI:**
+  - `extract_interesting_ips` eklendi (sürüm dizgelerini ve yerel/bogon adresleri filtreleyip ham C2 IP:port çıkarır); PE `architecture`, `compile_time` (`IMAGE_DEBUG_TYPE_REPRO` desteğiyle), `sections` (bölüm entropileri/RWX) ve `total_imports` panelde ve raporda gösteriliyor; `analyzer.scan_path` zip-slip/boyut koruması eklendi; API Ayarları penceresi maskelenmiş VT/MB/HA anahtarlarını ve temizleme düğmelerini (`clear_vt`/`clear_mb`/`clear_ha`) destekliyor; `simulate_user` varsayılanı frontend ve backend'de `True` olarak eşlendi (`tests/test_static.py`, `tests/test_app.py`).
+
+### 2. Alternatif Ortamda Çalıştırma & Dinamik Analiz Eksikleri
+
+- **E7. Gerçek Windows Sandbox uçtan uca doğrulaması ve `wsb.exe` CLI (Windows 11 24H2/25H2) — ✅ KOD & TESTLER TAMAMLANDI (canlı ortam beklemede):**
+  - `sandbox_manager.py` içine `wsb_cli_path`, `windows_sandbox_available`, `wsb_list_ids` (JSON + metin ayrıştırma) ve `wsb start --config` destekli `launch_sandbox` / oturum ID bazlı `stop_sandbox` eklendi; mock testleri geçiyor (`tests/test_sandbox_files.py`). Bu makinede `windows_sandbox_enabled: False` olduğu için canlı Sandbox uçtan uca çalıştırması özelliğin etkinleştirilip yeniden başlatılmasını bekliyor.
+- **E8. VirtualBox (alternatif VM) çalıştırma arka ucu — ✅ KOD & TESTLER TAMAMLANDI (canlı ortam beklemede):**
+  - `sandbox_manager.py`, `pipeline.py`, `app.py` ve web arayüzüne `vbox` arka ucu eklendi: snapshot listeleme (`/api/vbox/snapshots/{vm}`), temiz snapshot geri yükleme, pano/sürükle-bırak/USB izolasyonu, geçici paylaşılan klasörler (`sb_input`, `sb_tools`, `sb_output`), `guestcontrol` üzerinden `Inside-Sandbox.ps1` çalıştırma ve bitişte VM kapatıp snapshot'a döndürme; `vbox_password` yalnızca bellek içi `Job` nesnesinde tutulur (`state.json`/API'ye asla yazılmaz). Mock testleri geçiyor (`tests/test_sandbox_files.py`); canlı VM testi için misafir oturum bilgisi olan kurulu bir Windows VM gereklidir.
+- **E9. Sonradan Sandbox başlatırken hedef ve seçenek belirlenemiyor — ✅ UYGULANDI:**
+  - `list_runnable_targets` + `/api/jobs/{id}` (`runnable_targets`) + `/api/jobs/{id}/sandbox` (`SandboxStartRequest` geçersiz kılmaları) ve panelde *"Sandbox Ayarlarını Seç ve Başlat"* modalı eklendi (`tests/test_app.py`).
+- **E10. Desteklenmeyen çalıştırma dosya türleri ve CLI argümanı eksikliği — ✅ UYGULANDI:**
+  - `Inside-Sandbox.ps1` ve hedef seçicisi `.dll` (`rundll32.exe` / `regsvr32` + isteğe bağlı export adı), `.vbe`, `.jse`, `.wsf`, `.pif`, `.jar`, `.reg` uzantılarını, özel CLI argümanlarını (`TargetArgs`) ve standart kullanıcı (`runas.exe /trustlevel:0x20000`) seçeneğini destekliyor (`tests/test_sandbox_files.py`).
+- **E11. LAN engelinde `$gw` istisnası ve Sandbox içi yönetici yetkisi riski — ✅ UYGULANDI:**
+  - `Inside-Sandbox.ps1` içinde `$gw` genel LAN muafiyetinden çıkarıldı; özel ağdaki DNS IP'leri için yalnızca port 53 açık bırakılıp `1-52, 54-65535` TCP/UDP portları `SafeBox-BlockDNS-TCP` / `SafeBox-BlockDNS-UDP` ile engellendi; `fe80::/10` IPv6 link-local engeli eklendi; `RunAsStandardUser` seçeneği eklendi (`tests/test_sandbox_files.py`).
+- **E12. Dinamik izleme kör noktaları — ✅ UYGULANDI:**
+  - Döngü 1 sn yoklamaya çekildi; Event ID 4688 komut satırı denetimi (`Import-AuditProcesses`), belge/cüzdan honeyfile yemleri (`Initialize-Honeyfiles` / `Check-Honeyfiles`), `Documents` tarama yolu, gizlenmiş pencere başlığı (`Windows Update Service`) + rastgele fare hareketi, WMI abonelikleri/COM hijacking/`AppInit_DLLs`/BITS/PowerShell profilleri/ActiveSetup, UDP/QUIC SNI ve DoH tespiti, bırakılan dosyalarda imza/entropi/bayrak kontrolü ve `procmon_summary.json` çıkarımı eklendi (`tests/test_verdict.py`, `tests/test_sandbox_files.py`, `tests/test_app.py`).
+
+### 3. Çalıştırmadan Önce Tespit (Statik Analiz) Eksikleri
+
+- **E13. .NET (CLR) zararlıları için analiz eksikliği — ✅ UYGULANDI:**
+  - `is_dotnet` (CLR veri dizini kontrolü) ve `_analyze_dotnet_strings` (Reflection yükleme, P/Invoke bellek müdahalesi, DPAPI tarayıcı/cüzdan çözme, ConfuserEx vb. obfuscator izleri) eklendi (`tests/test_static.py`).
+- **E14. PE yapısal anomalileri ve 25 MB okuma sınırı — ✅ UYGULANDI:**
+  - `imphash`, gerçek sıfır olmayan TLS callback işaretçisi, `DELAY_IMPORT`, RWX bölüm bayrakları, `VirtualSize >> RawSize`, anormal giriş noktası bölümü, düşük import sayısı, `IMAGE_DIRECTORY_ENTRY_SECURITY` hariç tutulan overlay/file-pumping analizleri ve 25 MB üzerindeki dosyalarda son 4 MB kuyruk (tail) string/YARA/PyInstaller/Inno taraması eklendi (`tests/test_static.py`).
+- **E15. Script deobfuscation ve güvenli kod/metin/hex önizleyici eksikliği — ✅ UYGULANDI:**
+  - `deobfuscate_script` (PowerShell `-enc` Base64 UTF-16LE/UTF-8 ve Batch `^` kaçış temizliği; çözülen komutları string/YARA/URL/IP taramasına geri besler) ve yol dışına taşmayı engelleyen `/api/jobs/{id}/preview` (Metin / Dizge / Hex önizleme penceresi) eklendi (`tests/test_static.py`, `tests/test_app.py`).
+- **E16. Ek zararlı dosya/paket biçimleri ve uzantı kandırmacası tespiti — ✅ UYGULANDI:**
+  - Saf Python `parse_lnk` (MS-SHLLINK + LOLBin tespiti), OOXML/OLE2 makro/harici `.rels`/gömülü çalıştırılabilir incelemesi, PDF `/Launch`/`/OpenAction`/`/JavaScript` taraması, `_unpack_asar` Electron ASAR açıcı (path-traversal korumalı), Inno Setup desteği ve `detect_spoofing` (RLO `U+202E`, çift uzantı, `MZ` başlıklı sahte belge/medya) eklendi; belgelerin (`.pdf` vb.) gizlilik gereği VT'ye yüklenmeme garantisi korundu (`tests/test_static.py`, `tests/test_extract.py`, `tests/test_virustotal.py`).
+- **E17. YARA kural kapsamı ve arayüz yönetimi — ✅ UYGULANDI:**
+  - `rules/safebox_builtin.yar` 16 yerleşik kurala çıkarıldı (Crypto Miner, Reverse Shell PS, LSASS Dump, AMSI/ETW Bypass, Office Macro, PDF Action, Clipboard Hijacker, WMI Subscription, UAC Bypass, .NET Loader eklendi); `yara_scanner.py` içindeki dize içi `//` yorum kesme ve motor önbellek anahtarı hataları düzeltildi; `safebox_builtin.yar` salt-okunur korunarak özel `.yar` kural CRUD API'si (`/api/yara/rules*`) ve panel yöneticisi eklendi (`tests/test_static.py`, `tests/test_app.py`).
+
+### 4. Uygulama Durumu Özeti
+
+- Tüm **E1–E17** maddeleri uygulanmış ve test kapsamına alınmıştır. Kalan tek ortam bağımlı adım, hedef makinede isteğe bağlı olarak Windows Sandbox özelliğini etkinleştirmek (`E7`) ve/veya temiz bir VirtualBox Windows VM snapshot'ı hazırlamaktır (`E8`).

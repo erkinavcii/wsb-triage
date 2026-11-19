@@ -50,3 +50,112 @@ def test_script_has_pkt_size_and_dropped_hashes():
     assert "DroppedHashes" in ps
     assert "Capture-Screen" in ps
     assert "Invoke-FakeUser" in ps
+
+
+def test_script_hardening_honeyfiles_audit_and_extended_types():
+    ps = (ROOT / "sandbox" / "Inside-Sandbox.ps1").read_text(encoding="utf-8")
+    # E10: extended file types & Standard User & DLL exports & CLI args
+    for ext in (".dll", ".reg", ".jar", ".vbe", ".jse", ".wsf", ".pif"):
+        assert ext in ps
+    assert "rundll32.exe" in ps
+    assert "RunAsStandardUser" in ps and "0x20000" in ps
+    assert "TargetArgs" in ps and "DllExport" in ps
+
+    # E11: gateway is NOT exempted on all ports; DNS restricted to port 53; IPv6 link-local blocked
+    assert "SafeBox-BlockDNS-TCP" in ps
+    assert "SafeBox-BlockDNS-UDP" in ps
+    assert "'1-52'" in ps and "'54-65535'" in ps
+    assert "fe80::/10" in ps
+    assert "$exempt += $gw" not in ps
+
+    # E12: honeyfiles, 4688 audit, disguised title, WMI/COM/BITS/PSProfile persistence
+    assert "Windows Update Service" in ps
+    assert "Initialize-Honeyfiles" in ps and "Check-Honeyfiles" in ps
+    assert "Import-AuditProcesses" in ps and "4688" in ps
+    assert "WmiSubscriptions" in ps and "BitsJobs" in ps and "PsProfiles" in ps
+    assert "procmon_summary.json" in ps
+
+
+def test_e7_wsb_cli_mock(tmp_path, monkeypatch):
+    import time
+    import sandbox_manager as sbm
+    calls = []
+    wsb_file = tmp_path / "run.wsb"
+    wsb_file.write_text("<Configuration/>", encoding="utf-8")
+    gid_1 = "11111111-2222-3333-4444-555555555555"
+    gid_2 = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+    def fake_run(args, timeout=30):
+        calls.append(args)
+        if args[1:3] == ["list", "--raw"]:
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps([{"Id": gid_1}]), stderr="")
+        if args[1:3] == ["start", "--config"]:
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps({"Id": gid_2}), stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(sbm, "wsb_cli_path", lambda: "wsb.exe")
+    monkeypatch.setattr(sbm, "_run", fake_run)
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+
+    assert sbm.wsb_list_ids() == [gid_1]
+    assert sbm.launch_sandbox(wsb_file) == gid_2
+    assert any(c[1:3] == ["start", "--config"] for c in calls)
+    sbm.stop_sandbox(gid_2)
+    assert any(c == ["wsb.exe", "stop", "--id", gid_2] for c in calls)
+
+
+def test_e8_virtualbox_backend_mock_and_password_never_persisted(tmp_path, monkeypatch):
+    import time
+    import sandbox_manager as sbm
+    import pipeline
+
+    calls = []
+
+    def fake_run(args, timeout=30):
+        calls.append(args)
+        sub = args[1] if len(args) > 1 else ""
+        if sub == "snapshot" and len(args) > 3 and args[3] == "list":
+            return subprocess.CompletedProcess(args, 0, stdout='SnapshotName="SafeBox_Temiz_2026"\n', stderr="")
+        if sub == "showvminfo":
+            return subprocess.CompletedProcess(args, 0, stdout='VMState="poweroff"\n', stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(sbm, "vbox_manage_path", lambda: r"C:\VirtualBox\VBoxManage.exe")
+    monkeypatch.setattr(sbm, "_run", fake_run)
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+
+    in_d, tools_d, out_d = tmp_path / "in", tmp_path / "tools", tmp_path / "out"
+    for d in (in_d, tools_d, out_d):
+        d.mkdir()
+
+    snap = sbm.vbox_start_analysis(
+        vm_name="Win10Test", snapshot_name="", input_dir=in_d, tools_dir=tools_d, output_dir=out_d,
+        network=False, guest_user="analyst", guest_pass="super-secret-vm-pw",
+    )
+    assert snap == "SafeBox_Temiz_2026"
+    assert any(c[1:4] == ["snapshot", "Win10Test", "restore"] for c in calls)
+    assert any(c[1:3] == ["startvm", "Win10Test"] for c in calls)
+    assert any("sb_input" in c and "--readonly" in c for c in calls)
+    assert any("sb_output" in c and "--readonly" not in c for c in calls)
+    assert any("guestcontrol" in c and "Inside-Sandbox.ps1" in " ".join(c) for c in calls)
+
+    calls.clear()
+    sbm.vbox_stop_and_restore("Win10Test", snap)
+    assert any(c[1:4] == ["controlvm", "Win10Test", "poweroff"] for c in calls)
+    assert any(c[1:4] == ["snapshot", "Win10Test", "restore"] for c in calls)
+
+    # Snapshot missing must raise
+    monkeypatch.setattr(sbm, "list_vbox_snapshots", lambda _vm: [])
+    with pytest.raises(RuntimeError, match="temiz snapshot"):
+        sbm.vbox_start_analysis("Win10Test", "", in_d, tools_d, out_d, False, "analyst", "pw")
+
+    # VBox password is kept only in Job memory, NEVER persisted in state.json or snapshot()
+    sample = tmp_path / "sample.bat"
+    sample.write_text("echo ok\n", encoding="utf-8")
+    monkeypatch.setattr(pipeline.threading, "Thread", lambda *a, **kw: type("T", (), {"start": lambda self: None})())
+    job = pipeline.create_job(str(sample), {"vbox_user": "analyst", "vbox_password": "secret-vbox-pw-999", "run_sandbox": False})
+    assert job.vbox_password == "secret-vbox-pw-999"
+    state_disk = (job.case_dir / "state.json").read_text(encoding="utf-8")
+    assert "secret-vbox-pw-999" not in state_disk
+    assert "vbox_password" not in job.snapshot().get("options", {})
+

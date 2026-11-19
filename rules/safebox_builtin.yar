@@ -101,3 +101,167 @@ rule SafeBox_Patch_Keygen_Artifacts
     condition:
         any of ($p*) and any of ($m*)
 }
+
+rule SafeBox_Crypto_Miner_Indicators
+{
+    meta:
+        description = "Cryptocurrency miner stratum pool or XMRig indicators"
+        severity = "high"
+        score = 25
+    strings:
+        $m1 = "stratum+tcp://" ascii wide nocase
+        $m2 = "xmrig" ascii wide nocase fullword
+        $m3 = "cryptonight" ascii wide nocase
+        $m4 = "moneroocean" ascii wide nocase
+        $m5 = "donate-level" ascii wide nocase
+        $m6 = "randomx" ascii wide nocase fullword
+    condition:
+        2 of them
+}
+
+rule SafeBox_Reverse_Shell_PowerShell
+{
+    meta:
+        description = "PowerShell TCP socket reverse shell pattern"
+        severity = "critical"
+        score = 35
+    strings:
+        $t = "Net.Sockets.TCPClient" ascii wide nocase
+        $s1 = "GetStream" ascii wide nocase
+        $s2 = "StreamReader" ascii wide nocase
+        $e1 = "Invoke-Expression" ascii wide nocase
+        $e2 = "IEX" ascii wide nocase fullword
+    condition:
+        $t and any of ($s*) and any of ($e*)
+}
+
+rule SafeBox_LSASS_Credential_Dump
+{
+    meta:
+        description = "Attempts to dump LSASS memory or credentials"
+        severity = "critical"
+        score = 35
+    strings:
+        $k = "sekurlsa::" ascii wide nocase
+        $m1 = "MiniDumpWriteDump" ascii wide nocase
+        $m2 = "lsass" ascii wide nocase fullword
+        $c1 = "comsvcs.dll" ascii wide nocase
+        $c2 = "MiniDump" ascii wide nocase
+    condition:
+        $k or ($m1 and $m2) or ($c1 and $c2)
+}
+
+rule SafeBox_AMSI_ETW_Bypass
+{
+    meta:
+        description = "AMSI or ETW memory patching indicators"
+        severity = "high"
+        score = 25
+    strings:
+        $a = "AmsiScanBuffer" ascii wide nocase
+        $ai = "amsiInitFailed" ascii wide nocase
+        $etw = "EtwEventWrite" ascii wide nocase
+        $vp = "VirtualProtect" ascii wide nocase
+    condition:
+        ($a and ($vp or $ai)) or ($etw and $vp)
+}
+
+rule SafeBox_Office_Macro_Dropper
+{
+    meta:
+        description = "Office macro auto-execution combined with shell or download API"
+        severity = "high"
+        score = 25
+    strings:
+        $a1 = "AutoOpen" ascii wide nocase
+        $a2 = "Document_Open" ascii wide nocase
+        $a3 = "Workbook_Open" ascii wide nocase
+        $x1 = "WScript.Shell" ascii wide nocase
+        $x2 = "PowerShell" ascii wide nocase
+        $x3 = "URLDownloadToFile" ascii wide nocase
+        $x4 = "ShellExecute" ascii wide nocase
+    condition:
+        any of ($a*) and any of ($x*)
+}
+
+rule SafeBox_PDF_Suspicious_Action
+{
+    meta:
+        description = "PDF document with automatic action, embedded JavaScript, or Launch command"
+        severity = "high"
+        score = 20
+    strings:
+        $hdr = "%PDF-" ascii
+        $l = "/Launch" ascii
+        $o = "/OpenAction" ascii
+        $j1 = "/JavaScript" ascii
+        $j2 = "/JS" ascii fullword
+    condition:
+        $hdr and ($l or ($o and any of ($j*)))
+}
+
+rule SafeBox_Clipboard_Hijacker
+{
+    meta:
+        description = "Monitors or modifies clipboard along with cryptocurrency wallet patterns"
+        severity = "high"
+        score = 25
+    strings:
+        $c1 = "AddClipboardFormatListener" ascii wide nocase
+        $c2 = "GetClipboardData" ascii wide nocase
+        $c3 = "SetClipboardData" ascii wide nocase
+        $w1 = "bc1" ascii wide nocase fullword
+        $w2 = "0x" ascii wide nocase fullword
+        $w3 = "bitcoin" ascii wide nocase fullword
+        $w4 = "ethereum" ascii wide nocase fullword
+        $w5 = "wallet" ascii wide nocase fullword
+    condition:
+        ($c1 or ($c2 and $c3)) and any of ($w*)
+}
+
+rule SafeBox_Persistence_WMI_Subscription
+{
+    meta:
+        description = "WMI permanent event subscription persistence indicators"
+        severity = "critical"
+        score = 30
+    strings:
+        $f = "__EventFilter" ascii wide nocase
+        $c = "CommandLineEventConsumer" ascii wide nocase
+        $b = "__FilterToConsumerBinding" ascii wide nocase
+    condition:
+        $f and $c and $b
+}
+
+rule SafeBox_UAC_Bypass_Registry
+{
+    meta:
+        description = "Known UAC bypass binary and ms-settings registry hijack indicators"
+        severity = "high"
+        score = 25
+    strings:
+        $b1 = "fodhelper" ascii wide nocase
+        $b2 = "computerdefaults" ascii wide nocase
+        $b3 = "eventvwr" ascii wide nocase
+        $r1 = "ms-settings\\Shell\\Open\\command" ascii wide nocase
+        $r2 = "DelegateExecute" ascii wide nocase
+    condition:
+        any of ($b*) and any of ($r*)
+}
+
+rule SafeBox_DotNet_Memory_Loader
+{
+    meta:
+        description = ".NET reflection in-memory assembly loader pattern"
+        severity = "high"
+        score = 25
+    strings:
+        $r = "System.Reflection" ascii wide
+        $a = "Assembly" ascii wide
+        $b = "FromBase64String" ascii wide
+        $x1 = "DownloadData" ascii wide
+        $x2 = "VirtualAlloc" ascii wide
+        $x3 = "Invoke" ascii wide fullword
+    condition:
+        $r and $a and $b and any of ($x*)
+}

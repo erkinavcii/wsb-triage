@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import threading
 import time
@@ -40,6 +41,8 @@ NO_WINDOW = 0x08000000
 
 ARCHIVE_EXT = {".rar", ".zip", ".7z", ".001", ".cab", ".iso", ".gz", ".tgz", ".tar", ".xz", ".bz2"}
 SCRIPT_EXT = {".ps1", ".bat", ".cmd", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".hta", ".lnk", ".jar", ".msi", ".scr", ".com", ".reg", ".pif"}
+DOC_EXT = {".lnk", ".docm", ".xlsm", ".pptm", ".doc", ".xls", ".pdf"}
+RUNNABLE_EXT = SCRIPT_EXT | {".exe", ".dll"}
 NAME_RX = re.compile(r"crack|patch|activat|keygen|loader|inject|amtlib|genp|unlock|bypass|kms|serial|license", re.I)
 
 STAGES = [
@@ -54,15 +57,24 @@ STAGES = [
 DEFAULT_OPTIONS = {
     "password": "",
     "target": "",
+    "target_args": "",
+    "dll_export": "",
     "duration_min": 10,
     "network": True,
     "vt_upload": True,
     "max_vt": 12,
     "run_sandbox": True,
     "keep_sandbox_open": False,
-    "simulate_user": False,
+    "simulate_user": True,
     "notify": True,
     "memory_mb": 4096,
+    "run_as_standard_user": False,
+    "seed_honeyfiles": True,
+    "sandbox_backend": "wsb",
+    "vbox_vm": "",
+    "vbox_snapshot": "",
+    "vbox_user": "",
+    "vbox_password": "",
 }
 
 COPY_INTO_SANDBOX_MAX_MB = 1024   # samples above this run directly from the read-only mapped folder
@@ -109,12 +121,13 @@ def _write_json(path: Path, data: Any) -> None:
 
 # ======================================================================== Job
 class Job:
-    def __init__(self, case_dir: Path, state: Dict[str, Any], password: str = ""):
+    def __init__(self, case_dir: Path, state: Dict[str, Any], password: str = "", vbox_password: str = ""):
         self.case_dir = case_dir
         self.state = state
         self.lock = threading.RLock()
-        # The archive password lives only in memory: never in state.json, never in API responses.
+        # Passwords live only in memory: never in state.json, never in API responses.
         self.password = password
+        self.vbox_password = vbox_password
 
     def check_cancel(self) -> None:
         if self.state.get("cancel_requested"):
@@ -221,6 +234,9 @@ def create_job(sample_path: str, options: Optional[Dict[str, Any]] = None) -> Jo
         opts["duration_min"] = 10
     password = opts.pop("password", "") or ""
     opts["has_password"] = bool(password)
+    vbox_password = opts.pop("vbox_password", "") or ""
+    opts["has_vbox_password"] = bool(vbox_password)
+    opts["sandbox_backend"] = "vbox" if opts.get("sandbox_backend") == "vbox" else "wsb"
     safe = re.sub(r"[^\w.-]", "_", src.name)[:40] or "sample"
     case_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}_{safe}"
     if (CASES_DIR / case_id).exists():      # two jobs for the same file within one second
@@ -228,7 +244,7 @@ def create_job(sample_path: str, options: Optional[Dict[str, Any]] = None) -> Jo
     case_dir = CASES_DIR / case_id
     for sub in ("input", "output", "tools"):
         (case_dir / sub).mkdir(parents=True, exist_ok=True)
-    job = Job(case_dir, _new_state(case_id, str(src.resolve()), opts), password)
+    job = Job(case_dir, _new_state(case_id, str(src.resolve()), opts), password, vbox_password=vbox_password)
     job.save()
     with JOBS_LOCK:
         JOBS[case_id] = job
@@ -445,12 +461,66 @@ def cleanup_jobs(days: int) -> List[str]:
     return removed
 
 
-def start_sandbox_later(job: Job) -> None:
+_SANDBOX_OVERRIDE_KEYS = {
+    "target", "target_args", "dll_export", "duration_min", "memory_mb",
+    "network", "keep_sandbox_open", "simulate_user", "run_as_standard_user",
+    "seed_honeyfiles", "sandbox_backend", "vbox_vm", "vbox_snapshot", "vbox_user",
+}
+
+
+def list_runnable_targets(job: Job) -> List[str]:
+    """Returns relative paths of runnable candidates under job.input_dir ordered by likelihood."""
+    inp = job.input_dir
+    if not inp.is_dir():
+        return []
+    deprio_rx = re.compile(r"(uninst|unins\d|crash|helper|vc_?redist|vcredist|dotnet|ndp\d|directx|dxsetup|redist|updater|elevat|report|cleanup|repair)", re.I)
+    inst_rx = re.compile(r"^(set-?up|install|autorun|autoplay|start)", re.I)
+    cands = [p for p in inp.rglob("*") if p.is_file() and p.suffix.lower() in RUNNABLE_EXT]
+
+    def sort_key(p: Path):
+        ext = p.suffix.lower()
+        if ext == ".dll":
+            rank = 10
+        elif deprio_rx.search(p.name):
+            rank = 9
+        elif inst_rx.search(p.name):
+            rank = 0
+        elif NAME_RX.search(p.name):
+            rank = 1
+        else:
+            rank = 5
+        rel = p.relative_to(inp)
+        return (rank, 0 if ext in (".exe", ".msi") else 1, len(rel.parts), -p.stat().st_size)
+
+    cands.sort(key=sort_key)
+    return [str(p.relative_to(inp)) for p in cands[:100]]
+
+
+def start_sandbox_later(job: Job, overrides: Optional[Dict[str, Any]] = None) -> None:
     # Check-and-set under the job lock: a double click, or a click while the job is queued/running, must not start a
     # second sandbox thread on the same case folder.
     with job.lock:
         if job.state["status"] == "running" or job.state["stages"]["sandbox"]["status"] in ("running", "queued"):
             raise PipelineError("Bu analiz zaten çalışıyor ya da sandbox sırasında bekliyor.")
+        if overrides:
+            opts = job.state.setdefault("options", dict(DEFAULT_OPTIONS))
+            for k in _SANDBOX_OVERRIDE_KEYS:
+                if k in overrides and overrides[k] is not None:
+                    opts[k] = overrides[k]
+            try:
+                opts["memory_mb"] = max(1024, min(65536, int(opts.get("memory_mb") or 4096)))
+            except (TypeError, ValueError):
+                opts["memory_mb"] = 4096
+            try:
+                opts["duration_min"] = max(1, min(180, int(opts.get("duration_min") or 10)))
+            except (TypeError, ValueError):
+                opts["duration_min"] = 10
+            opts["sandbox_backend"] = "vbox" if opts.get("sandbox_backend") == "vbox" else "wsb"
+            if overrides.get("vbox_password"):
+                job.vbox_password = str(overrides["vbox_password"])
+                opts["has_vbox_password"] = True
+            opts.pop("vbox_password", None)
+            opts.pop("password", None)
         job.state["status"] = "running"
         job.state["stages"]["sandbox"]["status"] = "queued"
         job.state["stages"]["sandbox"]["msg"] = "Başlatılıyor..."
@@ -511,24 +581,112 @@ def _archive_set_size(src: Path) -> int:
     return src.stat().st_size
 
 
-INSTALLER_EXT = {".msi", ".msix", ".cab", ".exe"}
+INSTALLER_EXT = {".msi", ".msix", ".cab", ".exe", ".asar"}
 MAX_INSTALLER_UNPACK_BYTES = 512 * 1024 * 1024
 _NON_CONTAINER_7Z_TYPES = {"pe", "elf", "macho", "coff", "te"}
+_ASAR_KEEP_EXT = {".js", ".mjs", ".cjs", ".ts", ".json", ".exe", ".dll", ".bat", ".cmd", ".ps1", ".vbs", ".hta"}
+
+
+def _unpack_asar(cand: Path, dest_dir: Path) -> int:
+    """Pure-Python Electron .asar archive extractor (capped at 200 files / 50 MB with path-traversal guard)."""
+    try:
+        fsize = cand.stat().st_size
+        if fsize < 20 or fsize > MAX_INSTALLER_UNPACK_BYTES:
+            return 0
+        with open(cand, "rb") as f:
+            hdr = f.read(16)
+            if len(hdr) < 16 or struct.unpack_from("<I", hdr, 0)[0] != 4:
+                return 0
+            hdr_size = struct.unpack_from("<I", hdr, 4)[0]
+            json_len = struct.unpack_from("<I", hdr, 12)[0]
+            if hdr_size < 8 or hdr_size > 16 * 1024 * 1024 or json_len == 0 or json_len > hdr_size:
+                return 0
+            data_offset = 8 + hdr_size
+            if data_offset >= fsize:
+                return 0
+            manifest_raw = f.read(json_len).decode("utf-8", errors="strict")
+            manifest = json.loads(manifest_raw)
+            files_root = (manifest or {}).get("files")
+            if not isinstance(files_root, dict):
+                return 0
+
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            root_resolved = dest_dir.resolve()
+            extracted = 0
+            total_written = 0
+            stack = [(files_root, Path("."))]
+            while stack and extracted < 200 and total_written < 50 * 1024 * 1024:
+                node, rel = stack.pop()
+                for name, meta in node.items():
+                    if not isinstance(meta, dict):
+                        continue
+                    safe_rel = rel / name
+                    if isinstance(meta.get("files"), dict):
+                        stack.append((meta["files"], safe_rel))
+                        continue
+                    if "offset" not in meta or "size" not in meta:
+                        continue
+                    if Path(name).suffix.lower() not in _ASAR_KEEP_EXT:
+                        continue
+                    try:
+                        off = int(meta["offset"])
+                        sz = int(meta["size"])
+                    except (TypeError, ValueError):
+                        continue
+                    if off < 0 or sz <= 0 or sz > 10 * 1024 * 1024 or data_offset + off + sz > fsize:
+                        continue
+                    target = (root_resolved / safe_rel).resolve()
+                    if target != root_resolved and root_resolved not in target.parents:
+                        continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    f.seek(data_offset + off)
+                    chunk = f.read(sz)
+                    target.write_bytes(chunk)
+                    extracted += 1
+                    total_written += len(chunk)
+                    if extracted >= 200 or total_written >= 50 * 1024 * 1024:
+                        break
+            return extracted
+    except Exception:
+        return 0
+
+
+def _unpack_inno(job: Job, cand: Path, dest_dir: Path) -> int:
+    inno = sbm.innoextract_path()
+    if not inno:
+        try:
+            head = cand.read_bytes()[:4 * 1024 * 1024]
+            if b"Inno Setup" in head:
+                job.log(f"'{cand.name}' Inno Setup kurulumu görünüyor; içeriği açmak için PATH'e innoextract.exe ekleyebilirsiniz.")
+        except OSError:
+            pass
+        return 0
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run([inno, "-e", "-s", "-d", str(dest_dir), str(cand)], capture_output=True, text=True,
+                       timeout=300, errors="replace", creationflags=NO_WINDOW)
+        return sum(1 for p in dest_dir.rglob("*") if p.is_file())
+    except Exception:
+        return 0
 
 
 def _unpack_one_installer(job: Job, sz: str, cand: Path, dest_dir: Path, depth: int = 0) -> int:
-    """Uses 7-Zip to unpack MSI/NSIS/SFX/CAB installer containers for static/VT inspection.
+    """Uses 7-Zip / ASAR / innoextract to unpack installer containers for static/VT inspection.
     Never unpacks bare PE section tables (Type = PE only). Returns extracted file count."""
+    if cand.suffix.lower() == ".asar":
+        return _unpack_asar(cand, dest_dir)
+    if not sz:
+        return _unpack_inno(job, cand, dest_dir) if cand.suffix.lower() == ".exe" else 0
     try:
         lp = subprocess.run([sz, "l", "-slt", "-p", str(cand)], capture_output=True, text=True,
                             timeout=120, errors="replace", creationflags=NO_WINDOW)
     except Exception:
         return 0
     if lp.returncode != 0:
-        return 0
+        return _unpack_inno(job, cand, dest_dir) if cand.suffix.lower() == ".exe" else 0
     types = [m.strip() for m in re.findall(r"^Type = (.+)$", lp.stdout or "", re.M)]
     if not types or all(t.lower() in _NON_CONTAINER_7Z_TYPES for t in types):
-        return 0
+        return _unpack_inno(job, cand, dest_dir) if cand.suffix.lower() == ".exe" else 0
     body = (lp.stdout or "").split("\n----------", 1)[-1]
     total_size = sum(int(x) for x in re.findall(r"^Size = (\d+)", body, re.M))
     _check_unpacked_size(job, total_size, cand)
@@ -548,14 +706,12 @@ def _unpack_one_installer(job: Job, sz: str, cand: Path, dest_dir: Path, depth: 
 
 
 def _unpack_installers(job: Job, inp: Path) -> int:
-    """Inspects MSI/NSIS/SFX installers in input_dir and extracts inner payloads into unpacked_dir."""
+    """Inspects MSI/NSIS/SFX/ASAR/Inno installers in input_dir and extracts inner payloads into unpacked_dir."""
     sz = sbm.seven_zip_path()
-    if not sz:
-        return 0
     cands = sorted(
         (p for p in inp.rglob("*")
          if p.is_file() and p.suffix.lower() in INSTALLER_EXT and p.stat().st_size <= MAX_INSTALLER_UNPACK_BYTES),
-        key=lambda p: p.stat().st_size,
+        key=lambda p: (0 if p.suffix.lower() == ".asar" else 1, p.stat().st_size),
     )[:5]
     unpacked_total = 0
     for idx, cand in enumerate(cands, 1):
@@ -749,12 +905,16 @@ def stage_inventory(job: Job) -> None:
             job.stage("inventory", "running", f"Hash: {i} / {len(file_entries)} dosya")
         rec = {"rel": rel_name, "path": str(p), "size": 0, "sha256": None, "is_pe": False,
                "is_script": p.suffix.lower() in SCRIPT_EXT,
+               "is_doc": p.suffix.lower() in DOC_EXT,
+               "spoof_flag": False,
                "name_flag": bool(NAME_RX.search(p.name)) or p.name.lower() in analyzer.SUSPICIOUS_FILENAMES,
                "sig": None, "missing": False, "unpacked": is_unpacked}
         try:
             rec["size"] = p.stat().st_size
             with open(p, "rb") as f:
-                rec["is_pe"] = f.read(2) == b"MZ"
+                head = f.read(64)
+            rec["is_pe"] = head[:2] == b"MZ"
+            rec["spoof_flag"] = bool(analyzer.detect_spoofing(p, head))
             rec["sha256"] = _sha256(p)
         except Exception:
             rec["missing"] = not p.exists()
@@ -806,6 +966,8 @@ def _candidate_score(r: Dict[str, Any]) -> int:
         return 0
     status = (r.get("sig") or {}).get("status")
     score = 0
+    if r.get("spoof_flag"):
+        score += 120
     if r["name_flag"]:
         score += 100
     if status == "HashMismatch":
@@ -814,6 +976,8 @@ def _candidate_score(r: Dict[str, Any]) -> int:
         score += 50
     if r["is_pe"] and status != "Valid":
         score += 40
+    if r.get("is_doc"):
+        score += 30
     if r["rel"].lower().endswith(".exe"):
         score += 10
     return score
@@ -1019,10 +1183,11 @@ def stage_vt(job: Job) -> None:
 
 
 def _check_dropped_files_vt(job: Job, beh: Dict[str, Any]) -> None:
-    """Queries VirusTotal by SHA-256 for executables dropped inside the sandbox during analysis.
+    """Queries VirusTotal (and MalwareBazaar/Hybrid Analysis fallback) by SHA-256 for dropped executables.
     Only hash lookup is performed (no uploads, zero data leakage risk)."""
     key = vt_client.get_api_key()
-    if not key:
+    intel_backup = intel_client.has_configured_sources()
+    if not key and not intel_backup:
         return
     dropped = (beh.get("Files") or {}).get("DroppedHashes") or []
     if not isinstance(dropped, list) or not dropped:
@@ -1052,18 +1217,19 @@ def _check_dropped_files_vt(job: Job, beh: Dict[str, Any]) -> None:
     if not new_drops:
         return
 
-    msg = f"Sandbox içinde bırakılan {len(new_drops)} yeni çalıştırılabilir dosyanın hash'i VirusTotal'de sorgulanıyor..."
+    msg = f"Sandbox içinde bırakılan {len(new_drops)} yeni çalıştırılabilir dosyanın hash'i sorgulanıyor..."
     job.log(msg)
     job.stage("sandbox", "running", msg)
+    icfg = intel_client.get_intel_config() if intel_backup else {}
+    run_mb = bool(icfg.get("mb_enabled") or icfg.get("mb_api_key"))
+    run_ha = bool(icfg.get("ha_api_key"))
     quota = False
     for item in new_drops:
         job.check_cancel()
-        if quota:
-            break
         sha = item["SHA256"]
         p_name = Path(item["Path"]).name or "unknown.exe"
         rel_label = f"[bırakılan] {p_name}"
-        entry = {
+        entry: Dict[str, Any] = {
             "rel": rel_label,
             "path": item["Path"],
             "sha256": sha,
@@ -1073,18 +1239,35 @@ def _check_dropped_files_vt(job: Job, beh: Dict[str, Any]) -> None:
             "gui_url": f"https://www.virustotal.com/gui/file/{sha}",
             "dropped": True,
         }
-        try:
-            res = vt_client.lookup(sha, key)
-            if res:
-                entry["result"] = res
-                entry["status"] = "VT'de kayıtlı (bırakılan dosya)"
-            else:
-                entry["status"] = "VT'de yok (bırakılan dosya)"
-        except vt_client.VtQuotaError:
-            quota = True
-            entry["status"] = "Sorgulanmadı (VirusTotal kotası doldu)"
-        except Exception as ex:
-            entry["status"] = f"Hata: {ex}"
+        need_fallback = False
+        if key and not quota:
+            try:
+                res = vt_client.lookup(sha, key)
+                if res:
+                    entry["result"] = res
+                    entry["status"] = "VT'de kayıtlı (bırakılan dosya)"
+                else:
+                    entry["status"] = "VT'de yok (bırakılan dosya)"
+                    need_fallback = True
+            except vt_client.VtQuotaError:
+                quota = True
+                entry["status"] = "Sorgulanmadı (VirusTotal kotası doldu)"
+                need_fallback = True
+            except Exception as ex:
+                entry["status"] = f"Hata: {ex}"
+                need_fallback = True
+        else:
+            need_fallback = True
+            entry["status"] = "Sorgulanmadı (VirusTotal kotası doldu)" if quota else "VT anahtarı yok"
+
+        if need_fallback and (run_mb or run_ha):
+            ires = intel_client.query_hash_intel(sha, run_mb=run_mb, run_ha=run_ha)
+            entry["intel"] = ires
+            if ires.get("any_found"):
+                entry["status"] = f"{ires['summary']} (bırakılan dosya)"
+            elif not key:
+                entry["status"] = "MB/HA'da yok (bırakılan dosya)"
+
         job.state["vt"].append(entry)
         compute_verdict(job)
         job.save()
@@ -1094,20 +1277,75 @@ def _check_dropped_files_vt(job: Job, beh: Dict[str, Any]) -> None:
 
 
 # ======================================================================== 5. sandbox
+def _observe_sandbox_loop(job: Job, out: Path, duration: int, check_alive_fn) -> None:
+    started = time.time()
+    deadline = started + duration + 15 * 60
+    done_flag = out / "done.flag"
+    misses = 0
+    # Heartbeat: while observing, the monitor rewrites live.json every ~5 s.
+    last_beat, last_beat_t, sample_started_t, max_gap = None, None, None, 0.0
+    job.state["sandbox"].pop("monitor_lost", None)
+    job.state["sandbox"].pop("monitor_max_gap", None)
+    while not done_flag.exists():
+        time.sleep(4)
+        now = time.time()
+        live = sanitize_sandbox_json(_read_json(out / "live.json"))
+        if live:
+            job.state["sandbox"]["live"] = live
+            beat = (live.get("Updated"), live.get("SecondsLeft"), live.get("Phase"))
+            if beat != last_beat:
+                if last_beat_t is not None:
+                    max_gap = max(max_gap, now - last_beat_t)
+                last_beat, last_beat_t = beat, now
+        if sample_started_t is None and _timeline_has(out, ("Sample started", "No runnable file")):
+            sample_started_t = now
+        status = (out / "status.txt").read_text(encoding="utf-8", errors="replace").strip() if (out / "status.txt").exists() else ""
+        if status:
+            job.state["sandbox"]["status_text"] = status
+            job.state["stages"]["sandbox"]["msg"] = status
+        observing = (live or {}).get("Phase", "observing") == "observing"
+        silent_since = last_beat_t if last_beat_t is not None else sample_started_t
+        if observing and silent_since is not None and now - silent_since > MONITOR_DEAD_SEC:
+            job.state["sandbox"]["monitor_lost"] = {"after_sec": int(now - (sample_started_t or started)),
+                                                    "silent_sec": int(now - silent_since),
+                                                    "last_update": (live or {}).get("Updated")}
+            job.log(f"İzleyici {int(now - silent_since)} sn'dir yanıt vermiyor — örnek izleme scriptini durdurmuş olabilir. "
+                    "O ana kadar toplanan veriler saklandı.")
+            job.save()
+            break
+        job.save()
+        if now > deadline:
+            job.log("Sandbox zaman aşımına uğradı.")
+            break
+        if time.time() - started > 90:
+            state = check_alive_fn()          # None = check failed (busy system): not evidence of closing
+            misses = misses + 1 if state is False else 0
+            if misses >= 3:
+                job.log("Sandbox penceresi izleme bitmeden kapatıldı.")
+                break
+    live = sanitize_sandbox_json(_read_json(out / "live.json"))
+    if live:
+        job.state["sandbox"]["live"] = live
+    if max_gap > 60:
+        job.state["sandbox"]["monitor_max_gap"] = int(max_gap)
+
+
 def stage_sandbox(job: Job) -> None:
-    if not sbm.WSB_EXE.exists():
+    backend = "vbox" if job.opt("sandbox_backend") == "vbox" else "wsb"
+    if backend == "wsb" and not sbm.windows_sandbox_available():
         job.stage("sandbox", "unavailable", "Windows Sandbox kapalı. Üstteki 'Windows Sandbox'ı Etkinleştir' butonunu kullanıp bilgisayarı yeniden başlatın.")
         return
-    # Windows Sandbox runs one instance per machine: wait in line instead of failing.
+    if backend == "vbox" and not sbm.vbox_manage_path():
+        job.stage("sandbox", "unavailable", "VirtualBox (VBoxManage.exe) bulunamadı.")
+        return
+    # Only one sandbox/VM instance runs at a time: wait in line instead of failing.
     if not SANDBOX_LOCK.acquire(blocking=False):
         job.stage("sandbox", "queued", "Sırada: başka bir analizin sandbox'ı bitince otomatik başlayacak.")
         job.log("Sandbox meşgul, sıraya alındı.")
         while not SANDBOX_LOCK.acquire(timeout=5):
-            job.check_cancel()          # cancelling while queued just leaves the queue
+            job.check_cancel()
         job.log("Sıra geldi, sandbox hazırlanıyor.")
     try:
-        if sbm.sandbox_state() is True:
-            raise PipelineError("Açık bir Windows Sandbox penceresi var (aynı anda yalnızca bir tane açılabilir). Kapatıp tekrar deneyin.")
         out = job.output_dir
         if any(out.iterdir()):
             prev = job.case_dir / f"output_prev_{datetime.now().strftime('%H%M%S')}"
@@ -1124,77 +1362,58 @@ def stage_sandbox(job: Job) -> None:
         duration = int(job.opt("duration_min")) * 60
         _write_json(tools / "config.json", {
             "Target": job.opt("target") or "",
+            "TargetArgs": job.opt("target_args") or "",
+            "DllExport": job.opt("dll_export") or "",
+            "RunAsStandardUser": bool(job.opt("run_as_standard_user")),
+            "SeedHoneyfiles": True if job.opt("seed_honeyfiles") is None else bool(job.opt("seed_honeyfiles")),
             "DurationSeconds": duration,
-            "CopyMaxMB": COPY_INTO_SANDBOX_MAX_MB,   # bigger samples run in place from the read-only share
-            "BlockLan": bool(job.opt("network")),     # internet allowed, home network / host blocked
+            "CopyMaxMB": COPY_INTO_SANDBOX_MAX_MB,
+            "BlockLan": bool(job.opt("network")),
             "SimulateUser": bool(job.opt("simulate_user")),
         })
-        wsb = job.case_dir / "analysis.wsb"
-        wsb.write_text(sbm.build_wsb(job.case_dir, bool(job.opt("network")), int(job.opt("memory_mb")), job.input_dir), encoding="utf-8")
 
         net = "açık (trafik kaydediliyor)" if job.opt("network") else "kapalı"
-        job.stage("sandbox", "running", f"Sandbox açılıyor (internet {net}, {job.opt('duration_min')} dk)...")
-        job.log("Windows Sandbox başlatıldı. Örnek bir kurulum penceresi açarsa sandbox penceresinin içinden ilerleyebilirsiniz.")
-        sbm.launch_sandbox(wsb)
-        started = time.time()
-        deadline = started + duration + 15 * 60
-        done_flag = out / "done.flag"
-        misses = 0
-        # Heartbeat: while observing, the monitor rewrites live.json every ~5 s. A sample running as admin can kill the
-        # monitor (anti-analysis); then live.json stops changing and no done.flag ever comes.
-        last_beat, last_beat_t, sample_started_t, max_gap = None, None, None, 0.0
-        job.state["sandbox"].pop("monitor_lost", None)
-        job.state["sandbox"].pop("monitor_max_gap", None)
-        while not done_flag.exists():
-            time.sleep(4)
-            now = time.time()
-            live = sanitize_sandbox_json(_read_json(out / "live.json"))
-            if live:
-                job.state["sandbox"]["live"] = live
-                beat = (live.get("Updated"), live.get("SecondsLeft"), live.get("Phase"))
-                if beat != last_beat:
-                    if last_beat_t is not None:
-                        max_gap = max(max_gap, now - last_beat_t)
-                    last_beat, last_beat_t = beat, now
-            if sample_started_t is None and _timeline_has(out, ("Sample started", "No runnable file")):
-                sample_started_t = now
-            status = (out / "status.txt").read_text(encoding="utf-8", errors="replace").strip() if (out / "status.txt").exists() else ""
-            if status:
-                job.state["sandbox"]["status_text"] = status
-                job.state["stages"]["sandbox"]["msg"] = status
-            observing = (live or {}).get("Phase", "observing") == "observing"
-            silent_since = last_beat_t if last_beat_t is not None else sample_started_t
-            if observing and silent_since is not None and now - silent_since > MONITOR_DEAD_SEC:
-                job.state["sandbox"]["monitor_lost"] = {"after_sec": int(now - (sample_started_t or started)),
-                                                        "silent_sec": int(now - silent_since),
-                                                        "last_update": (live or {}).get("Updated")}
-                job.log(f"İzleyici {int(now - silent_since)} sn'dir yanıt vermiyor — örnek izleme scriptini durdurmuş olabilir. "
-                        "O ana kadar toplanan veriler saklandı.")
-                job.save()
-                break
-            job.save()
-            if now > deadline:
-                job.log("Sandbox zaman aşımına uğradı.")
-                break
-            if time.time() - started > 90:
-                state = sbm.sandbox_state()          # None = check failed (busy system): not evidence of closing
-                misses = misses + 1 if state is False else 0
-                if misses >= 3:                      # ~3 consecutive clear "not running" answers
-                    job.log("Sandbox penceresi izleme bitmeden kapatıldı.")
-                    break
-        live = sanitize_sandbox_json(_read_json(out / "live.json"))
-        if live:
-            job.state["sandbox"]["live"] = live
-        if max_gap > 60:
-            job.state["sandbox"]["monitor_max_gap"] = int(max_gap)
+        wsb_sid: Optional[str] = None
+        used_vbox_snap = ""
+        vbox_vm = str(job.opt("vbox_vm") or "").strip()
+
+        if backend == "vbox":
+            job.stage("sandbox", "running", f"VirtualBox VM ({vbox_vm}) temiz snapshot'tan başlatılıyor (internet {net}, {job.opt('duration_min')} dk)...")
+            used_vbox_snap = sbm.vbox_start_analysis(
+                vbox_vm,
+                str(job.opt("vbox_snapshot") or ""),
+                job.input_dir,
+                tools,
+                out,
+                bool(job.opt("network")),
+                str(job.opt("vbox_user") or ""),
+                job.vbox_password or "",
+                log_cb=job.log,
+            )
+            job.log(f"VirtualBox VM '{vbox_vm}' başlatıldı (snapshot: {used_vbox_snap}).")
+            _observe_sandbox_loop(job, out, duration, lambda: sbm._vm_state(vbox_vm) == "running")
+        else:
+            if sbm.sandbox_state() is True:
+                raise PipelineError("Açık bir Windows Sandbox penceresi var (aynı anda yalnızca bir tane açılabilir). Kapatıp tekrar deneyin.")
+            wsb = job.case_dir / "analysis.wsb"
+            wsb.write_text(sbm.build_wsb(job.case_dir, bool(job.opt("network")), int(job.opt("memory_mb")), job.input_dir), encoding="utf-8")
+            job.stage("sandbox", "running", f"Sandbox açılıyor (internet {net}, {job.opt('duration_min')} dk)...")
+            job.log("Windows Sandbox başlatıldı. Örnek bir kurulum penceresi açarsa sandbox penceresinin içinden ilerleyebilirsiniz.")
+            wsb_sid = sbm.launch_sandbox(wsb)
+            _observe_sandbox_loop(job, out, duration, sbm.sandbox_state)
+
         if job.state.pop("cancel_requested", None):
-            # cancel during the sandbox = stop observing now, but keep and report what was collected
             job.log("İptal: izleme erken bitirildi, o ana kadar toplanan sonuçlar raporlanıyor.")
         if not job.opt("keep_sandbox_open"):
-            job.log("Sandbox kapatılıyor (içindeki her şey silinir).")
-            sbm.stop_sandbox()
+            if backend == "vbox":
+                job.log(f"VirtualBox VM kapatılıp temiz snapshot'a ({used_vbox_snap}) geri döndürülüyor.")
+                sbm.vbox_stop_and_restore(vbox_vm, used_vbox_snap)
+            else:
+                job.log("Sandbox kapatılıyor (içindeki her şey silinir).")
+                sbm.stop_sandbox(wsb_sid)
         elif job.state["sandbox"].get("monitor_lost"):
-            job.log("İzleyici durdu; 'kapatma' seçili olmadığı için sandbox açık bırakıldı. İçindekileri ana bilgisayara kopyalamayın.")
+            job.log("İzleyici durdu; 'kapatma' seçili olmadığı için ortam açık bırakıldı. İçindekileri ana bilgisayara kopyalamayın.")
+
         quarantined = quarantine_output(out)
         job.state["sandbox"]["quarantined"] = quarantined
         job.state["sandbox"]["screenshots"] = list_screenshots(job)
@@ -1215,7 +1434,7 @@ def stage_sandbox(job: Job) -> None:
 
 
 # Files the monitor itself writes into output/. Anything else was put there by something inside the sandbox.
-OUTPUT_ALLOWLIST = {"live.json", "behavior.json", "status.txt", "timeline.log", "capture.pcapng", "procmon.pml", "done.flag"}
+OUTPUT_ALLOWLIST = {"live.json", "behavior.json", "status.txt", "timeline.log", "capture.pcapng", "procmon.pml", "procmon_summary.json", "done.flag"}
 _SCREENSHOT_NAME_RX = re.compile(r"^scr_\d{3}\.png$")
 _MAX_SCREENSHOTS = 30
 _MAX_SCREENSHOT_BYTES = 10 * 1024 * 1024
@@ -1292,9 +1511,12 @@ def _timeline_has(out: Path, needles) -> bool:
 
 # ------------------------------------------------------------------ sandbox output is attacker-controlled
 _STR_LISTS = [("Persistence", "Services"), ("Persistence", "Drivers"), ("Persistence", "Tasks"), ("Persistence", "RunKeys"),
-              ("Persistence", "Startup"), ("Defender", "Added"), ("Defender", "ThreatsDetected"), ("Hosts", "Added"),
+              ("Persistence", "Startup"), ("Persistence", "WmiSubscriptions"), ("Persistence", "ComHijacks"),
+              ("Persistence", "AppInitDlls"), ("Persistence", "BitsJobs"), ("Persistence", "PsProfiles"), ("Persistence", "ActiveSetup"),
+              ("Defender", "Added"), ("Defender", "ThreatsDetected"), ("Hosts", "Added"),
               ("Hosts", "Removed"), ("Firewall", "Added"), ("Files", "NewExecutables"), ("Files", "ModifiedExecutables"),
-              ("Network", "NewListening"), ("LanBlock", "Details"), ("LanBlock", "Exempt"), ("LanBlock", "Ranges"),
+              ("Network", "NewListening"), ("Network", "UdpEndpoints"), ("HoneyfileAlerts",),
+              ("LanBlock", "Details"), ("LanBlock", "Exempt"), ("LanBlock", "Ranges"),
               ("Quick", "Services"), ("Quick", "Tasks"), ("Quick", "RunKeys"), ("Quick", "Startup"), ("Quick", "Defender"), ("Quick", "Hosts")]
 _OBJ_LISTS = [("Processes",), ("Connections",), ("Network", "Connections"), ("Network", "DnsCache"), ("Files", "DroppedHashes")]
 _INTS = [("Files", "NewCount"), ("Files", "ModifiedCount"), ("SecondsLeft",), ("ProcessCount",), ("SampleProcessCount",),
@@ -1512,7 +1734,21 @@ def correlate_network_processes(
             t["processes"] = procs
             t["from_sample"] = fs
 
+    for u in net.get("udp_targets") or []:
+        raw_t = str(u.get("target") or "")
+        ip_part, _, port_part = raw_t.rpartition(":")
+        procs, fs = _procs_for_endpoints([(ip_part or raw_t, port_part if ip_part else "")])
+        if procs or not u.get("processes"):
+            u["processes"] = procs
+            u["from_sample"] = fs
+
     return net
+
+
+DOH_DOMAINS = (
+    "dns.google", "cloudflare-dns.com", "mozilla.cloudflare-dns.com",
+    "dns.quad9.net", "doh.opendns.com", "dns.adguard.com", "dns.nextdns.io",
+)
 
 
 def network_summary(pcap: Path, behavior: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
@@ -1550,6 +1786,16 @@ def network_summary(pcap: Path, behavior: Optional[Dict[str, Any]] = None) -> Op
         if ep_ip:
             sni_eps.setdefault(sname, set()).add((ep_ip, row[3].strip()))
 
+    for row in q("QUIC SNI", "quic && tls.handshake.extensions_server_name", ["tls.handshake.extensions_server_name", "ip.dst", "ipv6.dst", "udp.dstport"]):
+        row += [""] * (4 - len(row))
+        sname = row[0].strip()
+        if not sname:
+            continue
+        sni_names.append(sname)
+        ep_ip = (row[1] or row[2]).strip().lower()
+        if ep_ip:
+            sni_eps.setdefault(sname, set()).add((ep_ip, row[3].strip()))
+
     http = q("HTTP", "http.request", ["http.host", "http.request.method", "http.request.uri", "ip.dst", "ipv6.dst", "tcp.dstport"])
     syn = q("TCP", "tcp.flags.syn == 1 && tcp.flags.ack == 0", ["ip.dst", "ipv6.dst", "tcp.dstport"])
     targets: Dict[str, int] = {}
@@ -1557,6 +1803,18 @@ def network_summary(pcap: Path, behavior: Optional[Dict[str, Any]] = None) -> Op
         row += [""] * (3 - len(row))
         t = f"{row[0] or row[1]}:{row[2]}"
         targets[t] = targets.get(t, 0) + 1
+
+    udp_raw = q("UDP", "udp && !(dns || mdns || nbns || ssdp || dhcp || dhcpv6)", ["ip.dst", "ipv6.dst", "udp.dstport"])
+    udp_targets: Dict[str, int] = {}
+    for row in udp_raw:
+        row += [""] * (3 - len(row))
+        dst_ip = (row[0] or row[1]).strip()
+        ip_obj = _clean_ip(dst_ip)
+        if not ip_obj or ip_obj.is_multicast or ip_obj.is_unspecified or ip_obj.is_loopback:
+            continue
+        t = f"{dst_ip}:{row[2]}"
+        udp_targets[t] = udp_targets.get(t, 0) + 1
+
     seen: set = set()
     http_rows: List[Dict[str, Any]] = []
     http_eps: Dict[tuple, set] = {}
@@ -1579,11 +1837,19 @@ def network_summary(pcap: Path, behavior: Optional[Dict[str, Any]] = None) -> Op
         if hk and hk in http_eps:
             h["_endpoints"] = list(http_eps[hk])
 
+    dns_rows = _count(dns)
+    doh_domains = sorted({
+        d["name"] for d in (dns_rows + sni_rows)
+        if d.get("name") and _match(d["name"].lower().rstrip("."), DOH_DOMAINS)
+    })
+
     summary = {
-        "dns": _count(dns),
+        "dns": dns_rows,
         "sni": sni_rows,
         "http": http_rows[:200],
         "tcp_targets": [{"target": k, "count": v} for k, v in sorted(targets.items(), key=lambda kv: -kv[1])[:100]],
+        "udp_targets": [{"target": k, "count": v} for k, v in sorted(udp_targets.items(), key=lambda kv: -kv[1])[:100]],
+        "doh_domains": doh_domains,
         "partial": failed,
     }
     return correlate_network_processes(summary, behavior, domain_ips)
@@ -1631,13 +1897,35 @@ def compute_verdict(job: Job) -> None:
         notes.append(f"{inv['sig_errors']} dosyanın dijital imzası kontrol edilemedi, bu yüzden imzasız sayıldı "
                      f"(imza sonuçları güvenilir değil): {inv.get('sig_error_msg', '')}")
     for st in s.get("static") or []:
+        sig = st.get("signature") or {}
+        sig_status = sig.get("status")
+        for sf in st.get("spoof_flags") or []:
+            if str(sf.get("severity") or "").lower() in ("critical", "high"):
+                red.append(f"Uzantı/Biçim kandırmacası '{st.get('rel', '')}': {sf.get('reason', '')}")
+        for ym in st.get("yara_matches") or []:
+            sev = str(ym.get("severity") or "medium").lower()
+            desc = ym.get("description") or ym.get("rule")
+            if sev in ("critical", "high"):
+                red.append(f"YARA [{ym.get('rule')}]: '{st.get('rel', '')}' ({desc})")
+            else:
+                notes.append(f"YARA [{ym.get('rule')}]: '{st.get('rel', '')}' ({desc})")
+        for ff in st.get("format_findings") or []:
+            sev = str(ff.get("severity") or "medium").lower()
+            msg_ff = f"{ff.get('category')}: '{st.get('rel', '')}' — {ff.get('description', '')}"
+            if sev in ("critical", "high"):
+                red.append(msg_ff)
+            else:
+                notes.append(msg_ff)
+        score = int(st.get("risk_score") or 0)
+        if sig_status != "Valid" and score >= 75:
+            red.append(f"Statik analiz: '{st.get('rel', '')}' çok yüksek risk puanı aldı ({score}/100).")
+        elif score >= 65:
+            notes.append(f"Statik analiz: '{st.get('rel', '')}' yüksek risk puanı aldı ({score}/100).")
+
         crit = [f["category"] for f in st.get("string_findings", []) if f.get("severity") == "critical"]
         if not crit:
             continue
-        sig = st.get("signature") or {}
-        if sig.get("status") == "Valid":
-            # Signed does not mean safe (stolen certificates), but embedded browser engines (CEF/Electron) legitimately
-            # contain browser-profile strings, so this stays a note.
+        if sig_status == "Valid":
             signer = (sig.get("signer") or "").split(",")[0].replace("CN=", "")
             notes.append(f"Statik: '{st['rel']}' imzalı ({signer}) ama şu izleri içeriyor: {', '.join(crit)} — "
                          "gömülü tarayıcı motorlarında normal olabilir; imzalı zararlılar da olur, VT ve sandbox sonucuyla birlikte değerlendirin.")
@@ -1669,23 +1957,53 @@ def compute_verdict(job: Job) -> None:
             red.append(f"Sandbox içindeki Defender tehdit buldu: {'; '.join(D['ThreatsDetected'][:5])}")
         if D.get("Added"):
             red.append(f"Defender ayarları değiştirildi (istisna eklendi / koruma kapatıldı): {'; '.join(D['Added'][:5])}")
+        if b.get("HoneyfileAlerts"):
+            red.append(f"Yem dosyalara (honeyfile) erişildi/değiştirildi: {'; '.join(b['HoneyfileAlerts'][:4])}")
         if P.get("Services"):
             red.append(f"{len(P['Services'])} yeni servis kuruldu.")
         if P.get("Drivers"):
             red.append(f"{len(P['Drivers'])} yeni sürücü kuruldu.")
         if P.get("Startup"):
             red.append(f"Başlangıç klasörüne {len(P['Startup'])} dosya eklendi.")
+        if P.get("WmiSubscriptions"):
+            red.append(f"WMI olay aboneliği kalıcılığı eklendi ({len(P['WmiSubscriptions'])} kayıt).")
+        if P.get("AppInitDlls"):
+            red.append(f"AppInit_DLLs / LogonScript kalıcılığı eklendi: {'; '.join(P['AppInitDlls'][:3])}")
+        if P.get("BitsJobs"):
+            red.append(f"BITS arka plan aktarım görevi oluşturuldu ({len(P['BitsJobs'])} görev).")
+        if P.get("PsProfiles"):
+            red.append(f"PowerShell profil dosyası oluşturuldu/değiştirildi ({len(P['PsProfiles'])}).")
+        if P.get("ComHijacks"):
+            notes.append(f"HKCU COM sınıfı kaydı eklendi ({len(P['ComHijacks'])}) — COM hijacking ihtimali.")
+        if P.get("ActiveSetup"):
+            notes.append(f"Active Setup kalıcılık kaydı eklendi ({len(P['ActiveSetup'])}).")
         if P.get("Tasks"):
             notes.append(f"{len(P['Tasks'])} yeni zamanlanmış görev — ürüne mi ait kontrol edin.")
         if P.get("RunKeys"):
             notes.append(f"{len(P['RunKeys'])} otomatik başlatma kaydı eklendi/değişti.")
         if (b.get("Hosts") or {}).get("Added"):
             notes.append(f"hosts dosyası değişti ({len(b['Hosts']['Added'])} satır) — crack'ler lisans sunucusunu genelde böyle engeller.")
+        if (b.get("Hosts") or {}).get("Removed"):
+            notes.append(f"hosts dosyasından {len(b['Hosts']['Removed'])} satır silindi.")
         if (b.get("Firewall") or {}).get("Added"):
             notes.append(f"{len(b['Firewall']['Added'])} güvenlik duvarı kuralı eklendi — crack'ler ürünün internetini genelde böyle keser.")
+        new_listen = (b.get("Network") or {}).get("NewListening") or []
+        if new_listen:
+            red.append(f"Yeni dinleyici (listening) TCP portu açıldı: {'; '.join(new_listen[:4])}")
         sus = [p for p in b.get("Processes") or [] if p.get("Suspicious")]
         if sus:
             red.append(f"{len(sus)} işlem şüpheli komut satırıyla çalıştı (gizli/şifreli PowerShell, indirme, Defender müdahalesi...).")
+        mod_exec = (b.get("Files") or {}).get("ModifiedExecutables") or []
+        if mod_exec:
+            red.append(f"Mevcut {len(mod_exec)} çalıştırılabilir dosya değiştirildi: {', '.join(mod_exec[:4])}")
+        for dh in (b.get("Files") or {}).get("DroppedHashes") or []:
+            if not isinstance(dh, dict):
+                continue
+            d_flags = dh.get("Flags") or []
+            if isinstance(d_flags, list) and d_flags:
+                red.append(f"Bırakılan dosya '{Path(str(dh.get('Path') or 'dosya')).name}' şüpheli dizgeler içeriyor: {', '.join(str(x) for x in d_flags[:4])}")
+            elif dh.get("SigStatus") not in ("Valid", None, "") and float(dh.get("Entropy") or 0) > 7.2:
+                notes.append(f"Bırakılan imzasız dosya '{Path(str(dh.get('Path') or 'dosya')).name}' yüksek entropili ({dh.get('Entropy')}/8).")
         dropped = [f for f in (b.get("Files") or {}).get("NewExecutables") or [] if re.search(r"\\AppData\\|\\Temp\\|\\ProgramData\\|\\Users\\Public\\", f, re.I)]
         if dropped:
             notes.append(f"AppData/Temp/ProgramData içine {len(dropped)} yeni çalıştırılabilir dosya bırakıldı.")
@@ -1703,6 +2021,9 @@ def compute_verdict(job: Job) -> None:
             red.append(f"Canlı: {len(q['Services'])} yeni servis.")
         if live.get("SuspiciousCount"):
             red.append(f"Canlı: {live['SuspiciousCount']} şüpheli komut satırı.")
+    pm_sum = _read_json(job.output_dir / "procmon_summary.json")
+    if isinstance(pm_sum, dict) and isinstance(pm_sum.get("SensitiveEvents"), list) and pm_sum["SensitiveEvents"]:
+        red.append(f"Procmon: hassas sistem/kimlik dosyalarına erişim tespit edildi ({len(pm_sum['SensitiveEvents'])} olay).")
     net = s.get("network")
     if net:
         names = (net.get("dns") or []) + (net.get("sni") or []) + [{"name": h["host"], "class": h["class"]} for h in net.get("http") or []]
@@ -1714,6 +2035,8 @@ def compute_verdict(job: Job) -> None:
             notes.append(f"{len(unk)} bilinmeyen (Microsoft/Adobe dışı) alan adıyla iletişim: {', '.join(unk[:10])}")
         if cloud:
             notes.append(f"{len(cloud)} paylaşımlı bulut/CDN adresi (Windows'un kendi trafiği de olabilir, zararlılar da kullanır): {', '.join(cloud[:8])}")
+        if net.get("doh_domains"):
+            notes.append(f"DNS-over-HTTPS (DoH) sunucusu tespit edildi: {', '.join(str(x) for x in net['doh_domains'][:5])} — şifreli DNS sorguları normal DNS listesinde görünmeyebilir.")
         if net.get("partial"):
             notes.append(f"Ağ özeti kısmi: {', '.join(net['partial'])} sorgusu zaman aşımına uğradı (kayıt çok büyük). Tamamı için kaydı Wireshark'ta açın.")
     # Coverage: "no red flags" must not look like a clean bill of health when checks did not actually run.
@@ -1770,6 +2093,22 @@ def write_report(job: Job) -> None:
     yara_rows: List[str] = []
     for st in (s.get("static") or [])[:15]:
         L.append(f"- **{st['rel']}** — risk {st['risk_score']}/100, imza: {(st.get('signature') or {}).get('status')}; " + "; ".join(st.get("risk_reasons", [])[:4]))
+        pe = st.get("pe_info") or {}
+        if pe.get("is_pe"):
+            pe_bits = [x for x in (
+                pe.get("architecture"),
+                f"derleme: {pe['compile_time']}" if pe.get("compile_time") else "",
+                f"import: {pe.get('total_imports', 0)}",
+                f"imphash: `{pe['imphash']}`" if pe.get("imphash") else "",
+                ".NET (CLR)" if pe.get("is_dotnet") else "",
+                f"Overlay: {round(pe['overlay']['size'] / 1048576, 2)} MB" if pe.get("overlay") else "",
+            ) if x]
+            if pe_bits:
+                L.append(f"  - PE: {' | '.join(pe_bits)}")
+        if st.get("interesting_ips"):
+            L.append(f"  - Dizge içi IP'ler: `{', '.join(st['interesting_ips'][:10])}`")
+        if st.get("deobfuscated_snippets"):
+            L.append(f"  - Çözülen gizli komut ({len(st['deobfuscated_snippets'])}): `{st['deobfuscated_snippets'][0].get('decoded', '')[:140]}`")
         for ym in st.get("yara_matches") or []:
             yara_rows.append(f"- **{st['rel']}** → `{ym.get('rule')}` ({ym.get('severity')}): {ym.get('description', '')}")
     if yara_rows:
@@ -1779,11 +2118,23 @@ def write_report(job: Job) -> None:
         L += ["", "## Sandbox davranışı", "", f"- Çalıştırılan: `{b.get('Target')}` ({b.get('RunMode')})",
               f"- İzleme: {b.get('Started')} → {b.get('Ended')}", f"- Ağ kaydı: {b.get('CaptureStatus')}",
               f"- Yerel ağ engeli: {(b.get('LanBlock') or {}).get('Status')}" + (" — **KALDIRILMAYA ÇALIŞILDI**" if (b.get('LanBlock') or {}).get('Tampered') else ""), ""]
-        sections = [("Defender değişiklikleri", (b.get("Defender") or {}).get("Added")), ("Defender tespitleri", (b.get("Defender") or {}).get("ThreatsDetected")),
+        sections = [("Yem dosya (honeyfile) uyarıları", b.get("HoneyfileAlerts")),
+                    ("Defender değişiklikleri", (b.get("Defender") or {}).get("Added")), ("Defender tespitleri", (b.get("Defender") or {}).get("ThreatsDetected")),
                     ("Yeni servisler", (b.get("Persistence") or {}).get("Services")), ("Yeni sürücüler", (b.get("Persistence") or {}).get("Drivers")),
                     ("Yeni zamanlanmış görevler", (b.get("Persistence") or {}).get("Tasks")), ("Otomatik başlatma kayıtları", (b.get("Persistence") or {}).get("RunKeys")),
-                    ("Başlangıç klasörü", (b.get("Persistence") or {}).get("Startup")), ("hosts eklenen satırlar", (b.get("Hosts") or {}).get("Added")),
-                    ("Güvenlik duvarı kuralları", (b.get("Firewall") or {}).get("Added")), ("Yeni çalıştırılabilir dosyalar", (b.get("Files") or {}).get("NewExecutables"))]
+                    ("Başlangıç klasörü", (b.get("Persistence") or {}).get("Startup")),
+                    ("WMI kalıcılık abonelikleri", (b.get("Persistence") or {}).get("WmiSubscriptions")),
+                    ("COM hijacking kayıtları", (b.get("Persistence") or {}).get("ComHijacks")),
+                    ("AppInit / LogonScript", (b.get("Persistence") or {}).get("AppInitDlls")),
+                    ("BITS görevleri", (b.get("Persistence") or {}).get("BitsJobs")),
+                    ("PowerShell profilleri", (b.get("Persistence") or {}).get("PsProfiles")),
+                    ("Active Setup kayıtları", (b.get("Persistence") or {}).get("ActiveSetup")),
+                    ("hosts eklenen satırlar", (b.get("Hosts") or {}).get("Added")),
+                    ("hosts silinen satırlar", (b.get("Hosts") or {}).get("Removed")),
+                    ("Güvenlik duvarı kuralları", (b.get("Firewall") or {}).get("Added")),
+                    ("Yeni dinleyici portlar (TCP)", (b.get("Network") or {}).get("NewListening")),
+                    ("Yeni çalıştırılabilir dosyalar", (b.get("Files") or {}).get("NewExecutables")),
+                    ("Değiştirilen çalıştırılabilir dosyalar", (b.get("Files") or {}).get("ModifiedExecutables"))]
         for title, items in sections:
             items = items or []
             L.append(f"### {title} ({len(items)})")
@@ -1806,8 +2157,12 @@ def write_report(job: Job) -> None:
                 return ""
             return f" (`{', '.join(ps[:3])}`" + (" [örnek]" if row.get("from_sample") else "") + ")"
         L += ["", "## Ağ özeti (tshark)", "", "### DNS"] + [f"- {d['name']} ×{d['count']}{_ptag(d)} — {d['class']}" for d in net["dns"][:100]]
-        L += ["", "### TLS SNI"] + [f"- {d['name']} ×{d['count']}{_ptag(d)} — {d['class']}" for d in net["sni"][:100]]
+        L += ["", "### TLS / QUIC SNI"] + [f"- {d['name']} ×{d['count']}{_ptag(d)} — {d['class']}" for d in net["sni"][:100]]
         L += ["", "### HTTP"] + [f"- {h['method']} http://{h['host']}{h['uri']}{_ptag(h)} — {h['class']}" for h in net["http"][:100]]
+        if net.get("udp_targets"):
+            L += ["", "### UDP hedefleri"] + [f"- {u['target']} ×{u['count']}{_ptag(u)}" for u in net["udp_targets"][:60]]
+        if net.get("doh_domains"):
+            L += ["", "### Tespit edilen DoH sunucuları"] + [f"- `{d}`" for d in net["doh_domains"]]
     L += ["", "## Sınırlar", "", "- Zararlılar sandbox'ı fark edip sessiz kalabilir veya izleme süresinden uzun bekleyebilir.",
           "- Windows arka plan trafiği kayda karışır; 'gürültü' sınıflandırması tahmindir.", "- Temiz sonuç riski azaltır, güvenli olduğunu kanıtlamaz."]
     (job.case_dir / "report.md").write_text("\n".join(L), encoding="utf-8")
@@ -2016,13 +2371,19 @@ def collect_iocs(job: Job, include_noise: bool = False) -> List[Dict[str, Any]]:
                 rec.get("rel", ""), malicious=(sig_st == "HashMismatch"))
 
     for st in s.get("static") or []:
-        sha = (st.get("sha256") or "").strip().lower()
+        sha = (st.get("sha256") or (st.get("hashes") or {}).get("sha256") or "").strip().lower()
         if _SHA256_RE.fullmatch(sha):
             score = int(st.get("risk_score") or 0)
             yara = [m.get("rule") for m in (st.get("yara_matches") or []) if m.get("rule")]
             cls = f"Risk {score}/100" + (f" [YARA: {', '.join(yara[:3])}]" if yara else "")
             add("sha256", sha, "static", cls, st.get("rel", ""),
                 malicious=(score >= 50 or bool(yara)))
+        for ip_raw in st.get("interesting_ips") or []:
+            ip_part = str(ip_raw).strip().rsplit(":", 1)[0] if ":" in str(ip_raw) else str(ip_raw).strip()
+            ip_obj = _clean_ip(ip_part)
+            if ip_obj and not (ip_obj.is_unspecified or ip_obj.is_loopback or ip_obj.is_multicast):
+                itype = "ipv6" if ip_obj.version == 6 else "ipv4"
+                add(itype, str(ip_obj), "static", "Statik dizge içi IP", f"{st.get('rel', '')} ({ip_raw})")
         for u in st.get("interesting_urls") or []:
             u = str(u).strip()
             if u.startswith(("http://", "https://")):
@@ -2273,10 +2634,19 @@ def compare_jobs(base_job: Job, target_job: Job) -> Dict[str, Any]:
         "drivers": _diff_list(b_per.get("Drivers"), t_per.get("Drivers")),
         "tasks": _diff_list(b_per.get("Tasks"), t_per.get("Tasks")),
         "runkeys": _diff_list((b_per.get("RunKeys") or []) + (b_per.get("Startup") or []), (t_per.get("RunKeys") or []) + (t_per.get("Startup") or [])),
+        "wmi_subscriptions": _diff_list(b_per.get("WmiSubscriptions"), t_per.get("WmiSubscriptions")),
+        "com_hijacks": _diff_list(b_per.get("ComHijacks"), t_per.get("ComHijacks")),
+        "appinit_dlls": _diff_list(b_per.get("AppInitDlls"), t_per.get("AppInitDlls")),
+        "bits_jobs": _diff_list(b_per.get("BitsJobs"), t_per.get("BitsJobs")),
+        "ps_profiles": _diff_list(b_per.get("PsProfiles"), t_per.get("PsProfiles")),
         "defender": _diff_list((b_beh.get("Defender") or {}).get("Added") or [], (t_beh.get("Defender") or {}).get("Added") or []),
         "hosts": _diff_list((b_beh.get("Hosts") or {}).get("Added"), (t_beh.get("Hosts") or {}).get("Added")),
+        "hosts_removed": _diff_list((b_beh.get("Hosts") or {}).get("Removed"), (t_beh.get("Hosts") or {}).get("Removed")),
         "firewall": _diff_list((b_beh.get("Firewall") or {}).get("Added"), (t_beh.get("Firewall") or {}).get("Added")),
         "dropped_executables": _diff_list((b_beh.get("Files") or {}).get("NewExecutables"), (t_beh.get("Files") or {}).get("NewExecutables")),
+        "modified_executables": _diff_list((b_beh.get("Files") or {}).get("ModifiedExecutables"), (t_beh.get("Files") or {}).get("ModifiedExecutables")),
+        "new_listening": _diff_list((b_beh.get("Network") or {}).get("NewListening"), (t_beh.get("Network") or {}).get("NewListening")),
+        "honeyfile_alerts": _diff_list(b_beh.get("HoneyfileAlerts"), t_beh.get("HoneyfileAlerts")),
         "suspicious_processes": _diff_list(
             [f"{p.get('Name')}: {p.get('CommandLine') or ''}" for p in (b_beh.get("Processes") or []) if isinstance(p, dict) and p.get("Suspicious")],
             [f"{p.get('Name')}: {p.get('CommandLine') or ''}" for p in (t_beh.get("Processes") or []) if isinstance(p, dict) and p.get("Suspicious")],
@@ -2298,9 +2668,12 @@ def compare_jobs(base_job: Job, target_job: Job) -> Dict[str, Any]:
     if static_deltas:
         yara_hits = sum(len(d["new_yara"]) for d in static_deltas)
         highlights.append(f"{len(static_deltas)} dosyada statik risk artışı" + (f" ve {yara_hits} yeni YARA eşleşmesi" if yara_hits else "") + ".")
-    pers_cnt = sum(len(behavior_diff[k]) for k in ("services", "drivers", "tasks", "runkeys", "defender", "firewall"))
+    pers_cnt = sum(len(behavior_diff[k]) for k in (
+        "services", "drivers", "tasks", "runkeys", "wmi_subscriptions", "com_hijacks", "appinit_dlls", "bits_jobs", "ps_profiles",
+        "defender", "firewall", "modified_executables", "new_listening", "honeyfile_alerts",
+    ))
     if pers_cnt:
-        highlights.append(f"Hedef sandbox'ta fazladan {pers_cnt} kalıcılık/güvenlik değişikliği bıraktı.")
+        highlights.append(f"Hedef sandbox'ta fazladan {pers_cnt} kalıcılık/güvenlik/davranış farkı bıraktı.")
     if extra_domains or extra_ips:
         highlights.append(f"Hedef fazladan {len(extra_domains)} alan adı ve {len(extra_ips)} IP ile iletişim kurdu.")
 

@@ -26,6 +26,7 @@ def isolated(tmp_path, monkeypatch):
     cases.mkdir()
     monkeypatch.setattr(pipeline, "CASES_DIR", cases)
     monkeypatch.setattr(pipeline, "AV_SETTLE_SEC", 0)
+    monkeypatch.setattr(vt_client, "CONFIG_PATH", tmp_path / "no_config.json")
     monkeypatch.setattr(vt_client, "get_api_key", lambda: "")
 
     def no_network(*a, **k):

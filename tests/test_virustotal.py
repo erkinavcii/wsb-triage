@@ -259,3 +259,35 @@ def test_intel_client_malwarebazaar_and_hybrid_analysis_fallback(tmp_path, monke
     assert job.state["verdict"]["level"] == "red"
     assert any("MalwareBazaar" in r for r in job.state["verdict"]["red"])
     assert any("Hybrid Analysis" in r for r in job.state["verdict"]["red"])
+
+
+def test_e5_dropped_files_fallback_to_mb_ha_without_vt(tmp_path, monkeypatch):
+    import intel_client
+    sha = "d" * 64
+    job = bare_job(tmp_path)
+    monkeypatch.setattr(vt_client, "get_api_key", lambda: "")
+    monkeypatch.setattr(intel_client, "has_configured_sources", lambda: True)
+    monkeypatch.setattr(intel_client, "get_intel_config", lambda: {"mb_enabled": True, "ha_api_key": "ha-k"})
+    monkeypatch.setattr(intel_client, "query_hash_intel", lambda s, **kw: {
+        "sha256": s, "any_found": True, "malicious": True, "summary": "MalwareBazaar: AsyncRAT",
+        "malwarebazaar": {"found": True, "family": "AsyncRAT", "gui_url": "https://bazaar.abuse.ch"},
+        "hybrid_analysis": {"found": False},
+    })
+
+    pipeline._check_dropped_files_vt(job, {"Files": {"DroppedHashes": [{"Path": r"C:\Temp\drop.exe", "SHA256": sha, "Size": 4096}]}})
+    assert len(job.state["vt"]) == 1
+    entry = job.state["vt"][0]
+    assert entry["dropped"] is True
+    assert entry["intel"]["malicious"] is True
+    assert job.state["verdict"]["level"] == "red"
+    assert any("MalwareBazaar" in r for r in job.state["verdict"]["red"])
+
+
+def test_suspicious_pdf_is_flagged_statically_but_never_uploaded_to_vt(tmp_path, fake_vt, run_job):
+    pdf = tmp_path / "gizli_sozlesme.pdf"
+    pdf.write_bytes(b"%PDF-1.7\n1 0 obj << /OpenAction 2 0 R /JavaScript (app.alert(1)) >>\n%%EOF")
+    job = run_job(pdf, vt_upload=True)
+    assert fake_vt.uploads == []
+    assert "gizlilik" in _statuses(job)["[orijinal] gizli_sozlesme.pdf"]
+    assert job.state["verdict"]["level"] == "red"
+

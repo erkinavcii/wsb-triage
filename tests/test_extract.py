@@ -160,3 +160,36 @@ def test_plain_pe_is_not_unpacked_as_installer(tmp_path, run_job):
     assert job.state["stages"]["extract"]["status"] == "done"
     assert not job.unpacked_dir.exists()
     assert job.state["inventory"]["files"] == 1
+
+
+def test_unpack_asar_extracts_safe_files_and_blocks_traversal(tmp_path):
+    import json
+    import struct
+    good_bytes = b"console.log('hello electron');"
+    evil_bytes = b"evil!"
+    manifest = {
+        "files": {
+            "app": {"files": {"main.js": {"offset": "0", "size": len(good_bytes)}}},
+            "..": {"files": {"..": {"files": {"evil.js": {"offset": str(len(good_bytes)), "size": len(evil_bytes)}}}}},
+        }
+    }
+    mbytes = json.dumps(manifest).encode("utf-8")
+    hdr = struct.pack("<IIII", 4, 8 + len(mbytes), 4 + len(mbytes), len(mbytes))
+    asar = tmp_path / "app.asar"
+    asar.write_bytes(hdr + mbytes + good_bytes + evil_bytes)
+
+    dest = tmp_path / "out"
+    count = pipeline._unpack_asar(asar, dest)
+    assert count == 1
+    assert (dest / "app" / "main.js").read_bytes() == good_bytes
+    assert not (tmp_path / "evil.js").exists()
+
+
+def test_analyzer_scan_path_blocks_zip_slip(tmp_path):
+    import analyzer
+    bad_zip = tmp_path / "slip.zip"
+    with zipfile.ZipFile(bad_zip, "w") as zf:
+        zf.writestr("../../outside.exe", b"MZ")
+    with pytest.raises(ValueError, match="güvenli olmayan yol"):
+        analyzer.scan_path(str(bad_zip))
+

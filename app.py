@@ -9,7 +9,7 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Body, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -141,6 +141,14 @@ class IntelConfigRequest(BaseModel):
     mb_api_key: Optional[str] = None
     ha_api_key: Optional[str] = None
     mb_enabled: Optional[bool] = None
+    clear_vt: bool = False
+    clear_mb: bool = False
+    clear_ha: bool = False
+
+
+class YaraRuleRequest(BaseModel):
+    name: str
+    content: str
 
 
 class VtUploadRequest(BaseModel):
@@ -159,15 +167,42 @@ class JobRequest(BaseModel):
     path: str
     password: Optional[str] = ""
     target: Optional[str] = ""
+    target_args: Optional[str] = ""
+    dll_export: Optional[str] = ""
     duration_min: Optional[int] = 10
     network: Optional[bool] = True
     vt_upload: Optional[bool] = True
     max_vt: Optional[int] = 12
     run_sandbox: Optional[bool] = True
     keep_sandbox_open: Optional[bool] = False
-    simulate_user: Optional[bool] = False
+    simulate_user: Optional[bool] = True
     notify: Optional[bool] = True
     memory_mb: Optional[int] = 4096
+    run_as_standard_user: Optional[bool] = False
+    seed_honeyfiles: Optional[bool] = True
+    sandbox_backend: Optional[str] = "wsb"
+    vbox_vm: Optional[str] = ""
+    vbox_snapshot: Optional[str] = ""
+    vbox_user: Optional[str] = ""
+    vbox_password: Optional[str] = ""
+
+
+class SandboxStartRequest(BaseModel):
+    target: Optional[str] = None
+    target_args: Optional[str] = None
+    dll_export: Optional[str] = None
+    duration_min: Optional[int] = None
+    memory_mb: Optional[int] = None
+    network: Optional[bool] = None
+    keep_sandbox_open: Optional[bool] = None
+    simulate_user: Optional[bool] = None
+    run_as_standard_user: Optional[bool] = None
+    seed_honeyfiles: Optional[bool] = None
+    sandbox_backend: Optional[str] = None
+    vbox_vm: Optional[str] = None
+    vbox_snapshot: Optional[str] = None
+    vbox_user: Optional[str] = None
+    vbox_password: Optional[str] = None
 
 
 class WatchRequest(BaseModel):
@@ -216,18 +251,26 @@ async def index(request: Request, token: Optional[str] = None):
     )
 
 
+def _mask_key(k: str) -> str:
+    if not k:
+        return ""
+    return (k[:4] + "..." + k[-4:]) if len(k) > 8 else "****"
+
+
 @app.get("/api/system-status")
 def system_status():
     caps = sandbox_manager.get_system_capabilities()
     key = vt_client.get_api_key()
     caps["vt_api_configured"] = bool(key)
-    caps["vt_api_masked"] = (key[:4] + "..." + key[-4:]) if len(key) > 8 else ""
+    caps["vt_api_masked"] = _mask_key(key)
     caps["procmon"] = any((BASE_DIR / "sandbox" / n).exists() for n in ("Procmon64.exe", "Procmon.exe"))
     caps["yara"] = yara_scanner.rules_status()
     icfg = intel_client.get_intel_config()
     caps["mb_enabled"] = icfg["mb_enabled"]
     caps["mb_api_configured"] = bool(icfg["mb_api_key"])
+    caps["mb_api_masked"] = _mask_key(icfg["mb_api_key"])
     caps["ha_api_configured"] = bool(icfg["ha_api_key"])
+    caps["ha_api_masked"] = _mask_key(icfg["ha_api_key"])
     caps["context_menu"] = sandbox_manager.context_menu_status()
     return caps
 
@@ -241,11 +284,15 @@ def save_vt_config(req: ApiKeyRequest):
 
 @app.post("/api/intel/config")
 def save_intel_config(req: IntelConfigRequest):
-    if req.vt_api_key is not None and req.vt_api_key.strip():
+    if req.clear_vt:
+        vt_client.set_api_key("")
+    elif req.vt_api_key is not None and req.vt_api_key.strip():
         vt_client.set_api_key(req.vt_api_key.strip())
+    mb_val = "" if req.clear_mb else (req.mb_api_key.strip() if req.mb_api_key and req.mb_api_key.strip() else None)
+    ha_val = "" if req.clear_ha else (req.ha_api_key.strip() if req.ha_api_key and req.ha_api_key.strip() else None)
     icfg = intel_client.set_intel_config(
-        mb_api_key=req.mb_api_key.strip() if req.mb_api_key else None,
-        ha_api_key=req.ha_api_key.strip() if req.ha_api_key else None,
+        mb_api_key=mb_val,
+        ha_api_key=ha_val,
         mb_enabled=req.mb_enabled,
     )
     return {
@@ -334,16 +381,20 @@ def job_state(case_id: str):
     st = job.snapshot()
     st["case_dir"] = str(job.case_dir)
     st["has_pcap"] = (job.output_dir / "capture.pcapng").exists()
+    st["has_procmon"] = (job.output_dir / "procmon.pml").exists()
+    st["procmon_summary"] = pipeline._read_json(job.output_dir / "procmon_summary.json")
     st["has_report"] = (job.case_dir / "report.md").exists()
     st["screenshots"] = pipeline.list_screenshots(job)
+    st["runnable_targets"] = pipeline.list_runnable_targets(job)
     return st
 
 
 @app.post("/api/jobs/{case_id}/sandbox")
-def job_run_sandbox(case_id: str):
+def job_run_sandbox(case_id: str, req: Optional[SandboxStartRequest] = Body(default=None)):
     job = _job(case_id)
     try:
-        pipeline.start_sandbox_later(job)
+        overrides = req.model_dump(exclude_none=True) if req else None
+        pipeline.start_sandbox_later(job, overrides=overrides)
     except pipeline.PipelineError as e:
         raise HTTPException(409, str(e))
     return {"status": "started"}
@@ -448,11 +499,76 @@ def job_open(case_id: str, what: str = "folder"):
         if not sandbox_manager.tshark_path():
             raise HTTPException(400, "Wireshark kurulu değil")
         os.startfile(str(p))
+    elif what == "procmon":
+        p = job.output_dir / "procmon.pml"
+        if not p.exists():
+            raise HTTPException(404, "Process Monitor kaydı yok")
+        os.startfile(str(p))
     elif what == "report":
-        os.startfile(str(job.case_dir / "report.md"))
+        p = job.case_dir / "report.md"
+        if not p.exists():
+            raise HTTPException(404, "Rapor henüz yok")
+        os.startfile(str(p))
     else:
         os.startfile(str(job.case_dir))
     return {"status": "ok"}
+
+
+def _format_hex_dump(data: bytes) -> str:
+    lines: list[str] = []
+    for off in range(0, len(data), 16):
+        chunk = data[off:off + 16]
+        hex_part = " ".join(f"{b:02x}" for b in chunk)
+        ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        lines.append(f"{off:08x}  {hex_part:<47}  |{ascii_part}|")
+    return "\n".join(lines)
+
+
+@app.get("/api/jobs/{case_id}/preview")
+def job_preview_file(case_id: str, file_path: str, mode: str = "text"):
+    job = _job(case_id)
+    if mode not in ("text", "strings", "hex"):
+        raise HTTPException(400, "Geçersiz önizleme modu (text, strings veya hex olmalı).")
+    try:
+        raw_p = Path(file_path)
+        if raw_p.is_symlink():
+            raise HTTPException(400, "Sembolik bağlantılar önizlenemez.")
+        p = raw_p.resolve()
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(400, "Geçersiz dosya yolu.")
+    allowed_roots = [job.input_dir.resolve(), job.unpacked_dir.resolve()]
+    if not any(r in p.parents for r in allowed_roots):
+        raise HTTPException(400, "Yalnızca bu analizin örnek dosyaları önizlenebilir.")
+    if not p.is_file():
+        raise HTTPException(404, "Dosya bulunamadı.")
+
+    total_size = p.stat().st_size
+    limit = 16384 if mode == "hex" else 131072
+    with open(p, "rb") as f:
+        data = f.read(limit)
+    truncated = total_size > len(data)
+
+    if mode == "hex":
+        content = _format_hex_dump(data)
+    elif mode == "strings":
+        content = analyzer.extract_printable_strings(data, min_len=4)[:120000]
+    else:
+        decoded = data.decode("utf-8", errors="replace")
+        non_print = sum(1 for c in decoded[:4096] if ord(c) < 32 and c not in "\r\n\t")
+        prefix = ""
+        if decoded and (non_print / max(1, min(len(decoded), 4096))) > 0.25:
+            prefix = "[İkili dosya — metin görünümü]\n\n"
+        content = prefix + decoded
+
+    return {
+        "file": p.name,
+        "mode": mode,
+        "size": total_size,
+        "truncated": truncated,
+        "content": content,
+    }
 
 
 # ------------------------------------------------------------------ downloads watcher
@@ -487,6 +603,44 @@ def enable_wsb():
 @app.post("/api/vbox/harden")
 def harden_vbox(req: VboxHardenRequest):
     return sandbox_manager.harden_and_snapshot_virtualbox_vm(req.vm_name)
+
+
+@app.get("/api/vbox/snapshots/{vm_name}")
+def vbox_snapshots(vm_name: str):
+    return {"vm_name": vm_name, "snapshots": sandbox_manager.list_vbox_snapshots(vm_name)}
+
+
+@app.get("/api/yara/rules")
+def yara_rules_list():
+    return {"status": yara_scanner.rules_status(), "files": yara_scanner.list_rule_files()}
+
+
+@app.get("/api/yara/rules/{name}")
+def yara_rule_read(name: str):
+    try:
+        return {"name": name, "content": yara_scanner.read_rule_file(name)}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except FileNotFoundError:
+        raise HTTPException(404, "YARA kural dosyası bulunamadı.")
+
+
+@app.post("/api/yara/rules")
+def yara_rule_save(req: YaraRuleRequest):
+    try:
+        return yara_scanner.save_custom_rule_file(req.name, req.content)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.delete("/api/yara/rules/{name}")
+def yara_rule_delete(name: str):
+    try:
+        return yara_scanner.delete_custom_rule_file(name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except FileNotFoundError:
+        raise HTTPException(404, "YARA kural dosyası bulunamadı.")
 
 
 @app.post("/api/context-menu")

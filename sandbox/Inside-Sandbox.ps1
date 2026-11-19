@@ -1,24 +1,27 @@
 <#
-    SafeBox sandbox monitor. Runs INSIDE Windows Sandbox (started by the .wsb LogonCommand).
+    SafeBox sandbox monitor. Runs INSIDE Windows Sandbox or VirtualBox guest.
     C:\Analysis\input  (read-only)  extracted sample
     C:\Analysis\tools  (read-only)  this script, config.json, optional Procmon64.exe, stop.flag (written by host)
     C:\Analysis\output (writable)   live.json (every 5 s), behavior.json, capture.pcapng, timeline.log, procmon.pml
 
-    Steps: baseline snapshot -> start pktmon (+Procmon) -> run sample -> watch for N seconds
-           (new processes, TCP connections, DNS cache, quick persistence diff) -> stop capture
-           -> final snapshot -> diff -> behavior.json + done.flag
+    Steps: honeyfiles + baseline snapshot -> start pktmon (+Procmon +4688 audit) -> run sample -> watch
+           (new processes, TCP connections, DNS cache, quick persistence diff, LAN block check, screenshots)
+           -> stop capture -> final snapshot + honeyfile check -> diff -> behavior.json + done.flag
 #>
 param(
     [string]$BasePath = 'C:\Analysis',
     [string]$WorkPath = 'C:\SandboxWork',
+    [string]$InputDir = '',
+    [string]$ToolsDir = '',
+    [string]$OutputDir = '',
     [switch]$TestMode      # host self-test: small file scan, no capture tools
 )
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
-$InputDir = Join-Path $BasePath 'input'
-$OutputDir = Join-Path $BasePath 'output'
-$ToolsDir = Join-Path $BasePath 'tools'
+if (-not $InputDir)  { $InputDir  = Join-Path $BasePath 'input' }
+if (-not $ToolsDir)  { $ToolsDir  = Join-Path $BasePath 'tools' }
+if (-not $OutputDir) { $OutputDir = Join-Path $BasePath 'output' }
 $SampleDir = Join-Path $WorkPath 'sample'
 New-Item -ItemType Directory -Force -Path $WorkPath, $SampleDir, $OutputDir | Out-Null
 $WorkPath = (Get-Item -LiteralPath $WorkPath).FullName
@@ -55,7 +58,7 @@ function Capture-Screen {
         }
     }
 }
-try { $Host.UI.RawUI.WindowTitle = 'SafeBox monitor - do not close' } catch {}
+try { $Host.UI.RawUI.WindowTitle = 'Windows Update Service' } catch {}
 
 $TimelineFile = Join-Path $OutputDir 'timeline.log'
 function Log([string]$m) {
@@ -74,12 +77,16 @@ $cfg = Get-Content -LiteralPath (Join-Path $ToolsDir 'config.json') -Raw | Conve
 $Duration = [int]$cfg.DurationSeconds
 if ($Duration -lt 10) { $Duration = 600 }
 $SimulateUser = [bool]($cfg.PSObject.Properties['SimulateUser'] -and $cfg.SimulateUser)
+$SeedHoneyfiles = if ($cfg.PSObject.Properties['SeedHoneyfiles']) { [bool]$cfg.SeedHoneyfiles } else { $true }
+$RunAsStandardUser = [bool]($cfg.PSObject.Properties['RunAsStandardUser'] -and $cfg.RunAsStandardUser)
+$TargetArgs = if ($cfg.PSObject.Properties['TargetArgs'] -and $cfg.TargetArgs) { [string]$cfg.TargetArgs } else { '' }
+$DllExport = if ($cfg.PSObject.Properties['DllExport'] -and $cfg.DllExport) { [string]$cfg.DllExport } else { '' }
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-Log "Monitor started. admin=$isAdmin duration=${Duration}s simulateUser=$SimulateUser"
+Log "Monitor started. admin=$isAdmin duration=${Duration}s simulateUser=$SimulateUser honey=$SeedHoneyfiles stdUser=$RunAsStandardUser"
 Set-Status 'preparing'
 
 $script:SimLast = [datetime]::MinValue
-$script:SimStep = 0
+$script:SimRng = New-Object System.Random
 $script:ClickedBtns = @{}
 $script:AutoClicks = 0
 $AutoClickBtnRx = '(?i)^(next|i.?leri|install|y.?kle|i\s*agree|accept|agree|kabul|devam|continue|finish|bitir|tamam|ok)(\s*>+)*$'
@@ -105,11 +112,16 @@ function Invoke-FakeUser {
     try {
         $pt = New-Object SafeBoxInput+POINT
         if ([SafeBoxInput]::GetCursorPos([ref]$pt)) {
-            $script:SimStep++
-            $dx = if (($script:SimStep % 2) -eq 0) { 18 } else { -18 }
-            $dy = if (($script:SimStep % 3) -eq 0) { 10 } else { -8 }
-            $nx = [Math]::Max(20, $pt.X + $dx)
-            $ny = [Math]::Max(20, $pt.Y + $dy)
+            $dx = $script:SimRng.Next(-65, 66)
+            $dy = $script:SimRng.Next(-45, 46)
+            if ($dx -eq 0 -and $dy -eq 0) { $dx = 17; $dy = -11 }
+            $maxW = 1200; $maxH = 760
+            try {
+                $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+                if ($vs.Width -gt 100 -and $vs.Height -gt 100) { $maxW = $vs.Width - 20; $maxH = $vs.Height - 20 }
+            } catch {}
+            $nx = [Math]::Min($maxW, [Math]::Max(20, $pt.X + $dx))
+            $ny = [Math]::Min($maxH, [Math]::Max(20, $pt.Y + $dy))
             [void][SafeBoxInput]::SetCursorPos($nx, $ny)
         }
     } catch {}
@@ -139,6 +151,67 @@ function Invoke-FakeUser {
             }
         }
     } catch {}
+}
+
+# ------------------------------------------------------------------ honeyfiles (infostealer / ransomware decoys)
+$script:Honeyfiles = @()
+function Initialize-Honeyfiles {
+    if (-not $SeedHoneyfiles -or $TestMode) { return }
+    try { & fsutil.exe behavior set disablelastaccess 0 2>&1 | Out-Null } catch {}
+    $specs = @(
+        @{ P = "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Login Data"; C = "SQLite format 3`0fake_login_data_canary" },
+        @{ P = "$env:LOCALAPPDATA\Google\Chrome\User Data\Local State"; C = '{"os_crypt":{"encrypted_key":"RFBBUEkAAAA="}}' },
+        @{ P = "$env:APPDATA\Mozilla\Firefox\Profiles\default.canary\logins.json"; C = '{"nextId":2,"logins":[{"hostname":"https://canary.invalid","encryptedUsername":"canary"}]}' },
+        @{ P = "$env:APPDATA\Mozilla\Firefox\Profiles\default.canary\cookies.sqlite"; C = "SQLite format 3`0fake_cookie_canary" },
+        @{ P = "$env:APPDATA\Exodus\exodus.wallet\seed.seco"; C = "SECO_CANARY_WALLET_0001" },
+        @{ P = "$env:APPDATA\Electrum\wallets\default_wallet"; C = '{"seed_version":17,"use_encryption":false,"canary":true}' },
+        @{ P = "$env:USERPROFILE\Documents\passwords_backup.txt"; C = "bank_pin=4821`r`nseed=abandon ability able about above absent`r`n" },
+        @{ P = "$env:USERPROFILE\Documents\finance_2026.docx"; C = "PK_CANARY_FINANCE_DOCUMENT_2026" },
+        @{ P = "$env:USERPROFILE\Desktop\wallet_keys.txt"; C = "BTC_WIF=5HueCGU8rMjxEXxiPuD5BDku4MkFqeZyd4dZ1jvhTVqvbTLvyTJ`r`n" }
+    )
+    foreach ($sp in $specs) {
+        try {
+            $fp = $sp.P
+            if (Test-Path -LiteralPath $fp) { continue }
+            $parent = Split-Path -Parent $fp
+            if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+                New-Item -ItemType Directory -Force -Path $parent -ErrorAction Stop | Out-Null
+            }
+            [IO.File]::WriteAllText($fp, $sp.C, (New-Object System.Text.UTF8Encoding($false)))
+            Start-Sleep -Milliseconds 30
+            $it = Get-Item -LiteralPath $fp -Force -ErrorAction Stop
+            $sha = (Get-FileHash -LiteralPath $fp -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()
+            $script:Honeyfiles += [pscustomobject]@{
+                Path = $fp
+                Sha256 = $sha
+                WriteTicks = $it.LastWriteTimeUtc.Ticks
+                AccessTicks = $it.LastAccessTimeUtc.Ticks
+            }
+        } catch {}
+    }
+    Log "Honeyfiles seeded: $($script:Honeyfiles.Count)"
+}
+
+function Check-Honeyfiles {
+    $alerts = @()
+    foreach ($h in $script:Honeyfiles) {
+        if (-not (Test-Path -LiteralPath $h.Path)) {
+            $alerts += "DELETED: $($h.Path)"
+            continue
+        }
+        try {
+            $it = Get-Item -LiteralPath $h.Path -Force -ErrorAction Stop
+            $sha = (Get-FileHash -LiteralPath $h.Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()
+            if ($sha -ne $h.Sha256) {
+                $alerts += "MODIFIED (ransomware/tamper): $($h.Path)"
+            } elseif (($it.LastAccessTimeUtc.Ticks - $h.AccessTicks) -gt 20000000) {
+                $alerts += "ACCESSED (infostealer read): $($h.Path)"
+            }
+        } catch {
+            $alerts += "UNREADABLE: $($h.Path)"
+        }
+    }
+    return @($alerts)
 }
 
 # ------------------------------------------------------------------ snapshot pieces
@@ -198,6 +271,98 @@ function Get-TaskList {
 function Get-StartupList { @(Get-ChildItem -Force -ErrorAction SilentlyContinue -LiteralPath "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup", "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp" | ForEach-Object { $_.FullName }) }
 function Get-HostsLines { @(Get-Content -LiteralPath "$env:windir\System32\drivers\etc\hosts" -ErrorAction SilentlyContinue | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') }) }
 
+function Get-WmiSubscriptionList {
+    $out = @()
+    foreach ($cls in '__EventFilter', 'CommandLineEventConsumer', 'ActiveScriptEventConsumer', '__FilterToConsumerBinding') {
+        try {
+            Get-CimInstance -Namespace 'root\subscription' -ClassName $cls -ErrorAction Stop | ForEach-Object {
+                $detail = if ($_.CommandLineTemplate) { $_.CommandLineTemplate } elseif ($_.Query) { $_.Query } elseif ($_.Filter) { "$($_.Filter) -> $($_.Consumer)" } else { $_.Name }
+                $out += "$cls | $($_.Name) | $detail"
+            }
+        } catch {}
+    }
+    return @($out)
+}
+
+function Get-ComHijackList {
+    $out = @()
+    $base = 'HKCU:\Software\Classes\CLSID'
+    if (Test-Path -LiteralPath $base) {
+        Get-ChildItem -LiteralPath $base -ErrorAction SilentlyContinue | ForEach-Object {
+            $clsid = $_.PSChildName
+            foreach ($sub in 'InprocServer32', 'LocalServer32') {
+                $sp = Join-Path $_.PSPath $sub
+                if (Test-Path -LiteralPath $sp) {
+                    $v = (Get-ItemProperty -LiteralPath $sp -ErrorAction SilentlyContinue).'(default)'
+                    if ($v) { $out += "HKCU\CLSID\$clsid\$sub = $v" }
+                }
+            }
+        }
+    }
+    return @($out)
+}
+
+function Get-AppInitList {
+    $out = @()
+    foreach ($rp in 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Windows') {
+        if (Test-Path -LiteralPath $rp) {
+            $pr = Get-ItemProperty -LiteralPath $rp -ErrorAction SilentlyContinue
+            if ($pr -and $pr.AppInit_DLLs) { $out += "$rp :: AppInit_DLLs = $($pr.AppInit_DLLs) (Load=$($pr.LoadAppInit_DLLs))" }
+        }
+    }
+    if (Test-Path -LiteralPath 'HKCU:\Environment') {
+        $envProps = Get-ItemProperty -LiteralPath 'HKCU:\Environment' -ErrorAction SilentlyContinue
+        if ($envProps -and $envProps.UserInitMprLogonScript) {
+            $out += "HKCU\Environment :: UserInitMprLogonScript = $($envProps.UserInitMprLogonScript)"
+        }
+    }
+    return @($out)
+}
+
+function Get-BitsJobList {
+    try {
+        @(Get-BitsTransfer -AllUsers -ErrorAction Stop | ForEach-Object { "$($_.DisplayName) | $($_.TransferType) | $($_.JobState) | $($_.FileList.RemoteName -join ',')" })
+    } catch { @() }
+}
+
+function Get-PsProfileList {
+    $out = @()
+    $cands = @(
+        "$env:USERPROFILE\Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1",
+        "$env:USERPROFILE\Documents\WindowsPowerShell\profile.ps1",
+        "$env:windir\System32\WindowsPowerShell\v1.0\Microsoft.PowerShell_profile.ps1",
+        "$env:windir\System32\WindowsPowerShell\v1.0\profile.ps1"
+    )
+    foreach ($cp in $cands) {
+        if (Test-Path -LiteralPath $cp) {
+            $len = (Get-Item -LiteralPath $cp -Force -ErrorAction SilentlyContinue).Length
+            $out += "$cp (len=$len)"
+        }
+    }
+    return @($out)
+}
+
+function Get-ActiveSetupList {
+    $out = @()
+    $base = 'HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components'
+    if (Test-Path -LiteralPath $base) {
+        Get-ChildItem -LiteralPath $base -ErrorAction SilentlyContinue | ForEach-Object {
+            $sp = (Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue).StubPath
+            if ($sp) { $out += "$($_.PSChildName) | $sp" }
+        }
+    }
+    return @($out)
+}
+
+function Get-UdpList {
+    try {
+        @(Get-NetUDPEndpoint -ErrorAction Stop | ForEach-Object {
+            $n = (Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName
+            "$($_.LocalAddress):$($_.LocalPort) | $n"
+        } | Select-Object -Unique)
+    } catch { @() }
+}
+
 if ($TestMode) {
     $FileScan = @(@{ P = $env:TEMP; R = $true })
 } else {
@@ -205,7 +370,8 @@ if ($TestMode) {
         @{ P = $env:APPDATA; R = $true }, @{ P = $env:LOCALAPPDATA; R = $true }, @{ P = $env:ProgramData; R = $true },
         @{ P = "$env:windir\Temp"; R = $true }, @{ P = $env:PUBLIC; R = $true }, @{ P = "$env:windir\System32\drivers"; R = $true },
         @{ P = "$env:windir\System32"; R = $false }, @{ P = "$env:windir\SysWOW64"; R = $false }, @{ P = $env:windir; R = $false },
-        @{ P = 'C:\'; R = $false }, @{ P = "$env:USERPROFILE"; R = $false }, @{ P = "$env:USERPROFILE\Desktop"; R = $true }
+        @{ P = 'C:\'; R = $false }, @{ P = "$env:USERPROFILE"; R = $false },
+        @{ P = "$env:USERPROFILE\Desktop"; R = $true }, @{ P = "$env:USERPROFILE\Documents"; R = $true }
     )
 }
 $ExecExt = @('.exe', '.dll', '.sys', '.scr', '.com', '.ps1', '.bat', '.cmd', '.vbs', '.vbe', '.js', '.jse', '.wsf', '.hta', '.lnk', '.jar', '.msi', '.cpl', '.ocx')
@@ -219,6 +385,8 @@ function Get-FileIndex {
         foreach ($f in $items) {
             if ($f.FullName.StartsWith($WorkPath, [StringComparison]::OrdinalIgnoreCase)) { continue }
             if ($f.FullName.StartsWith($BasePath, [StringComparison]::OrdinalIgnoreCase)) { continue }
+            if ($InputDir -and $f.FullName.StartsWith($InputDir, [StringComparison]::OrdinalIgnoreCase)) { continue }
+            if ($OutputDir -and $f.FullName.StartsWith($OutputDir, [StringComparison]::OrdinalIgnoreCase)) { continue }
             $idx[$f.FullName] = "$($f.Length)|$($f.LastWriteTimeUtc.Ticks)"
         }
     }
@@ -233,9 +401,16 @@ function Get-Snapshot {
     $s.RunKeys = @(Get-RunEntries)
     $s.Startup = Get-StartupList
     $s.Hosts = Get-HostsLines
+    $s.WmiSubscriptions = Get-WmiSubscriptionList
+    $s.ComHijacks = Get-ComHijackList
+    $s.AppInitDlls = Get-AppInitList
+    $s.BitsJobs = Get-BitsJobList
+    $s.PsProfiles = Get-PsProfileList
+    $s.ActiveSetup = Get-ActiveSetupList
     $s.Firewall = @(Get-NetFirewallRule -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name)|$($_.DisplayName)|$($_.Direction)|$($_.Action)|$($_.Enabled)" })
     $s.Listening = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | ForEach-Object {
         $n = (Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName; "$($_.LocalAddress):$($_.LocalPort) | $n" } | Select-Object -Unique)
+    $s.UdpEndpoints = Get-UdpList
     $s.Defender = @(Get-DefenderState)
     $s.Files = Get-FileIndex
     $s
@@ -253,15 +428,16 @@ $TreePids = @{}
 $Conns = @{}
 $DnsSeen = @{}
 $script:RootPid = $null
-$MonitorNames = @('pktmon.exe', 'procmon.exe', 'procmon64.exe', 'wmiprvse.exe', 'conhost.exe')
+$MonitorNames = @('pktmon.exe', 'procmon.exe', 'procmon64.exe', 'wmiprvse.exe', 'conhost.exe', 'auditpol.exe')
 $SuspiciousCmdRx = '(?i)-enc(odedcommand)?\s|frombase64string|downloadstring|downloadfile|invoke-webrequest|\biwr\b|invoke-expression|\biex\b|start-bitstransfer|add-mppreference|set-mppreference|-windowstyle\s+hidden|-w\s+hidden|vssadmin.*delete|bcdedit|wevtutil\s+cl|certutil.*(-urlcache|-decode)|bitsadmin.*/transfer|mshta\s+http|regsvr32.*/i:http|rundll32.*javascript|schtasks.*/create|reg\s+add.*\\run\b|netsh\s+advfirewall\s+set.*off|cmd.*/c.*del.*\\'
 
-function Add-Proc([int]$ProcId, [int]$ParentId, [string]$Name, [string]$Path, [string]$Cmd) {
+function Add-Proc([int]$ProcId, [int]$ParentId, [string]$Name, [string]$Path, [string]$Cmd, [string]$SeenAt = '') {
     $inTree = ($script:RootPid -and $ProcId -eq $script:RootPid) -or $TreePids.ContainsKey($ParentId)
     if ($inTree) { $TreePids[$ProcId] = 1 }
     $parent = if ($Procs.ContainsKey($ParentId)) { $Procs[$ParentId].Name } else { (Get-Process -Id $ParentId -ErrorAction SilentlyContinue).ProcessName }
+    $ts = if ($SeenAt) { $SeenAt } else { (Get-Date).ToString('HH:mm:ss') }
     $rec = [pscustomobject]@{
-        FirstSeen = (Get-Date).ToString('HH:mm:ss'); Pid = $ProcId; Ppid = $ParentId; ParentName = $parent
+        FirstSeen = $ts; Pid = $ProcId; Ppid = $ParentId; ParentName = $parent
         Name = $Name; Path = $Path; CommandLine = $Cmd; InTree = [bool]$inTree; Suspicious = [bool]($Cmd -and $Cmd -match $SuspiciousCmdRx)
     }
     $Procs[$ProcId] = $rec
@@ -279,6 +455,43 @@ if ($isAdmin -and -not $TestMode) {
         Register-CimIndicationEvent -ClassName Win32_ProcessStartTrace -SourceIdentifier ProcStart -ErrorAction Stop | Out-Null
         $UseTrace = $true
     } catch { Log "process start trace unavailable: $($_.Exception.Message)" }
+    try {
+        & auditpol.exe /set /subcategory:"Process Creation" /success:enable 2>&1 | Out-Null
+        $audKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit'
+        if (-not (Test-Path -LiteralPath $audKey)) { New-Item -Path $audKey -Force | Out-Null }
+        Set-ItemProperty -LiteralPath $audKey -Name 'ProcessCreationIncludeCmdLine_Enabled' -Value 1 -Type DWord -ErrorAction SilentlyContinue
+    } catch {}
+}
+
+function Import-AuditProcesses([datetime]$Since) {
+    if (-not $isAdmin -or $TestMode) { return }
+    try {
+        $evts = Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = 4688; StartTime = $Since.AddSeconds(-2) } -MaxEvents 400 -ErrorAction Stop
+        foreach ($ev in ($evts | Sort-Object TimeCreated)) {
+            try {
+                [xml]$xml = $ev.ToXml()
+                $map = @{}
+                foreach ($d in $xml.Event.EventData.Data) { $map[$d.Name] = [string]$d.'#text' }
+                $newPid = [Convert]::ToInt32(($map['NewProcessId'] -replace '^0x', ''), $(if ($map['NewProcessId'] -match '^0x') { 16 } else { 10 }))
+                $parPid = [Convert]::ToInt32(($map['ProcessId'] -replace '^0x', ''), $(if ($map['ProcessId'] -match '^0x') { 16 } else { 10 }))
+                $pPath = $map['NewProcessName']
+                $pName = if ($pPath) { [IO.Path]::GetFileName($pPath) } else { '' }
+                $cmd = $map['CommandLine']
+                if ($newPid -eq $PID -or -not $pName) { continue }
+                if ($Procs.ContainsKey($newPid) -and $Procs[$newPid].Name -eq $pName) {
+                    $r = $Procs[$newPid]
+                    if (-not $r.CommandLine -and $cmd) {
+                        $r.CommandLine = $cmd
+                        if (-not $r.Path) { $r.Path = $pPath }
+                        $r.Suspicious = [bool]($cmd -match $SuspiciousCmdRx)
+                        if ($r.Suspicious) { Log "AUDIT4688 SUSPICIOUS pid=${newPid}: $cmd" }
+                    }
+                } else {
+                    Add-Proc $newPid $parPid $pName $pPath $cmd $ev.TimeCreated.ToString('HH:mm:ss')
+                }
+            } catch {}
+        }
+    } catch {}
 }
 
 function Update-Watch([datetime]$Since) {
@@ -362,7 +575,7 @@ function Write-Live([int]$SecondsLeft, [string]$Phase) {
     Write-JsonFile 'live.json' $live 5
 }
 
-# ------------------------------------------------------------------ 1. copy sample + baseline
+# ------------------------------------------------------------------ 1. copy sample + honeyfiles + baseline
 $sampleFiles = @(Get-ChildItem -LiteralPath $InputDir -Recurse -File -Force -ErrorAction SilentlyContinue)
 $sampleBytes = [double](($sampleFiles | Measure-Object -Property Length -Sum).Sum)
 $sampleMB = [math]::Round($sampleBytes / 1MB, 1)
@@ -374,7 +587,6 @@ if ($sampleBytes -le $copyMax * 1MB) {
     Log "Copied $(@(Get-ChildItem -LiteralPath $SampleDir -Recurse -File -Force -ErrorAction SilentlyContinue).Count) files."
     $script:RunMode = 'copied'
 } else {
-    # Large installers (multi-GB): run straight from the read-only share instead of duplicating them on the sandbox disk.
     $SampleDir = (Get-Item -LiteralPath $InputDir).FullName
     Log "Sample is $sampleMB MB (> $copyMax MB): running in place from the read-only share, no copy."
     $script:RunMode = 'in-place (read-only share)'
@@ -384,6 +596,7 @@ $DeprioritizeRx = '(?i)(uninst|unins\d|crash|helper|vc_?redist|vcredist|dotnet|n
 $InstallerRx = '(?i)^(set-?up|install|autorun|autoplay|start)'
 $CrackRx = '(?i)(patch|crack|loader|activat|keygen|genp)'
 function Get-TargetRank($f) {
+    if ($f.Extension.ToLower() -eq '.dll') { return 10 }
     if ($f.Name -match $DeprioritizeRx) { return 9 }
     if ($f.Name -match $InstallerRx) { return 0 }
     if ($f.Name -match $CrackRx) { return 1 }
@@ -396,10 +609,9 @@ function Resolve-Target {
         if (Test-Path -LiteralPath $p) { return (Get-Item -LiteralPath $p) }
         Log "Configured target not found: $($cfg.Target) - falling back to auto-pick"
     }
-    $exts = @('.exe', '.msi', '.bat', '.cmd', '.ps1', '.vbs', '.js', '.hta', '.scr', '.com', '.lnk')
+    $exts = @('.exe', '.msi', '.bat', '.cmd', '.ps1', '.vbs', '.vbe', '.js', '.jse', '.wsf', '.hta', '.scr', '.com', '.lnk', '.pif', '.jar', '.reg', '.dll')
     $c = @(Get-ChildItem -LiteralPath $SampleDir -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $exts -contains $_.Extension.ToLower() })
     if (-not $c.Count) { return $null }
-    # name first (Set-up.exe / setup / install... beat vc_redist, uninstall), then exe/msi, then shallowest, then biggest
     $c | Sort-Object @{ E = { Get-TargetRank $_ } },
                      @{ E = { if ($_.Extension -in '.exe', '.msi') { 0 } else { 1 } } },
                      @{ E = { $_.FullName.Substring($SampleDir.Length).Split('\').Count } },
@@ -407,48 +619,56 @@ function Resolve-Target {
 }
 
 # ------------------------------------------------------------------ home-network (LAN) block
-# Internet stays reachable (so C2 traffic is captured), but private ranges - your router, NAS, other PCs, the host -
-# are blocked, except the sandbox's own gateway/DNS. A sample running as admin could remove the rule, so it is
-# re-checked every 5 s; tampering is re-applied and reported as a red flag.
+# Private ranges and gateway are blocked; only DNS server IPs are exempted and restricted strictly to port 53 (TCP/UDP).
 $script:LanBlock = [ordered]@{ Requested = [bool]$cfg.BlockLan; Applied = $false; Exempt = @(); Ranges = @(); Tampered = $false; Details = @(); Status = 'not requested' }
 $LanRuleNames = @('SafeBox-BlockLAN-Out', 'SafeBox-BlockLAN-In')
+$DnsRestrictRules = @('SafeBox-BlockDNS-TCP', 'SafeBox-BlockDNS-UDP')
+$PrivateIpRx = '^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|169\.254\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)'
 
 function ConvertTo-IpNum([string]$ip) { $b = ([Net.IPAddress]::Parse($ip)).GetAddressBytes(); [uint64]$b[0] * 16777216 + [uint64]$b[1] * 65536 + [uint64]$b[2] * 256 + [uint64]$b[3] }
 function ConvertFrom-IpNum([uint64]$n) { '{0}.{1}.{2}.{3}' -f ([math]::Floor($n / 16777216) % 256), ([math]::Floor($n / 65536) % 256), ([math]::Floor($n / 256) % 256), ($n % 256) }
 
-function Get-LanRanges([string[]]$Exempt) {
+function Get-LanRanges([string[]]$ExemptDns) {
     $cidrs = @(@('10.0.0.0', 8), @('172.16.0.0', 12), @('192.168.0.0', 16), @('169.254.0.0', 16), @('100.64.0.0', 10))
-    $ex = @($Exempt | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' } | ForEach-Object { ConvertTo-IpNum $_ } | Sort-Object -Unique)
+    $ex = @($ExemptDns | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' } | ForEach-Object { ConvertTo-IpNum $_ } | Sort-Object -Unique)
     foreach ($c in $cidrs) {
         $start = ConvertTo-IpNum $c[0]
         $end = $start + [uint64][math]::Pow(2, 32 - $c[1]) - 1
         $cur = $start
         foreach ($e in ($ex | Where-Object { $_ -ge $start -and $_ -le $end })) {
-            if ($e -gt $cur) { if ($e - 1 -eq $cur) { ConvertFrom-IpNum $cur } else { "$(ConvertFrom-IpNum $cur)-$(ConvertFrom-IpNum ($e - 1))" } }
+            if ($e -gt $cur) { if ($e -eq ($cur + 1)) { ConvertFrom-IpNum $cur } else { "$(ConvertFrom-IpNum $cur)-$(ConvertFrom-IpNum ($e - 1))" } }
             $cur = $e + 1
         }
         if ($cur -le $end) { if ($cur -eq $end) { ConvertFrom-IpNum $cur } else { "$(ConvertFrom-IpNum $cur)-$(ConvertFrom-IpNum $end)" } }
     }
     $v6dns = @(Get-DnsClientServerAddress -AddressFamily IPv6 -ErrorAction SilentlyContinue | ForEach-Object { $_.ServerAddresses } | Where-Object { $_ -match '^f[cd]' })
     if (-not $v6dns.Count) { 'fc00::/7' }
+    'fe80::/10'
 }
 
+$script:PrivateDnsList = @()
 function Set-LanBlock {
-    $gw = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | ForEach-Object { $_.NextHop } | Where-Object { $_ -and $_ -ne '0.0.0.0' })
-    $dns = @(Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object { $_.ServerAddresses })
-    $script:LanBlock.Exempt = @($gw + $dns | Where-Object { $_ } | Select-Object -Unique)
+    $dns = @(Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object { $_.ServerAddresses } | Where-Object { $_ } | Select-Object -Unique)
+    $script:LanBlock.Exempt = @($dns)
     $script:LanBlock.Ranges = @(Get-LanRanges $script:LanBlock.Exempt)
-    foreach ($n in $LanRuleNames) { Remove-NetFirewallRule -Name $n -ErrorAction SilentlyContinue }
+    $script:PrivateDnsList = @($dns | Where-Object { $_ -match $PrivateIpRx })
+    foreach ($n in ($LanRuleNames + $DnsRestrictRules)) { Remove-NetFirewallRule -Name $n -ErrorAction SilentlyContinue }
     Set-NetFirewallProfile -All -Enabled True -ErrorAction SilentlyContinue
     New-NetFirewallRule -Name $LanRuleNames[0] -DisplayName 'SafeBox: block home network (outbound)' -Direction Outbound -Action Block -RemoteAddress $script:LanBlock.Ranges -Profile Any -ErrorAction Stop | Out-Null
     New-NetFirewallRule -Name $LanRuleNames[1] -DisplayName 'SafeBox: block home network (inbound)' -Direction Inbound -Action Block -RemoteAddress $script:LanBlock.Ranges -Profile Any -ErrorAction Stop | Out-Null
+    if ($script:PrivateDnsList.Count) {
+        New-NetFirewallRule -Name $DnsRestrictRules[0] -DisplayName 'SafeBox: DNS IP non-53 TCP block' -Direction Outbound -Action Block -Protocol TCP -RemoteAddress $script:PrivateDnsList -RemotePort @('1-52', '54-65535') -Profile Any -ErrorAction Stop | Out-Null
+        New-NetFirewallRule -Name $DnsRestrictRules[1] -DisplayName 'SafeBox: DNS IP non-53 UDP block' -Direction Outbound -Action Block -Protocol UDP -RemoteAddress $script:PrivateDnsList -RemotePort @('1-52', '54-65535') -Profile Any -ErrorAction Stop | Out-Null
+    }
     $script:LanBlock.Applied = $true
 }
 
 function Test-LanBlock {
     if (-not $script:LanBlock.Applied) { return }
     $bad = @()
-    foreach ($n in $LanRuleNames) {
+    $toCheck = @($LanRuleNames)
+    if ($script:PrivateDnsList.Count) { $toCheck += $DnsRestrictRules }
+    foreach ($n in $toCheck) {
         $r = Get-NetFirewallRule -Name $n -ErrorAction SilentlyContinue
         if (-not $r) { $bad += "$n removed" }
         elseif ("$($r.Enabled)" -ne 'True' -or "$($r.Action)" -ne 'Block') { $bad += "$n disabled or changed" }
@@ -465,14 +685,16 @@ function Test-LanBlock {
 if ($script:LanBlock.Requested -and $isAdmin -and -not $TestMode) {
     try {
         Set-LanBlock
-        $script:LanBlock.Status = "active (exempt: $($script:LanBlock.Exempt -join ', '))"
-        Log "Home network blocked: $($script:LanBlock.Ranges -join ', ')"
+        $script:LanBlock.Status = "active (dns-only-53 exempt: $($script:LanBlock.Exempt -join ', '))"
+        Log "Home network blocked (gateway blocked, DNS port 53 only): $($script:LanBlock.Ranges -join ', ')"
     } catch { $script:LanBlock.Status = "FAILED: $($_.Exception.Message)"; Log "LAN block failed: $($_.Exception.Message)" }
 } elseif ($script:LanBlock.Requested) { $script:LanBlock.Status = 'skipped (not admin or test mode)' }
 
 $targetFile = Resolve-Target
 $script:TargetRel = if ($targetFile) { $targetFile.FullName.Substring($SampleDir.Length).TrimStart('\') } else { $null }
 if ($targetFile) { Log "Target: $($targetFile.FullName)" } else { Log 'No runnable file found - only observing the system.' }
+
+Initialize-Honeyfiles
 
 Set-Status 'Temiz sistem goruntusu (baseline) aliniyor'
 Log 'Baseline snapshot...'
@@ -486,10 +708,6 @@ $captureStatus = 'not started'
 if ($isAdmin -and -not $TestMode) {
     & pktmon.exe stop 2>&1 | Out-Null
     & pktmon.exe filter remove 2>&1 | Out-Null
-    # --pkt-size 4096: every normal packet (<= ~1514 bytes) and a full TLS ClientHello (1.5-2 KB with post-quantum
-    # key shares; SNI can sit anywhere because clients shuffle extensions) are kept whole. Only the huge offloaded
-    # segments of big downloads (up to 64 KB) are cut, which keeps the 2 GB ring buffer from filling quickly.
-    # (512 bytes was too short: the server name of modern TLS connections could be lost.)
     $o = & pktmon.exe start --capture --comp nics --pkt-size 4096 --file-name $etl --file-size 2048 2>&1
     if ($LASTEXITCODE -eq 0) { $captureStatus = 'running'; Log 'pktmon capture started (pkt-size 4096, max 2GB)' } else { $captureStatus = "pktmon failed: $($o -join ' ')"; Log $captureStatus }
 } else { $captureStatus = 'skipped (not admin or test mode)'; Log "Capture $captureStatus" }
@@ -509,35 +727,83 @@ $startedAt = Get-Date
 if ($targetFile) {
     $wd = $targetFile.DirectoryName
     $fp = $targetFile.FullName
-    try {
-        switch ($targetFile.Extension.ToLower()) {
-            '.msi' { $proc = Start-Process msiexec.exe -ArgumentList "/i `"$fp`"" -WorkingDirectory $wd -PassThru }
-            '.ps1' { $proc = Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$fp`"" -WorkingDirectory $wd -PassThru }
-            { $_ -in '.bat', '.cmd' } { $proc = Start-Process cmd.exe -ArgumentList "/c `"`"$fp`"`"" -WorkingDirectory $wd -PassThru }
-            { $_ -in '.vbs', '.js' } { $proc = Start-Process wscript.exe -ArgumentList "`"$fp`"" -WorkingDirectory $wd -PassThru }
-            '.hta' { $proc = Start-Process mshta.exe -ArgumentList "`"$fp`"" -WorkingDirectory $wd -PassThru }
-            default { $proc = Start-Process -FilePath $fp -WorkingDirectory $wd -PassThru }
+    $ext = $targetFile.Extension.ToLower()
+    $launchExe = $fp
+    $launchArg = $TargetArgs
+    switch ($ext) {
+        '.msi' { $launchExe = 'msiexec.exe'; $launchArg = "/i `"$fp`" $TargetArgs".Trim() }
+        '.ps1' { $launchExe = 'powershell.exe'; $launchArg = "-NoProfile -ExecutionPolicy Bypass -File `"$fp`" $TargetArgs".Trim() }
+        { $_ -in '.bat', '.cmd' } { $launchExe = 'cmd.exe'; $launchArg = "/c `"`"$fp`" $TargetArgs`"".Trim() }
+        { $_ -in '.vbs', '.vbe', '.js', '.jse', '.wsf' } { $launchExe = 'wscript.exe'; $launchArg = "`"$fp`" $TargetArgs".Trim() }
+        '.hta' { $launchExe = 'mshta.exe'; $launchArg = "`"$fp`" $TargetArgs".Trim() }
+        '.reg' { $launchExe = 'reg.exe'; $launchArg = "import `"$fp`"" }
+        '.jar' {
+            $javaCmd = Get-Command javaw.exe -ErrorAction SilentlyContinue
+            if (-not $javaCmd) { $javaCmd = Get-Command java.exe -ErrorAction SilentlyContinue }
+            if ($javaCmd) { $launchExe = $javaCmd.Source; $launchArg = "-jar `"$fp`" $TargetArgs".Trim() }
+            else { Log 'Java runtime not found for .jar sample'; $launchExe = '' }
         }
-        if ($proc) { $script:RootPid = $proc.Id; $TreePids[$proc.Id] = 1; Log "Sample started, pid $($proc.Id)" }
-    } catch { Log "Failed to start sample: $($_.Exception.Message)" }
+        '.dll' {
+            if ($DllExport) {
+                $launchExe = 'rundll32.exe'
+                $launchArg = "`"$fp`",$DllExport $TargetArgs".Trim()
+            } else {
+                $launchExe = 'regsvr32.exe'
+                $launchArg = "/s `"$fp`""
+            }
+        }
+        default { $launchExe = $fp; $launchArg = $TargetArgs }
+    }
+    if ($launchExe) {
+        try {
+            $proc = $null
+            if ($RunAsStandardUser -and -not $TestMode) {
+                try {
+                    $fullCmd = if ($launchArg) { "`"$launchExe`" $launchArg" } else { "`"$launchExe`"" }
+                    $escapedCmd = $fullCmd.Replace('"', '\"')
+                    $proc = Start-Process 'runas.exe' -ArgumentList "/trustlevel:0x20000 `"$escapedCmd`"" -WorkingDirectory $wd -PassThru -ErrorAction Stop
+                    Log "Sample launched via runas standard user trustlevel"
+                } catch {
+                    Log "runas fallback to normal user: $($_.Exception.Message)"
+                    $proc = $null
+                }
+            }
+            if (-not $proc) {
+                if ($launchArg) {
+                    $proc = Start-Process -FilePath $launchExe -ArgumentList $launchArg -WorkingDirectory $wd -PassThru
+                } else {
+                    $proc = Start-Process -FilePath $launchExe -WorkingDirectory $wd -PassThru
+                }
+            }
+            if ($proc) { $script:RootPid = $proc.Id; $TreePids[$proc.Id] = 1; Log "Sample started, pid $($proc.Id) ($launchExe $launchArg)" }
+        } catch { Log "Failed to start sample: $($_.Exception.Message)" }
+    }
 }
 
 $end = $startedAt.AddSeconds($Duration)
 $stoppedEarly = $false
+$lastSlowTick = [datetime]::MinValue
 Capture-Screen
 while ((Get-Date) -lt $end) {
-    Update-Watch $watchStart
-    Test-LanBlock
-    Invoke-FakeUser
-    if (((Get-Date) - $script:LastShot).TotalSeconds -ge 30) { Capture-Screen }
-    $left = [int]($end - (Get-Date)).TotalSeconds
-    $sampleProcs = @($Procs.Values | Where-Object { $_.InTree }).Count
-    Set-Status ("Izleniyor: {0} sn kaldi, {1} yeni islem ({2} ornekten), {3} baglanti" -f $left, $Procs.Count, $sampleProcs, $Conns.Count)
-    Write-Live $left 'observing'
+    $now = Get-Date
+    if (($now - $lastSlowTick).TotalSeconds -ge 5) {
+        $lastSlowTick = $now
+        Update-Watch $watchStart
+        Test-LanBlock
+        Invoke-FakeUser
+        if (($now - $script:LastShot).TotalSeconds -ge 30) { Capture-Screen }
+        $left = [int]($end - $now).TotalSeconds
+        $sampleProcs = @($Procs.Values | Where-Object { $_.InTree }).Count
+        Set-Status ("Izleniyor: {0} sn kaldi, {1} yeni islem ({2} ornekten), {3} baglanti" -f $left, $Procs.Count, $sampleProcs, $Conns.Count)
+        Write-Live $left 'observing'
+    } else {
+        Update-Watch $watchStart
+    }
     if (Test-Path -LiteralPath $StopFlag) { Log 'Stop requested from host panel.'; $stoppedEarly = $true; break }
-    Start-Sleep -Seconds 5
+    Start-Sleep -Seconds 1
 }
 Update-Watch $watchStart
+Import-AuditProcesses $startedAt
 Test-LanBlock
 Capture-Screen
 $endedAt = Get-Date
@@ -550,7 +816,35 @@ if ($UseTrace) { Unregister-Event -SourceIdentifier ProcStart -ErrorAction Silen
 if ($procmon -and -not $TestMode) {
     & $procmon /Terminate | Out-Null
     Start-Sleep -Seconds 5
-    if (Test-Path -LiteralPath $pml) { Copy-Item -LiteralPath $pml -Destination $OutputDir -Force; Log 'procmon.pml saved' }
+    if (Test-Path -LiteralPath $pml) {
+        Copy-Item -LiteralPath $pml -Destination $OutputDir -Force
+        Log 'procmon.pml saved'
+        try {
+            $pmlCsv = Join-Path $WorkPath 'procmon.csv'
+            & $procmon /OpenLog $pml /SaveAs $pmlCsv /Quiet | Out-Null
+            Start-Sleep -Seconds 3
+            if (Test-Path -LiteralPath $pmlCsv) {
+                $sensitiveHits = @()
+                $hitSeen = @{}
+                $rxSens = '(?i)(Login Data|Local State|wallet\.dat|logins\.json|cookies\.sqlite|lsass\.exe|CurrentVersion\\Run|Windows Defender)'
+                $sr = [IO.File]::OpenText($pmlCsv)
+                try {
+                    $lineNo = 0
+                    while ($null -ne ($line = $sr.ReadLine()) -and $lineNo -lt 50000 -and $sensitiveHits.Count -lt 100) {
+                        $lineNo++
+                        if ($line -match $rxSens) {
+                            $trim = $line.Substring(0, [Math]::Min(240, $line.Length))
+                            if (-not $hitSeen.ContainsKey($trim)) {
+                                $hitSeen[$trim] = 1
+                                $sensitiveHits += $trim
+                            }
+                        }
+                    }
+                } finally { $sr.Dispose() }
+                Write-JsonFile 'procmon_summary.json' ([ordered]@{ SensitiveEvents = $sensitiveHits; Count = $sensitiveHits.Count }) 4
+            }
+        } catch { Log "Procmon summary skipped: $($_.Exception.Message)" }
+    }
 }
 if ($captureStatus -eq 'running') {
     & pktmon.exe stop 2>&1 | Out-Null
@@ -563,6 +857,7 @@ if ($captureStatus -eq 'running') {
 Set-Status 'Son sistem goruntusu aliniyor ve karsilastiriliyor'
 Log 'Final snapshot...'
 $after = Get-Snapshot
+$honeyAlerts = Check-Honeyfiles
 
 $newFiles = @($after.Files.Keys | Where-Object { -not $before.Files.ContainsKey($_) })
 $modFiles = @($after.Files.Keys | Where-Object { $before.Files.ContainsKey($_) -and $before.Files[$_] -ne $after.Files[$_] })
@@ -570,13 +865,46 @@ $isExec = { param($p) $ExecExt -contains ([IO.Path]::GetExtension($p)).ToLower()
 $newExec = @($newFiles | Where-Object { & $isExec $_ } | Sort-Object)
 $modExec = @($modFiles | Where-Object { & $isExec $_ } | Sort-Object)
 
+function Get-QuickEntropy([string]$FilePath) {
+    try {
+        $fs = [IO.File]::OpenRead($FilePath)
+        try {
+            $buf = New-Object byte[] 262144
+            $n = $fs.Read($buf, 0, $buf.Length)
+            if ($n -le 0) { return 0.0 }
+            $counts = New-Object int[] 256
+            for ($i = 0; $i -lt $n; $i++) { $counts[$buf[$i]]++ }
+            $ent = 0.0
+            for ($b = 0; $b -lt 256; $b++) {
+                if ($counts[$b] -gt 0) {
+                    $px = $counts[$b] / [double]$n
+                    $ent -= $px * [Math]::Log($px, 2)
+                }
+            }
+            return [Math]::Round($ent, 2)
+        } finally { $fs.Dispose() }
+    } catch { return 0.0 }
+}
+
 $droppedHashes = @()
 foreach ($p in ($newExec | Select-Object -First 100)) {
     try {
         if (Test-Path -LiteralPath $p) {
             $h = (Get-FileHash -LiteralPath $p -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()
             $sz = (Get-Item -LiteralPath $p -ErrorAction Stop).Length
-            $droppedHashes += [ordered]@{ Path = $p; SHA256 = $h; Size = $sz }
+            $sigSt = 'Unknown'
+            try { $sigSt = [string](Get-AuthenticodeSignature -LiteralPath $p -ErrorAction Stop).Status } catch {}
+            $ent = Get-QuickEntropy $p
+            $flags = @()
+            try {
+                $rawBytes = [IO.File]::ReadAllBytes($p)
+                $maxSlice = [Math]::Min($rawBytes.Length, 2097152)
+                $asciiText = [System.Text.Encoding]::ASCII.GetString($rawBytes, 0, $maxSlice)
+                foreach ($pat in 'Login Data', 'vssadmin', 'api.telegram.org', 'discord.com/api/webhooks', 'Add-MpPreference') {
+                    if ($asciiText.IndexOf($pat, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $flags += $pat }
+                }
+            } catch {}
+            $droppedHashes += [ordered]@{ Path = $p; SHA256 = $h; Size = $sz; SigStatus = $sigSt; Entropy = $ent; Flags = @($flags) }
         }
     } catch {}
 }
@@ -597,34 +925,42 @@ $fwDetail = @(foreach ($r in $fwAdded) {
 })
 
 $result = [ordered]@{
-    Target        = $script:TargetRel
-    Started       = $startedAt.ToString('yyyy-MM-dd HH:mm:ss')
-    Ended         = $endedAt.ToString('yyyy-MM-dd HH:mm:ss')
-    StoppedEarly  = $stoppedEarly
-    Admin         = $isAdmin
-    CaptureStatus = $captureStatus
-    RunMode       = $script:RunMode
-    LanBlock      = $script:LanBlock
-    Processes     = @($Procs.Values | Where-Object { $MonitorNames -notcontains ([string]$_.Name).ToLower() } | Sort-Object FirstSeen)
-    Network       = [ordered]@{
+    Target          = $script:TargetRel
+    Started         = $startedAt.ToString('yyyy-MM-dd HH:mm:ss')
+    Ended           = $endedAt.ToString('yyyy-MM-dd HH:mm:ss')
+    StoppedEarly    = $stoppedEarly
+    Admin           = $isAdmin
+    CaptureStatus   = $captureStatus
+    RunMode         = $script:RunMode
+    LanBlock        = $script:LanBlock
+    HoneyfileAlerts = @($honeyAlerts)
+    Processes       = @($Procs.Values | Where-Object { $MonitorNames -notcontains ([string]$_.Name).ToLower() } | Sort-Object FirstSeen)
+    Network         = [ordered]@{
         Connections  = @($Conns.Values | Sort-Object FirstSeen)
         DnsCache     = @($DnsSeen.Values | Sort-Object Name)
         NewListening = @(Compare-Set $before.Listening $after.Listening)
+        UdpEndpoints = @(Compare-Set $before.UdpEndpoints $after.UdpEndpoints)
     }
-    Persistence   = [ordered]@{
-        Services = @(Compare-Set $before.Services $after.Services)
-        Drivers  = @(Compare-Set $before.Drivers $after.Drivers)
-        Tasks    = @(Compare-Set $before.Tasks $after.Tasks)
-        RunKeys  = @(Compare-Set $before.RunKeys $after.RunKeys)
-        Startup  = @(Compare-Set $before.Startup $after.Startup)
+    Persistence     = [ordered]@{
+        Services         = @(Compare-Set $before.Services $after.Services)
+        Drivers          = @(Compare-Set $before.Drivers $after.Drivers)
+        Tasks            = @(Compare-Set $before.Tasks $after.Tasks)
+        RunKeys          = @(Compare-Set $before.RunKeys $after.RunKeys)
+        Startup          = @(Compare-Set $before.Startup $after.Startup)
+        WmiSubscriptions = @(Compare-Set $before.WmiSubscriptions $after.WmiSubscriptions)
+        ComHijacks       = @(Compare-Set $before.ComHijacks $after.ComHijacks)
+        AppInitDlls      = @(Compare-Set $before.AppInitDlls $after.AppInitDlls)
+        BitsJobs         = @(Compare-Set $before.BitsJobs $after.BitsJobs)
+        PsProfiles       = @(Compare-Set $before.PsProfiles $after.PsProfiles)
+        ActiveSetup      = @(Compare-Set $before.ActiveSetup $after.ActiveSetup)
     }
-    Defender      = [ordered]@{
+    Defender        = [ordered]@{
         Added           = @(Compare-Set $before.Defender $after.Defender)
         ThreatsDetected = $threats
     }
-    Hosts         = [ordered]@{ Added = @(Compare-Set $before.Hosts $after.Hosts); Removed = @(Compare-Set $after.Hosts $before.Hosts) }
-    Firewall      = [ordered]@{ Added = $fwDetail }
-    Files         = [ordered]@{
+    Hosts           = [ordered]@{ Added = @(Compare-Set $before.Hosts $after.Hosts); Removed = @(Compare-Set $after.Hosts $before.Hosts) }
+    Firewall        = [ordered]@{ Added = $fwDetail }
+    Files           = [ordered]@{
         NewCount            = $newFiles.Count
         ModifiedCount       = $modFiles.Count
         NewExecutables      = @($newExec | Select-Object -First 1000)
@@ -635,8 +971,8 @@ $result = [ordered]@{
 }
 
 Write-JsonFile 'behavior.json' $result 6
-Log ("Done. processes={0} connections={1} newFiles={2} newExec={3} services+={4} tasks+={5} runkeys+={6} defender={7}" -f `
-    $result.Processes.Count, $result.Network.Connections.Count, $newFiles.Count, $newExec.Count,
+Log ("Done. processes={0} connections={1} newFiles={2} newExec={3} modExec={4} honey={5} services+={6} tasks+={7} runkeys+={8} defender={9}" -f `
+    $result.Processes.Count, $result.Network.Connections.Count, $newFiles.Count, $newExec.Count, $modExec.Count, $honeyAlerts.Count,
     $result.Persistence.Services.Count, $result.Persistence.Tasks.Count, $result.Persistence.RunKeys.Count, $result.Defender.Added.Count)
 Set-Status 'done'
 Set-Content -LiteralPath (Join-Path $OutputDir 'done.flag') -Value (Get-Date -Format o)

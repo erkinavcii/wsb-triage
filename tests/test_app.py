@@ -300,3 +300,144 @@ def test_context_menu_and_enqueue(client, tmp_path, monkeypatch):
     assert seen_req["tok"] == "tok-123"
     assert seen_req["body"]["run_sandbox"] is False and seen_req["body"]["vt_upload"] is False
     assert opened == ["http://127.0.0.1:8765/?token=tok-123#job-xyz"]
+
+
+def test_e6_intel_config_set_and_clear_and_system_status_masks(client, monkeypatch):
+    import intel_client
+    import vt_client
+    monkeypatch.setattr(vt_client, "_user_env", lambda _n: "")
+    monkeypatch.setattr(vt_client, "get_api_key", lambda: (vt_client.load_config().get("vt_api_key") or "").strip())
+    for env_k in ("VT_API_KEY", "MB_API_KEY", "HA_API_KEY"):
+        monkeypatch.delenv(env_k, raising=False)
+
+    r = client.post("/api/intel/config", json={
+        "vt_api_key": "vt-secret-1234",
+        "mb_api_key": "mb-secret-5678",
+        "ha_api_key": "ha-secret-9012",
+        "mb_enabled": True,
+    })
+    assert r.status_code == 200
+    d = r.json()
+    assert d["vt_configured"] is True and d["mb_configured"] is True and d["ha_configured"] is True
+
+    st = client.get("/api/system-status").json()
+    assert st["vt_api_masked"].endswith("1234")
+    assert st["mb_api_masked"].endswith("5678")
+    assert st["ha_api_masked"].endswith("9012")
+    assert "vt-secret" not in st["vt_api_masked"]
+
+    r2 = client.post("/api/intel/config", json={"clear_vt": True, "clear_mb": True, "clear_ha": True, "mb_enabled": False})
+    assert r2.status_code == 200
+    d2 = r2.json()
+    assert d2["vt_configured"] is False and d2["mb_configured"] is False and d2["ha_configured"] is False
+    assert intel_client.has_configured_sources() is False
+
+
+def test_e9_and_e15_job_sandbox_overrides_and_safe_file_preview(client, tmp_path, monkeypatch):
+    import json
+    from conftest import bare_job
+
+    sample = tmp_path / "payload.ps1"
+    sample.write_text("Write-Output 'SafeBoxPreviewToken'\nInvoke-WebRequest http://x.test", encoding="utf-8")
+    job = bare_job(tmp_path / "case")
+    job.input_dir.mkdir(parents=True, exist_ok=True)
+    in_sample = job.input_dir / "payload.ps1"
+    in_sample.write_bytes(sample.read_bytes())
+    (job.input_dir / "helper.exe").write_bytes(b"MZstub")
+    job.output_dir.mkdir(parents=True, exist_ok=True)
+    (job.output_dir / "procmon_summary.json").write_text(json.dumps({"TotalEvents": 12, "SensitiveEvents": []}), encoding="utf-8")
+    job.save()
+
+    monkeypatch.setattr(pipeline, "get_job", lambda cid: job if cid == job.id else None)
+
+    r_get = client.get(f"/api/jobs/{job.id}")
+    assert r_get.status_code == 200
+    gd = r_get.json()
+    assert set(gd["runnable_targets"]) >= {"helper.exe", "payload.ps1"}
+    assert gd["procmon_summary"]["TotalEvents"] == 12
+
+    seen_overrides = {}
+
+    def fake_start_later(j, overrides=None):
+        seen_overrides["job"] = j.id
+        seen_overrides["overrides"] = overrides
+
+    monkeypatch.setattr(pipeline, "start_sandbox_later", fake_start_later)
+    r_sb = client.post(f"/api/jobs/{job.id}/sandbox", json={
+        "target": "payload.ps1", "network": False, "duration_min": 5, "run_as_standard_user": True,
+    })
+    assert r_sb.status_code == 200
+    assert seen_overrides["job"] == job.id
+    assert seen_overrides["overrides"]["target"] == "payload.ps1"
+    assert seen_overrides["overrides"]["network"] is False
+    assert seen_overrides["overrides"]["run_as_standard_user"] is True
+
+    # E15 preview modes + path traversal rejection
+    r_txt = client.get(f"/api/jobs/{job.id}/preview", params={"file_path": str(in_sample), "mode": "text"})
+    assert r_txt.status_code == 200 and "SafeBoxPreviewToken" in r_txt.json()["content"]
+    r_str = client.get(f"/api/jobs/{job.id}/preview", params={"file_path": str(in_sample), "mode": "strings"})
+    assert r_str.status_code == 200 and "SafeBoxPreviewToken" in r_str.json()["content"]
+    r_hex = client.get(f"/api/jobs/{job.id}/preview", params={"file_path": str(in_sample), "mode": "hex"})
+    assert r_hex.status_code == 200 and "00000000" in r_hex.json()["content"]
+
+    outside = tmp_path / "secret_host.txt"
+    outside.write_text("TOP SECRET", encoding="utf-8")
+    r_esc = client.get(f"/api/jobs/{job.id}/preview", params={"file_path": str(outside), "mode": "text"})
+    assert r_esc.status_code == 400
+
+
+def test_e17_yara_rules_api_crud(client, tmp_path, monkeypatch):
+    import yara_scanner
+    rules_tmp = tmp_path / "rules"
+    rules_tmp.mkdir()
+    orig = (yara_scanner.RULES_DIR / "safebox_builtin.yar").read_text(encoding="utf-8")
+    (rules_tmp / "safebox_builtin.yar").write_text(orig, encoding="utf-8")
+    monkeypatch.setattr(yara_scanner, "RULES_DIR", rules_tmp)
+    monkeypatch.setattr(yara_scanner, "_CACHE_KEY", None)
+
+    r_list = client.get("/api/yara/rules")
+    assert r_list.status_code == 200
+    assert r_list.json()["status"]["rules_count"] >= 16
+
+    r_builtin = client.get("/api/yara/rules/safebox_builtin.yar")
+    assert r_builtin.status_code == 200 and "SafeBox_Crypto_Miner_Indicators" in r_builtin.json()["content"]
+
+    # Bad syntax -> 400
+    assert client.post("/api/yara/rules", json={"name": "bad.yar", "content": "not yara"}).status_code == 400
+    # Builtin overwrite -> 400
+    valid = 'rule Custom_Web_Hit { strings: $x = "API_TEST_HIT" condition: $x }'
+    assert client.post("/api/yara/rules", json={"name": "safebox_builtin.yar", "content": valid}).status_code == 400
+
+    # Save & read & delete custom rule
+    r_save = client.post("/api/yara/rules", json={"name": "my_custom.yar", "content": valid})
+    assert r_save.status_code == 200 and r_save.json()["rules_count"] == 1
+    assert client.delete("/api/yara/rules/safebox_builtin.yar").status_code == 400
+    assert client.delete("/api/yara/rules/my_custom.yar").status_code == 200
+    assert client.get("/api/yara/rules/my_custom.yar").status_code == 404
+
+
+def test_static_frontend_strict_csp_and_css_completeness():
+    import re
+    from pathlib import Path
+    sdir = Path(__file__).resolve().parent.parent / "static"
+    css = (sdir / "styles.css").read_text(encoding="utf-8")
+    norm_css = (css.replace("\\/", "/").replace("\\:", ":").replace("\\[", "[")
+                   .replace("\\]", "]").replace("\\.", "."))
+
+    html_classes = set()
+    for fname in ("index.html", "auth.html", "app.js"):
+        txt = (sdir / fname).read_text(encoding="utf-8")
+        assert "onclick=" not in txt.lower(), f"inline onclick in {fname}"
+        assert not re.search(r"\bstyle\s*=", txt, re.I), f"inline style= in {fname}"
+        if fname.endswith(".html"):
+            assert "<style" not in txt.lower(), f"inline <style> in {fname}"
+            assert not re.search(r"<script(?![^>]*\bsrc=)[^>]*>", txt, re.I), f"inline <script> in {fname}"
+            for m in re.finditer(r'class="([^"]+)"', txt):
+                html_classes.update(m.group(1).split())
+
+    for cls in sorted(html_classes):
+        if cls == "dark":
+            continue
+        pat = r"\." + re.escape(cls) + r"(?=[\s,{:\.\>\[])"
+        assert re.search(pat, norm_css), f"CSS class missing from static/styles.css: {cls}"
+

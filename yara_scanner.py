@@ -94,11 +94,14 @@ def _compile_string_variants(literal_bytes: bytes, mods: List[str]) -> List[re.P
     return [re.compile(re.escape(v), flags) for v in variants if v]
 
 
-def _parse_yar_file(path: Path) -> List[Dict[str, Any]]:
-    text = path.read_text(encoding="utf-8", errors="replace")
-    # Strip // and /* */ comments outside literals cleanly enough for standard rules
-    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
-    text = re.sub(r"//[^\n]*", "", text)
+def _parse_yar_text(text: str, source_name: str = "<memory>") -> List[Dict[str, Any]]:
+    # Strip // and /* */ comments only outside "..." strings and /.../ regex literals
+    text = re.sub(
+        r'("(?:[^"\\]|\\.)*"|/(?!\*)(?:[^/\\\n]|\\.)+/[is]*)|/\*.*?\*/|//[^\n]*',
+        lambda m: m.group(1) or "",
+        text,
+        flags=re.S,
+    )
 
     parsed: List[Dict[str, Any]] = []
     for m in _RULE_RX.finditer(text):
@@ -162,13 +165,18 @@ def _parse_yar_file(path: Path) -> List[Dict[str, Any]]:
             unsupported.append("hiç dizi (string) yok")
         parsed.append({
             "name": rule_name,
-            "source": path.name,
+            "source": source_name,
             "meta": meta,
             "patterns": patterns,
             "condition": cond,
             "unsupported": unsupported,   # non-empty -> the built-in engine skips the rule and says why
         })
     return parsed
+
+
+def _parse_yar_file(path: Path) -> List[Dict[str, Any]]:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return _parse_yar_text(text, path.name)
 
 
 _SUPPORTED_STRING_MODS = {"ascii", "wide", "nocase", "fullword", "private"}
@@ -241,7 +249,7 @@ def _eval_builtin_condition(cond: str, hits: Dict[str, bool], all_ids: List[str]
 def _load_ruleset():
     global _CACHE_KEY, _CACHE_RULES
     files = _rule_files()
-    sig = _files_signature(files)
+    sig = (_yara is not None, _files_signature(files))
     if sig == _CACHE_KEY and _CACHE_RULES is not None:
         return _CACHE_RULES
     global _LOAD_PROBLEMS
@@ -337,3 +345,117 @@ def scan_bytes(data: bytes, file_name: str = "") -> List[Dict[str, Any]]:
                 "strings": matched_ids[:8],
             })
     return matches
+
+
+# ------------------------------------------------------------------ rule file management (E17)
+_SAFE_RULE_NAME_RX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*\.yara?$", re.IGNORECASE)
+
+
+def _validate_rule_name(name: str) -> str:
+    clean = (name or "").strip()
+    if not clean or ".." in clean or not _SAFE_RULE_NAME_RX.fullmatch(clean):
+        raise ValueError("Geçersiz YARA dosya adı (.yar veya .yara ile bitmeli, harf/rakam/_/-/. kullanılmalı).")
+    resolved = (RULES_DIR / clean).resolve()
+    if resolved.parent != RULES_DIR.resolve():
+        raise ValueError("Geçersiz YARA dosya yolu.")
+    return clean
+
+
+def list_rule_files() -> List[Dict[str, Any]]:
+    files = _rule_files()
+    out: List[Dict[str, Any]] = []
+    for p in files:
+        probs: List[str] = []
+        rule_names: List[str] = []
+        count = 0
+        if _yara is not None:
+            try:
+                comp = _yara.compile(filepath=str(p))
+                rule_names = [r.identifier for r in comp]
+                count = len(rule_names)
+            except Exception as e:
+                probs.append(str(e)[:200])
+        else:
+            try:
+                parsed = _parse_yar_file(p)
+                for r in parsed:
+                    if r["unsupported"]:
+                        probs.append(f"{r['name']}: {'; '.join(r['unsupported'])[:160]}")
+                    else:
+                        rule_names.append(r["name"])
+                count = len(rule_names)
+            except Exception as e:
+                probs.append(str(e)[:200])
+        try:
+            size = p.stat().st_size
+        except OSError:
+            size = 0
+        out.append({
+            "name": p.name,
+            "size": size,
+            "rules_count": count,
+            "rules": rule_names,
+            "builtin": p.name.lower() == "safebox_builtin.yar",
+            "problems": probs,
+        })
+    return out
+
+
+def read_rule_file(name: str) -> str:
+    safe = _validate_rule_name(name)
+    p = RULES_DIR / safe
+    if not p.is_file():
+        raise FileNotFoundError(f"Kural dosyası bulunamadı: {safe}")
+    return p.read_text(encoding="utf-8", errors="replace")
+
+
+def validate_rule_source(content: str) -> Tuple[int, List[str]]:
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("Kural içeriği boş olamaz.")
+    if len(content.encode("utf-8", errors="replace")) > 2 * 1024 * 1024:
+        raise ValueError("Kural dosyası 2 MB sınırını aşıyor.")
+    if _yara is not None:
+        try:
+            compiled = _yara.compile(source=content)
+            cnt = len(list(compiled))
+        except Exception as e:
+            raise ValueError(f"YARA sözdizimi hatası: {e}") from e
+        if cnt == 0:
+            raise ValueError("Dosyada geçerli bir YARA kuralı bulunamadı.")
+        return cnt, []
+    parsed = _parse_yar_text(content, "<custom>")
+    if not parsed:
+        raise ValueError("Geçerli bir YARA kuralı bulunamadı.")
+    probs = [f"{r['name']}: {'; '.join(r['unsupported'])}" for r in parsed if r["unsupported"]]
+    supported = [r for r in parsed if not r["unsupported"]]
+    if not supported:
+        raise ValueError(f"Yerleşik motor bu kuralları çalıştıramıyor: {'; '.join(probs)[:200]}")
+    return len(supported), probs
+
+
+def save_custom_rule_file(name: str, content: str) -> Dict[str, Any]:
+    global _CACHE_KEY, _CACHE_RULES
+    safe = _validate_rule_name(name)
+    if safe.lower() == "safebox_builtin.yar":
+        raise ValueError("Yerleşik kural dosyası (safebox_builtin.yar) düzenlenemez.")
+    count, probs = validate_rule_source(content)
+    RULES_DIR.mkdir(parents=True, exist_ok=True)
+    (RULES_DIR / safe).write_text(content, encoding="utf-8")
+    _CACHE_KEY = None
+    _CACHE_RULES = None
+    st = rules_status()
+    return {"name": safe, "rules_count": count, "problems": probs, "status": st}
+
+
+def delete_custom_rule_file(name: str) -> Dict[str, Any]:
+    global _CACHE_KEY, _CACHE_RULES
+    safe = _validate_rule_name(name)
+    if safe.lower() == "safebox_builtin.yar":
+        raise ValueError("Yerleşik kural dosyası (safebox_builtin.yar) silinemez.")
+    p = RULES_DIR / safe
+    if not p.is_file():
+        raise FileNotFoundError(f"Kural dosyası bulunamadı: {safe}")
+    p.unlink()
+    _CACHE_KEY = None
+    _CACHE_RULES = None
+    return {"deleted": safe, "status": rules_status()}

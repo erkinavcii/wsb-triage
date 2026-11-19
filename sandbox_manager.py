@@ -1,18 +1,21 @@
-"""Windows Sandbox / VirtualBox helpers: capabilities, hardened .wsb, start/stop, VM isolation."""
+"""Windows Sandbox / VirtualBox helpers: capabilities, hardened .wsb / wsb CLI, start/stop, VM execution & isolation."""
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from xml.sax.saxutils import escape
 
 BASE_DIR = Path(__file__).parent.resolve()
 WSB_EXE = Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32" / "WindowsSandbox.exe"
 VBOX_EXE = Path(r"C:\Program Files\Oracle\VirtualBox\VBoxManage.exe")
 NO_WINDOW = 0x08000000
+_GUID_RX = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 
 def _run(args: List[str], timeout: int = 30) -> subprocess.CompletedProcess:
@@ -40,6 +43,43 @@ def tshark_path() -> str:
     return find_tool("tshark.exe", [rf"{pf}\Wireshark\tshark.exe"])
 
 
+def innoextract_path() -> str:
+    pf, pf86 = os.environ.get("ProgramFiles", r"C:\Program Files"), os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    return find_tool("innoextract.exe", [
+        rf"{pf}\InnoExtract\innoextract.exe",
+        rf"{pf86}\InnoExtract\innoextract.exe",
+        str(BASE_DIR / "tools" / "innoextract.exe"),
+        str(BASE_DIR / "sandbox" / "innoextract.exe"),
+    ])
+
+
+def wsb_cli_path() -> str:
+    local_app = os.environ.get("LOCALAPPDATA", "")
+    win_dir = os.environ.get("WINDIR", r"C:\Windows")
+    cands = [
+        rf"{local_app}\Microsoft\WindowsApps\wsb.exe" if local_app else "",
+        rf"{win_dir}\System32\wsb.exe",
+    ]
+    return find_tool("wsb.exe", cands)
+
+
+def windows_sandbox_available() -> bool:
+    return WSB_EXE.exists() or bool(wsb_cli_path())
+
+
+def vbox_manage_path() -> str:
+    if VBOX_EXE.exists():
+        return str(VBOX_EXE)
+    msi_dir = os.environ.get("VBOX_MSI_INSTALL_PATH", "").rstrip("\\/")
+    pf, pf86 = os.environ.get("ProgramFiles", r"C:\Program Files"), os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    cands = [
+        rf"{msi_dir}\VBoxManage.exe" if msi_dir else "",
+        rf"{pf}\Oracle\VirtualBox\VBoxManage.exe",
+        rf"{pf86}\Oracle\VirtualBox\VBoxManage.exe",
+    ]
+    return find_tool("VBoxManage.exe", cands)
+
+
 def windows_version() -> str:
     try:
         import winreg
@@ -54,10 +94,11 @@ def windows_version() -> str:
 
 def list_vbox_vms() -> List[Dict[str, str]]:
     vms: List[Dict[str, str]] = []
-    if not VBOX_EXE.exists():
+    vbox = vbox_manage_path()
+    if not vbox:
         return vms
     try:
-        proc = _run([str(VBOX_EXE), "list", "vms"], timeout=10)
+        proc = _run([vbox, "list", "vms"], timeout=10)
         for line in proc.stdout.strip().splitlines():
             if '"' in line and "{" in line:
                 vms.append({"name": line.split('"')[1], "uuid": line.split("{")[1].split("}")[0]})
@@ -66,13 +107,36 @@ def list_vbox_vms() -> List[Dict[str, str]]:
     return vms
 
 
+def list_vbox_snapshots(vm_name: str) -> List[str]:
+    vbox = vbox_manage_path()
+    if not vbox or not vm_name:
+        return []
+    try:
+        proc = _run([vbox, "snapshot", vm_name, "list", "--machinereadable"], timeout=15)
+        if proc.returncode != 0:
+            return []
+        snaps: List[str] = []
+        for line in proc.stdout.splitlines():
+            if line.startswith("SnapshotName"):
+                val = line.split("=", 1)[1].strip().strip('"')
+                if val and val not in snaps:
+                    snaps.append(val)
+        return snaps
+    except Exception:
+        return []
+
+
 def get_system_capabilities() -> Dict[str, Any]:
+    vbox = vbox_manage_path()
     return {
         "os": windows_version(),
-        "windows_sandbox_enabled": WSB_EXE.exists(),
+        "windows_sandbox_enabled": windows_sandbox_available(),
+        "wsb_cli": wsb_cli_path(),
         "seven_zip": seven_zip_path(),
         "tshark": tshark_path(),
-        "virtualbox_installed": VBOX_EXE.exists(),
+        "innoextract": innoextract_path(),
+        "vbox_manage": vbox,
+        "virtualbox_installed": bool(vbox),
         "virtualbox_vms": list_vbox_vms(),
         "sandbox_running": sandbox_running(),
     }
@@ -144,28 +208,97 @@ def _sandbox_processes() -> Optional[List[str]]:
     return names
 
 
+def wsb_list_ids() -> Optional[List[str]]:
+    """Lists active Windows Sandbox IDs via `wsb.exe`. Returns None if `wsb.exe` is unavailable or failed."""
+    wsb = wsb_cli_path()
+    if not wsb:
+        return None
+    try:
+        proc = _run([wsb, "list", "--raw"], timeout=15)
+        raw = (proc.stdout or "").strip()
+        if proc.returncode == 0 and raw:
+            try:
+                parsed = json.loads(raw)
+                items = parsed if isinstance(parsed, list) else ([parsed] if isinstance(parsed, dict) else [])
+                ids: List[str] = []
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+                    status = str(it.get("Status") or it.get("status") or "").lower()
+                    if status == "stopped":
+                        continue
+                    sid = str(it.get("Id") or it.get("id") or "")
+                    if _GUID_RX.fullmatch(sid):
+                        ids.append(sid)
+                return ids
+            except Exception:
+                pass
+        proc2 = _run([wsb, "list"], timeout=15)
+        if proc2.returncode != 0:
+            return None
+        ids = []
+        for line in (proc2.stdout or "").splitlines():
+            if "stopped" in line.lower():
+                continue
+            ids.extend(_GUID_RX.findall(line))
+        return ids
+    except Exception:
+        return None
+
+
 def sandbox_state() -> Optional[bool]:
     """True = running, False = not running, None = unknown (check failed; do NOT treat as closed)."""
     names = _sandbox_processes()
-    return None if names is None else bool(names)
+    wsb_ids = wsb_list_ids()
+    if names or wsb_ids:
+        return True
+    if names is None and wsb_ids is None:
+        return None
+    return False
 
 
 def sandbox_running() -> bool:
     return bool(sandbox_state())
 
 
-def launch_sandbox(wsb_path: Path) -> None:
+def launch_sandbox(wsb_path: Path) -> Optional[str]:
+    """Starts Windows Sandbox via `wsb start --config` when available, falling back to `.wsb` shell launch."""
+    wsb = wsb_cli_path()
+    if wsb and wsb_path.is_file():
+        try:
+            xml_cfg = wsb_path.read_text(encoding="utf-8")
+            proc = _run([wsb, "start", "--config", xml_cfg, "--raw"], timeout=60)
+            if proc.returncode != 0:
+                proc = _run([wsb, "start", "--config", xml_cfg], timeout=60)
+            if proc.returncode == 0:
+                out = (proc.stdout or "").strip()
+                try:
+                    data = json.loads(out)
+                    sid = str((data or {}).get("Id") or (data or {}).get("id") or "")
+                    if _GUID_RX.fullmatch(sid):
+                        return sid
+                except Exception:
+                    pass
+                m = _GUID_RX.search(out)
+                return m.group(0) if m else None
+        except Exception:
+            pass
     os.startfile(str(wsb_path))
+    return None
 
 
-def stop_sandbox() -> None:
-    wsb = shutil.which("wsb.exe")
+def stop_sandbox(session_id: Optional[str] = None) -> None:
+    wsb = wsb_cli_path()
     if wsb:
         try:
-            import re
-            out = _run([wsb, "list"], timeout=15).stdout
-            for sid in re.findall(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", out):
-                _run([wsb, "stop", "--id", sid], timeout=30)
+            seen: set = set()
+            if session_id and _GUID_RX.fullmatch(session_id):
+                _run([wsb, "stop", "--id", session_id], timeout=30)
+                seen.add(session_id.lower())
+            for sid in (wsb_list_ids() or []):
+                if sid.lower() not in seen:
+                    _run([wsb, "stop", "--id", sid], timeout=30)
+                    seen.add(sid.lower())
         except Exception:
             pass
     time.sleep(3)
@@ -178,7 +311,10 @@ def stop_sandbox() -> None:
 
 # ------------------------------------------------------------------ VirtualBox
 def _vm_state(vm_name: str) -> str:
-    proc = _run([str(VBOX_EXE), "showvminfo", vm_name, "--machinereadable"], timeout=15)
+    vbox = vbox_manage_path()
+    if not vbox:
+        return "unknown"
+    proc = _run([vbox, "showvminfo", vm_name, "--machinereadable"], timeout=15)
     for line in proc.stdout.splitlines():
         if line.startswith("VMState="):
             return line.split("=", 1)[1].strip('"')
@@ -187,7 +323,8 @@ def _vm_state(vm_name: str) -> str:
 
 def harden_and_snapshot_virtualbox_vm(vm_name: str) -> Dict[str, Any]:
     """Cuts network/clipboard/drag&drop of a powered-off VM and takes a clean snapshot. Every step is verified."""
-    if not VBOX_EXE.exists():
+    vbox = vbox_manage_path()
+    if not vbox:
         return {"status": "error", "message": "VirtualBox (VBoxManage.exe) bulunamadı."}
     try:
         state = _vm_state(vm_name)
@@ -208,18 +345,18 @@ def harden_and_snapshot_virtualbox_vm(vm_name: str) -> Dict[str, Any]:
         for variants, label in checks:
             err = ""
             for opts in variants:
-                p = _run([str(VBOX_EXE), "modifyvm", vm_name] + opts, timeout=20)
+                p = _run([vbox, "modifyvm", vm_name] + opts, timeout=20)
                 if p.returncode == 0:
                     steps.append(label)
                     break
                 err = (p.stderr or p.stdout).strip()[:200]
             else:
                 failed.append(f"{label} — BAŞARISIZ: {err}")
-        shared = _run([str(VBOX_EXE), "showvminfo", vm_name, "--machinereadable"], timeout=15).stdout
+        shared = _run([vbox, "showvminfo", vm_name, "--machinereadable"], timeout=15).stdout
         if "SharedFolderNameMachineMapping" in shared:
             failed.append("VM'de paylaşılan klasör var — VirtualBox ayarlarından kaldırın (zararlı oradan ana bilgisayara ulaşabilir).")
         snap = f"SafeBox_Temiz_{datetime.now().strftime('%Y%m%d_%H%M')}"
-        p = _run([str(VBOX_EXE), "snapshot", vm_name, "take", snap, "--description", "SafeBox analiz oncesi temiz yedek"], timeout=120)
+        p = _run([vbox, "snapshot", vm_name, "take", snap, "--description", "SafeBox analiz oncesi temiz yedek"], timeout=120)
         (steps if p.returncode == 0 else failed).append(
             f"Temiz snapshot alındı: '{snap}'" if p.returncode == 0 else f"Snapshot alınamadı: {(p.stderr or p.stdout).strip()[:200]}")
         return {
@@ -231,6 +368,117 @@ def harden_and_snapshot_virtualbox_vm(vm_name: str) -> Dict[str, Any]:
         }
     except Exception as e:
         return {"status": "error", "message": f"VirtualBox yapılandırma hatası: {e}"}
+
+
+def vbox_start_analysis(
+    vm_name: str,
+    snapshot_name: str,
+    input_dir: Path,
+    tools_dir: Path,
+    output_dir: Path,
+    network: bool,
+    guest_user: str,
+    guest_pass: str,
+    log_cb: Optional[Callable[[str], None]] = None,
+) -> str:
+    """Restores a clean VirtualBox snapshot, isolates peripherals, mounts shared folders and starts Inside-Sandbox.ps1."""
+    vbox = vbox_manage_path()
+    if not vbox:
+        raise RuntimeError("VirtualBox (VBoxManage.exe) bulunamadı.")
+    if not vm_name:
+        raise RuntimeError("VirtualBox VM adı belirtilmedi.")
+    if not guest_user:
+        raise RuntimeError("VirtualBox misafir Windows kullanıcı adı belirtilmedi.")
+
+    snaps = list_vbox_snapshots(vm_name)
+    snap = (snapshot_name or "").strip()
+    if not snap:
+        clean_snaps = [s for s in snaps if s.startswith("SafeBox_Temiz_")]
+        snap = clean_snaps[-1] if clean_snaps else (snaps[-1] if snaps else "")
+    if not snap:
+        raise RuntimeError(f"'{vm_name}' için temiz snapshot bulunamadı. Önce 'VM'i izole et + snapshot' butonunu kullanın.")
+
+    if log_cb:
+        log_cb(f"VirtualBox VM '{vm_name}' temiz snapshot'a ({snap}) döndürülüyor...")
+    state = _vm_state(vm_name)
+    if state in ("running", "paused", "stuck"):
+        _run([vbox, "controlvm", vm_name, "poweroff"], timeout=30)
+        time.sleep(2)
+
+    rp = _run([vbox, "snapshot", vm_name, "restore", snap], timeout=120)
+    if rp.returncode != 0:
+        raise RuntimeError(f"Snapshot geri yüklenemedi ({snap}): {(rp.stderr or rp.stdout).strip()[:200]}")
+
+    for opts in (
+        ["--clipboard-mode", "disabled"],
+        ["--drag-and-drop", "disabled"],
+        ["--usb-ohci", "off", "--usb-ehci", "off", "--usb-xhci", "off"],
+        ["--nic1", "nat" if network else "none", "--nic2", "none", "--nic3", "none", "--nic4", "none"],
+    ):
+        _run([vbox, "modifyvm", vm_name] + opts, timeout=20)
+
+    sp = _run([vbox, "startvm", vm_name, "--type", "gui"], timeout=60)
+    if sp.returncode != 0:
+        raise RuntimeError(f"VirtualBox VM başlatılamadı: {(sp.stderr or sp.stdout).strip()[:200]}")
+
+    if log_cb:
+        log_cb("VirtualBox Guest Additions bekleniyor...")
+    ready = False
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        cmd_stat = [vbox, "guestcontrol", vm_name, "stat", "--username", guest_user]
+        if guest_pass:
+            cmd_stat += ["--password", guest_pass]
+        cmd_stat.append(r"C:\Windows\System32\cmd.exe")
+        gp = _run(cmd_stat, timeout=15)
+        if gp.returncode == 0:
+            ready = True
+            break
+        time.sleep(3)
+    if not ready:
+        vbox_stop_and_restore(vm_name, snap)
+        raise RuntimeError("VirtualBox Guest Additions yanıt vermedi (oturum bilgisi veya Guest Additions kurulumunu kontrol edin).")
+
+    for name, host_p, ro in (("sb_input", input_dir, True), ("sb_tools", tools_dir, True), ("sb_output", output_dir, False)):
+        _run([vbox, "sharedfolder", "remove", vm_name, "--name", name, "--transient"], timeout=10)
+        args = [vbox, "sharedfolder", "add", vm_name, "--name", name, "--hostpath", str(host_p), "--transient"]
+        if ro:
+            args.append("--readonly")
+        sf = _run(args, timeout=15)
+        if sf.returncode != 0:
+            vbox_stop_and_restore(vm_name, snap)
+            raise RuntimeError(f"Paylaşılan klasör ({name}) bağlanamadı: {(sf.stderr or sf.stdout).strip()[:200]}")
+
+    gc = [vbox, "guestcontrol", vm_name, "start", "--username", guest_user]
+    if guest_pass:
+        gc += ["--password", guest_pass]
+    gc += [
+        "--exe", r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        "--",
+        "-NoProfile", "-ExecutionPolicy", "Bypass",
+        "-File", r"\\VBoxSvr\sb_tools\Inside-Sandbox.ps1",
+        "-InputDir", r"\\VBoxSvr\sb_input",
+        "-ToolsDir", r"\\VBoxSvr\sb_tools",
+        "-OutputDir", r"\\VBoxSvr\sb_output",
+    ]
+    gp_start = _run(gc, timeout=30)
+    if gp_start.returncode != 0:
+        vbox_stop_and_restore(vm_name, snap)
+        raise RuntimeError(f"VM içinde izleyici başlatılamadı: {(gp_start.stderr or gp_start.stdout).strip()[:200]}")
+    return snap
+
+
+def vbox_stop_and_restore(vm_name: str, snapshot_name: str = "") -> None:
+    vbox = vbox_manage_path()
+    if not vbox or not vm_name:
+        return
+    try:
+        _run([vbox, "controlvm", vm_name, "poweroff"], timeout=30)
+        time.sleep(2)
+        if snapshot_name:
+            _run([vbox, "snapshot", vm_name, "restore", snapshot_name], timeout=120)
+    except Exception:
+        pass
 
 
 # ------------------------------------------------------------------ Explorer Right-Click Context Menu (HKCU, no UAC)
