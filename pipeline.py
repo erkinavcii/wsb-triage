@@ -829,9 +829,7 @@ def _windows_powershell_env() -> Dict[str, str]:
     """Environment without an inherited PSModulePath. When the panel is started from PowerShell 7 (or on CI runners),
     PSModulePath lists PowerShell 7 module folders, and Windows PowerShell 5.1 may load their incompatible copy of
     Microsoft.PowerShell.Security. Without the variable, 5.1 uses its own default module path."""
-    env = dict(os.environ)
-    env.pop("PSModulePath", None)
-    return env
+    return {k: v for k, v in os.environ.items() if k.lower() != "psmodulepath"}
 
 
 def check_signatures(case_dir: Path, paths: List[str], progress=None):

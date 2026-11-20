@@ -177,6 +177,11 @@ def test_signature_check_failure_is_loud(tmp_path, monkeypatch):
     assert "module could not be loaded" in res[f]["message"]
 
 
+def test_windows_powershell_env_strips_psmodulepath_case_insensitively(monkeypatch):
+    monkeypatch.setenv("PSMODULEPATH", r"C:\pwsh7\Modules")
+    assert not any(k.lower() == "psmodulepath" for k in pipeline._windows_powershell_env())
+
+
 def test_signature_errors_reach_the_verdict(tmp_path):
     job = bare_job(tmp_path)
     job.state["status"] = "done"

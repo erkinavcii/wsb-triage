@@ -1,5 +1,7 @@
 # SafeBox / wsb-triage
 
+[![tests](https://github.com/erkinavcii/wsb-triage/actions/workflows/tests.yml/badge.svg)](https://github.com/erkinavcii/wsb-triage/actions/workflows/tests.yml)
+
 > **Automated Windows Sandbox Malware Analysis & Triage Pipeline**
 
 [Türkçe dökümantasyon için buraya bakın (README.tr.md)](README.tr.md)

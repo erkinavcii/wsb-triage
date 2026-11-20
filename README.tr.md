@@ -1,5 +1,7 @@
 # SafeBox Analiz Merkezi
 
+[![tests](https://github.com/erkinavcii/wsb-triage/actions/workflows/tests.yml/badge.svg)](https://github.com/erkinavcii/wsb-triage/actions/workflows/tests.yml)
+
 > [English documentation (README.md)](README.md)
 
 İndirdiğin bir dosyayı kendi bilgisayarında çalıştırmadan önce otomatik ve yerel olarak inceleyen web tabanlı analiz ve triyaj paneli.
