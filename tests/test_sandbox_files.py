@@ -88,16 +88,26 @@ def test_e7_wsb_cli_mock(tmp_path, monkeypatch):
     def fake_run(args, timeout=30):
         calls.append(args)
         if args[1:3] == ["list", "--raw"]:
-            return subprocess.CompletedProcess(args, 0, stdout=json.dumps([{"Id": gid_1}]), stderr="")
+            return subprocess.CompletedProcess(
+                args, 0, stdout=json.dumps({"WindowsSandboxEnvironments": [{"Id": gid_1}]}), stderr=""
+            )
         if args[1:3] == ["start", "--config"]:
             return subprocess.CompletedProcess(args, 0, stdout=json.dumps({"Id": gid_2}), stderr="")
         return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
 
+    started_wsb = []
     monkeypatch.setattr(sbm, "wsb_cli_path", lambda: "wsb.exe")
     monkeypatch.setattr(sbm, "_run", fake_run)
+    monkeypatch.setattr(sbm.os, "startfile", lambda p: started_wsb.append(str(p)))
     monkeypatch.setattr(time, "sleep", lambda _s: None)
 
     assert sbm.wsb_list_ids() == [gid_1]
+    assert sbm.launch_sandbox(wsb_file) is None
+    assert started_wsb == [str(wsb_file)]
+
+    # Fallback to wsb start --config if os.startfile fails
+    monkeypatch.setattr(sbm.os, "startfile", lambda _p: (_ for _ in ()).throw(OSError("no assoc")))
+    monkeypatch.setattr(sbm.subprocess, "Popen", lambda *a, **kw: None)
     assert sbm.launch_sandbox(wsb_file) == gid_2
     assert any(c[1:3] == ["start", "--config"] for c in calls)
     sbm.stop_sandbox(gid_2)

@@ -224,7 +224,14 @@ def wsb_list_ids() -> Optional[List[str]]:
         if proc.returncode == 0 and raw:
             try:
                 parsed = json.loads(raw)
-                items = parsed if isinstance(parsed, list) else ([parsed] if isinstance(parsed, dict) else [])
+                if isinstance(parsed, dict) and isinstance(parsed.get("WindowsSandboxEnvironments"), list):
+                    items = parsed["WindowsSandboxEnvironments"]
+                elif isinstance(parsed, list):
+                    items = parsed
+                elif isinstance(parsed, dict):
+                    items = [parsed]
+                else:
+                    items = []
                 ids: List[str] = []
                 for it in items:
                     if not isinstance(it, dict):
@@ -267,7 +274,14 @@ def sandbox_running() -> bool:
 
 
 def launch_sandbox(wsb_path: Path) -> Optional[str]:
-    """Starts Windows Sandbox via `wsb start --config` when available, falling back to `.wsb` shell launch."""
+    """Opens the interactive Windows Sandbox GUI via `.wsb` shell launch so the desktop session,
+    LogonCommand (`Inside-Sandbox.ps1`), screenshots, and UIA all run reliably. Falls back to
+    `wsb start --config` + `wsb connect` only if `.wsb` shell launch fails."""
+    try:
+        os.startfile(str(wsb_path))
+        return None
+    except Exception:
+        pass
     wsb = wsb_cli_path()
     if wsb and wsb_path.is_file():
         try:
@@ -277,19 +291,26 @@ def launch_sandbox(wsb_path: Path) -> Optional[str]:
                 proc = _run([wsb, "start", "--config", xml_cfg], timeout=60)
             if proc.returncode == 0:
                 out = (proc.stdout or "").strip()
+                sid = None
                 try:
                     data = json.loads(out)
-                    sid = str((data or {}).get("Id") or (data or {}).get("id") or "")
-                    if _GUID_RX.fullmatch(sid):
-                        return sid
+                    cand = str((data or {}).get("Id") or (data or {}).get("id") or "")
+                    if _GUID_RX.fullmatch(cand):
+                        sid = cand
                 except Exception:
                     pass
-                m = _GUID_RX.search(out)
-                return m.group(0) if m else None
+                if not sid:
+                    m = _GUID_RX.search(out)
+                    sid = m.group(0) if m else None
+                if sid:
+                    try:
+                        subprocess.Popen([wsb, "connect", "--id", sid], creationflags=NO_WINDOW)
+                    except Exception:
+                        pass
+                return sid
         except Exception:
             pass
-    os.startfile(str(wsb_path))
-    return None
+    raise RuntimeError("Windows Sandbox başlatılamadı (.wsb ve wsb.exe başarısız oldu).")
 
 
 def stop_sandbox(session_id: Optional[str] = None) -> None:
