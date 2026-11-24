@@ -617,11 +617,32 @@ def focus_window(hwnd: int) -> bool:
     return ok or u32.GetForegroundWindow() == hwnd
 
 
-def focus_sandbox_window() -> Dict[str, Any]:
+def send_window_to_back(hwnd: int) -> bool:
+    """Puts a window behind all others without minimizing it. The sandbox window is an RDP-style view of the
+    sandbox desktop, so it is not minimized: it keeps running and drawing behind the other windows."""
+    import ctypes
+    u32 = ctypes.WinDLL("user32", use_last_error=True)
+    HWND_BOTTOM, SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 1, 0x0001, 0x0002, 0x0010
+    if u32.IsIconic(hwnd):
+        u32.ShowWindow(hwnd, 4)                      # SW_SHOWNOACTIVATE: restore without taking focus
+    return bool(u32.SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE))
+
+
+def arrange_sandbox_window(front: bool = True) -> Dict[str, Any]:
+    """front=True: restore and bring the Windows Sandbox window forward; False: send it behind other windows."""
     wins = find_windows_of(_SANDBOX_WINDOW_PROCS)
     if not wins:
         return {"status": "not_found", "message": "Açık bir Windows Sandbox penceresi bulunamadı."}
+    if not front:
+        ok = send_window_to_back(wins[0])
+        return {"status": "ok" if ok else "partial",
+                "message": "Sandbox penceresi arka plana alındı (çalışmaya devam ediyor)." if ok else
+                           "Pencere bulundu ama arka plana alınamadı."}
     ok = focus_window(wins[0])
     return {"status": "ok" if ok else "partial",
             "message": "Sandbox penceresi öne getirildi." if ok else
                        "Pencere bulundu ama Windows öne almaya izin vermedi; görev çubuğunda yanıp sönüyor olmalı."}
+
+
+def focus_sandbox_window() -> Dict[str, Any]:
+    return arrange_sandbox_window(True)

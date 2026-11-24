@@ -178,6 +178,7 @@ class JobRequest(BaseModel):
     max_vt: Optional[int] = 12
     run_sandbox: Optional[bool] = True
     keep_sandbox_open: Optional[bool] = False
+    show_sandbox_window: Optional[bool] = False
     simulate_user: Optional[bool] = True
     notify: Optional[bool] = True
     memory_mb: Optional[int] = 4096
@@ -199,6 +200,7 @@ class SandboxStartRequest(BaseModel):
     memory_mb: Optional[int] = None
     network: Optional[bool] = None
     keep_sandbox_open: Optional[bool] = None
+    show_sandbox_window: Optional[bool] = None
     simulate_user: Optional[bool] = None
     run_as_standard_user: Optional[bool] = None
     seed_honeyfiles: Optional[bool] = None
@@ -208,6 +210,10 @@ class SandboxStartRequest(BaseModel):
     vbox_snapshot: Optional[str] = None
     vbox_user: Optional[str] = None
     vbox_password: Optional[str] = None
+
+
+class SandboxWindowRequest(BaseModel):
+    mode: Optional[str] = "front"
 
 
 class WatchRequest(BaseModel):
@@ -677,8 +683,8 @@ def browse_dialog(mode: str = "file"):
 
 
 @app.post("/api/sandbox/focus")
-def sandbox_focus():
-    return sandbox_manager.focus_sandbox_window()
+def sandbox_focus(req: Optional[SandboxWindowRequest] = None):
+    return sandbox_manager.arrange_sandbox_window((req.mode if req else "front") != "back")
 
 
 @app.post("/api/sandbox/enable")

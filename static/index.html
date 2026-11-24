@@ -103,6 +103,8 @@
             <input type="checkbox" id="optSandbox" checked /> VT'den sonra Sandbox'ı otomatik başlat</label>
           <label class="flex items-center gap-2 bg-slate-900/90 px-3 py-2 rounded-xl border border-slate-700 cursor-pointer">
             <input type="checkbox" id="optKeepOpen" /> Süre bitince sandbox'ı kapatma</label>
+          <label class="flex items-center gap-2 bg-slate-900/90 px-3 py-2 rounded-xl border border-slate-700 cursor-pointer" title="Açık: sandbox penceresi açılınca öne gelir, kurulumu kendiniz ilerletebilirsiniz. Kapalı: pencere diğer pencerelerin arkasına alınır, analiz arka planda sürer ve paneldeki canlı ekrandan izlenir.">
+            <input type="checkbox" id="optShowWindow" /> Sandbox penceresini ekranda göster</label>
           <label class="flex items-center gap-2 bg-slate-900/90 px-3 py-2 rounded-xl border border-slate-700 cursor-pointer" title="Sandbox içinde fareyi gerçekçi biçimde hareket ettirir ve kurulum pencerelerindeki İleri/Yükle/Kabul düğmelerine otomatik tıklar.">
             <input type="checkbox" id="optSimUser" checked /> Sahte kullanıcı hareketi (otomatik tıkla)</label>
           <label class="flex items-center gap-2 bg-slate-900/90 px-3 py-2 rounded-xl border border-slate-700 cursor-pointer" title="Örneği sandbox içinde yönetici yerine standart kullanıcı haklarıyla başlatmayı dener.">
@@ -182,10 +184,11 @@
             <div class="flex items-center gap-2">
               <span id="sbFocusMsg" class="text-[11px] text-slate-400"></span>
               <button id="btnSbFocus" class="text-xs px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200">🖥️ Sandbox penceresini öne getir</button>
+              <button id="btnSbBack" class="text-xs px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200">⬇️ Arka plana al</button>
             </div>
           </div>
           <img id="sbLiveImg" class="sb-live" alt="Sandbox ekranının canlı görüntüsü" />
-          <div class="text-[11px] text-slate-500">Görüntü birkaç saniyede bir yenilenir. Kurulumda tıklamanız gereken bir pencere varsa "öne getir" ile sandbox penceresine geçebilirsiniz.</div>
+          <div class="text-[11px] text-slate-500">Görüntü birkaç saniyede bir yenilenir. Kurulumda tıklamanız gereken bir pencere varsa "öne getir" ile sandbox penceresine geçip butona kendiniz basabilirsiniz; işiniz bitince "arka plana al" ile geri gönderin. Sandbox her iki durumda da çalışmaya devam eder.</div>
         </div>
         <div id="sbScreenshotsWrap" class="hidden space-y-2">
           <div class="text-xs font-semibold text-indigo-300">📸 Sandbox ekran görüntüleri (<span id="sbShotCount">0</span>)</div>
@@ -340,6 +343,7 @@
       <div class="flex flex-wrap gap-2 text-xs">
         <label class="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-700 cursor-pointer"><input type="checkbox" id="sbModalNet" checked /> İnternet açık</label>
         <label class="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-700 cursor-pointer"><input type="checkbox" id="sbModalKeepOpen" /> Süre bitince açık bırak</label>
+        <label class="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-700 cursor-pointer" title="Açık: sandbox penceresi öne gelir. Kapalı: arkada çalışır, panelden izlenir."><input type="checkbox" id="sbModalShowWindow" /> Pencereyi ekranda göster</label>
         <label class="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-700 cursor-pointer"><input type="checkbox" id="sbModalSimUser" checked /> Sahte kullanıcı hareketi</label>
         <label class="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-700 cursor-pointer"><input type="checkbox" id="sbModalStdUser" /> Standart kullanıcı</label>
         <label class="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-700 cursor-pointer"><input type="checkbox" id="sbModalHoney" checked /> Yem dosyalar</label>

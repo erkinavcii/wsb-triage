@@ -67,6 +67,7 @@ DEFAULT_OPTIONS = {
     "max_vt": 12,
     "run_sandbox": True,
     "keep_sandbox_open": False,
+    "show_sandbox_window": False,
     "simulate_user": True,
     "notify": True,
     "memory_mb": 4096,
@@ -472,7 +473,7 @@ def cleanup_jobs(days: int) -> List[str]:
 
 _SANDBOX_OVERRIDE_KEYS = {
     "target", "target_args", "dll_export", "duration_min", "memory_mb",
-    "network", "keep_sandbox_open", "simulate_user", "run_as_standard_user",
+    "network", "keep_sandbox_open", "show_sandbox_window", "simulate_user", "run_as_standard_user",
     "seed_honeyfiles", "fake_net", "sandbox_backend", "vbox_vm", "vbox_snapshot", "vbox_user",
 }
 
@@ -1744,6 +1745,24 @@ def _check_dropped_files_vt(job: Job, beh: Dict[str, Any]) -> None:
 
 
 # ======================================================================== 5. sandbox
+def _arrange_sandbox_window_when_ready(job: Job, front: bool, wait_sec: int = 180) -> None:
+    """Once the Windows Sandbox window appears: bring it forward ("show the sandbox on screen") or send it behind
+    the other windows so it does not take over the desktop. Never minimized: the live view and screenshots come
+    from inside the sandbox and the window keeps running either way. Runs in the background; best effort."""
+    def worker():
+        deadline = time.time() + wait_sec
+        done_for = None
+        while time.time() < deadline and job.state.get("status") == "running":
+            wins = sbm.find_windows_of(sbm._SANDBOX_WINDOW_PROCS)
+            if wins and wins[0] != done_for:
+                res = sbm.arrange_sandbox_window(front)
+                job.log("Sandbox penceresi: " + str(res.get("message") or ""))
+                done_for = wins[0]   # the window can be re-created once while the sandbox boots: handle it again
+            time.sleep(2)
+    if os.name == "nt":
+        threading.Thread(target=worker, name=f"wsb-window-{job.id}", daemon=True).start()
+
+
 def _observe_sandbox_loop(job: Job, out: Path, duration: int, check_alive_fn) -> None:
     started = time.time()
     deadline = started + duration + 15 * 60
@@ -1931,6 +1950,7 @@ def stage_sandbox(job: Job) -> None:
             job.log("Windows Sandbox başlatıldı. Örnek bir kurulum penceresi açarsa sandbox penceresinin içinden ilerleyebilirsiniz.")
             wsb_sid = sbm.launch_sandbox(wsb)
             env_started = True
+            _arrange_sandbox_window_when_ready(job, bool(job.opt("show_sandbox_window")))
             _observe_sandbox_loop(job, out, duration, sbm.sandbox_state)
 
         if job.state.pop("cancel_requested", None):

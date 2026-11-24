@@ -114,6 +114,7 @@ function options() {
     vt_upload: $('optUpload').checked,
     run_sandbox: $('optSandbox').checked,
     keep_sandbox_open: $('optKeepOpen').checked,
+    show_sandbox_window: $('optShowWindow') ? $('optShowWindow').checked : false,
     simulate_user: $('optSimUser').checked,
     run_as_standard_user: $('optStdUser') ? $('optStdUser').checked : false,
     seed_honeyfiles: $('optHoneyfiles') ? $('optHoneyfiles').checked : true,
@@ -760,6 +761,7 @@ function openSandboxModal(st) {
   $('sbModalBackend').value = o.sandbox_backend === 'vbox' ? 'vbox' : 'wsb';
   $('sbModalNet').checked = o.network !== false;
   $('sbModalKeepOpen').checked = !!o.keep_sandbox_open;
+  if ($('sbModalShowWindow')) $('sbModalShowWindow').checked = !!o.show_sandbox_window;
   $('sbModalSimUser').checked = o.simulate_user !== false;
   $('sbModalStdUser').checked = !!o.run_as_standard_user;
   $('sbModalHoney').checked = o.seed_honeyfiles !== false;
@@ -789,6 +791,7 @@ if ($('btnSbModalStart')) {
       memory_mb: parseInt($('sbModalMemory').value, 10) || 4096,
       network: $('sbModalNet').checked,
       keep_sandbox_open: $('sbModalKeepOpen').checked,
+      show_sandbox_window: $('sbModalShowWindow') ? $('sbModalShowWindow').checked : false,
       simulate_user: $('sbModalSimUser').checked,
       run_as_standard_user: $('sbModalStdUser').checked,
       seed_honeyfiles: $('sbModalHoney').checked,
@@ -975,8 +978,10 @@ setInterval(loadWatch, 5000);
 setInterval(loadSystemStatus, 30000);
 const last = (location.hash || '').slice(1); if (last) openJob(decodeURIComponent(last));
 
-$('btnSbFocus').onclick = async () => {
+const sandboxWindow = async mode => {
   $('sbFocusMsg').textContent = '';
-  try { const d = await post('/api/sandbox/focus'); $('sbFocusMsg').textContent = d.message || ''; }
+  try { const d = await post('/api/sandbox/focus', { mode }); $('sbFocusMsg').textContent = d.message || ''; }
   catch (e) { $('sbFocusMsg').textContent = e.message; }
 };
+$('btnSbFocus').onclick = () => sandboxWindow('front');
+if ($('btnSbBack')) $('btnSbBack').onclick = () => sandboxWindow('back');

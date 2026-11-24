@@ -539,3 +539,19 @@ def test_live_screen_endpoint_and_focus(client, tmp_path, monkeypatch):
     r = client.post("/api/sandbox/focus")
     assert r.status_code == 200
     assert r.json()["status"] == "not_found"
+
+
+def test_sandbox_window_front_and_back(client, monkeypatch):
+    import sandbox_manager
+    monkeypatch.setattr(sandbox_manager, "find_windows_of", lambda names: [])
+    assert client.post("/api/sandbox/focus", json={"mode": "back"}).json()["status"] == "not_found"
+
+    calls = []
+    monkeypatch.setattr(sandbox_manager, "find_windows_of", lambda names: [1234])
+    monkeypatch.setattr(sandbox_manager, "send_window_to_back", lambda h: calls.append(("back", h)) or True)
+    monkeypatch.setattr(sandbox_manager, "focus_window", lambda h: calls.append(("front", h)) or True)
+    assert client.post("/api/sandbox/focus", json={"mode": "back"}).json()["status"] == "ok"
+    assert client.post("/api/sandbox/focus").json()["status"] == "ok"
+    assert calls == [("back", 1234), ("front", 1234)]
+    assert "show_sandbox_window" in pipeline._SANDBOX_OVERRIDE_KEYS
+    assert pipeline.DEFAULT_OPTIONS["show_sandbox_window"] is False
