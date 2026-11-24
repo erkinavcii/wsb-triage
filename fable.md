@@ -405,3 +405,13 @@ Photoshop analizinden sonra iki şikâyet: analizin bittiği anlaşılmıyordu, 
   - Sonuç hesaplama artık analiz kilidi altında yapılıyor (iki iş parçacığı aynı anda hesaplayabiliyor). Panel bandı aynı anda çalışan adımları birlikte gösteriyor ("VirusTotal + Windows Sandbox").
   - "Sandbox'ı otomatik çalıştır" kapalıyken eski sıra korunuyor.
 - **Test:** 205 test geçiyor (3 yeni test: sandbox VirusTotal'ı beklemeden başlar, iptal ikisini durdurur, sandbox hatasında VirusTotal sonuçları korunur).
+
+## K. Çökme kayıtları ve isteğe bağlı ekran kartı (25 Kasım 2026)
+
+Üçüncü Photoshop analizinde kurulum ve crack betiği tamamlandı, Photoshop açıldı ama resim açılınca iki kez kapandı. Sandbox'taki Windows hata kaydı: `Photoshop.exe` → `ntdll.dll`, kod `0xc0000409`, fast-fail **10** (Control Flow Guard ihlali), iki çökme de aynı adreste (`+0x127670`). Bu, ekran kartı eksikliğinden çok yamalanmış/kancalanmış kodla uyumlu bir tablo.
+
+- **K1. Çökme kayıtları rapora giriyor — ✅ EKLENDİ.** İzleyici, analiz bitmeden Windows'un "Application Error" (1000) kayıtlarını ve aynı çökmenin "Windows Error Reporting" (1001, BEX/APPCRASH) kaydından fast-fail kodunu okuyor (`Get-CrashEvents`). Mesaj metni sandbox'ın diline göre değiştiği için olay özelliklerinden (Properties) okunuyor. Aynı program + modül + kod + adres tek satırda sayılıyor ("x2"). Sonuçta not olarak (kırmızı değil) anlaşılır bir açıklamayla çıkıyor; CFG ihlalinde, pakette crack bulgusu da varsa "yama bu sürümle uyumsuz olabilir" ekleniyor. Panelde "💥 Çöken programlar" kutusu, raporda ayrı bölüm.
+  - Ana bilgisayarın gerçek kayıtlarıyla denendi (Unity, Explorer, Steam çökmeleri doğru okundu; Steam'in fast-fail 7 kodu WER kaydından birleştirildi).
+- **K2. "Sandbox'a ekran kartı ver (GPU)" seçeneği — ✅ EKLENDİ.** Başlatma formunda ve "tekrar çalıştır" penceresinde, varsayılan kapalı. Açıkken `.wsb` dosyasında `VGpu=Enable`; GPU isteyen programlar (Photoshop vb.) çalışabilir ama ana bilgisayarın ekran kartı sürücüsü sandbox'a açıldığı için yalıtım daha zayıf. Panelde "🎮 Ekran kartı (vGPU) açık" uyarısı ve analiz günlüğünde not.
+- **Sandbox'a metin/betik vermek:** pano paylaşımı bilerek kapalı. En rahat yol, analizin `output` klasörü: sandbox içinde `C:\Analysis\output` olarak görünüyor, oraya konan bir `.cmd` dosyası sandbox içinde çift tıklanarak çalıştırılabilir, yazdığı sonuç da ana bilgisayardan okunabilir.
+- **Test:** 207 test geçiyor (2 yeni test).

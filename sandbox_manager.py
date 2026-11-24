@@ -160,9 +160,12 @@ def enable_windows_sandbox_feature() -> Dict[str, Any]:
 
 
 # ------------------------------------------------------------------ Windows Sandbox
-def build_wsb(case_dir: Path, network: bool, memory_mb: int = 4096, input_dir: Optional[Path] = None) -> str:
+def build_wsb(case_dir: Path, network: bool, memory_mb: int = 4096, input_dir: Optional[Path] = None,
+              vgpu: bool = False) -> str:
     """Hardened config: sample/tools read-only, only output writable, no clipboard/vGPU/printer/audio/camera.
-    input_dir lets a user-selected folder be mapped read-only in place instead of being copied."""
+    input_dir lets a user-selected folder be mapped read-only in place instead of being copied.
+    vgpu=True (user's choice, off by default) shares the host GPU for programs that need it; that exposes the
+    host's graphics driver to the sandbox, so isolation is weaker."""
     maps = [
         (input_dir or (case_dir / "input"), r"C:\Analysis\input", "true"),
         (case_dir / "tools", r"C:\Analysis\tools", "true"),
@@ -174,7 +177,7 @@ def build_wsb(case_dir: Path, network: bool, memory_mb: int = 4096, input_dir: O
     )
     safe_memory = max(1024, min(65536, int(memory_mb or 4096)))
     return f"""<Configuration>
-  <VGpu>Disable</VGpu>
+  <VGpu>{"Enable" if vgpu else "Disable"}</VGpu>
   <Networking>{"Enable" if network else "Disable"}</Networking>
   <MemoryInMB>{safe_memory}</MemoryInMB>
   <AudioInput>Disable</AudioInput>

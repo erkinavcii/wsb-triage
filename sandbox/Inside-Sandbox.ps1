@@ -1231,6 +1231,51 @@ function Scan-ProcessMemory {
     return @($all)
 }
 
+# Program crashes Windows recorded while the sample ran: "Application Error" 1000 events, joined with the
+# "Windows Error Reporting" 1001 BEX/APPCRASH event of the same crash for the fast-fail code (P9).
+# Read from the event properties, never the message text: that is in the sandbox's display language.
+function Get-CrashEvents([datetime]$Since) {
+    $byKey = [ordered]@{}
+    $evs = @()
+    try { $evs = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Application Error'; Id = 1000; StartTime = $Since } -ErrorAction Stop) } catch {}
+    foreach ($e in $evs) {
+        $p = $e.Properties
+        if ($p.Count -lt 11) { continue }
+        $code = ([string]$p[6].Value).ToLower() -replace '^0x', ''
+        $off = ([string]$p[7].Value).ToLower() -replace '^0x', ''
+        $key = '{0}|{1}|{2}|{3}' -f ([string]$p[0].Value).ToLower(), ([string]$p[3].Value).ToLower(), $code, $off
+        if (-not $byKey.Contains($key)) {
+            $byKey[$key] = [ordered]@{ App = [string]$p[0].Value; Version = [string]$p[1].Value; Module = [string]$p[3].Value
+                                       Code = $code; Offset = $off; Path = [string]$p[10].Value; FastFail = ''; Count = 0
+                                       First = $e.TimeCreated.ToString('HH:mm:ss') }
+        }
+        $byKey[$key].Count++
+    }
+    $wer = @()
+    try { $wer = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Windows Error Reporting'; Id = 1001; StartTime = $Since } -ErrorAction Stop) } catch {}
+    foreach ($e in $wer) {
+        $p = $e.Properties
+        if ($p.Count -lt 14 -or ([string]$p[2].Value) -notmatch '^(BEX|BEX64|APPCRASH)$') { continue }
+        $code = ([string]$p[12].Value).ToLower() -replace '^0x', ''
+        $off = ([string]$p[11].Value).ToLower() -replace '^0x', ''
+        $key = '{0}|{1}|{2}|{3}' -f ([string]$p[5].Value).ToLower(), ([string]$p[8].Value).ToLower(), $code, $off
+        $ff = [string]$p[13].Value
+        if ($byKey.Contains($key) -and $code -eq 'c0000409' -and $ff -match '^[0-9a-fA-F]{1,16}$') {
+            $byKey[$key].FastFail = [string][Convert]::ToInt64($ff, 16)
+        }
+    }
+    $out = @()
+    foreach ($c in $byKey.Values) {
+        $offTxt = $c.Offset.TrimStart('0'); if (-not $offTxt) { $offTxt = '0' }
+        $line = "$($c.App) $($c.Version) | module $($c.Module) | code 0x$($c.Code)"
+        if ($c.FastFail) { $line += " | fastfail $($c.FastFail)" }
+        $line += " | offset 0x$offTxt | x$($c.Count) | first $($c.First) | $($c.Path)"
+        $out += $line
+        Log "CRASH $line"
+    }
+    return $out
+}
+
 $script:FakeNetLog = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
 $script:FakeNetState = [hashtable]::Synchronized(@{ Stop = $false; Log = $script:FakeNetLog; Udp = $null; Tcp = $null })
 $script:FakeNetWorkers = @()
@@ -1469,6 +1514,7 @@ Update-Watch $watchStart
 Import-AuditProcesses $startedAt
 Update-HoneyReads $startedAt
 $memFindings = @(Scan-ProcessMemory)
+$crashes = @(Get-CrashEvents $startedAt)
 Test-LanBlock
 Capture-Screen
 $endedAt = Get-Date
@@ -1609,6 +1655,7 @@ $result = [ordered]@{
     LanBlock        = $script:LanBlock
     HoneyfileAlerts = @($honeyAlerts)
     MemoryFindings  = @($memFindings)
+    Crashes         = @($crashes)
     FakeNetRequests = @($fakeNetReqs)
     AutoClicks      = @($script:ClickedActions)
     Processes       = @($Procs.Values | Where-Object { $MonitorNames -notcontains ([string]$_.Name).ToLower() } | Sort-Object FirstSeen)

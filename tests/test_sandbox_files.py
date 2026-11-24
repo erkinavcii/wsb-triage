@@ -315,3 +315,14 @@ def test_sandbox_is_closed_when_observation_fails(tmp_path, monkeypatch):
     with pytest.raises(PermissionError):
         pipeline.stage_sandbox(job)
     assert stopped == ["sid-1"]
+
+
+def test_vgpu_is_off_unless_asked_and_crashes_are_collected(tmp_path):
+    import pipeline
+    import sandbox_manager as sbm
+    assert "<VGpu>Disable</VGpu>" in sbm.build_wsb(tmp_path, network=True)
+    assert "<VGpu>Enable</VGpu>" in sbm.build_wsb(tmp_path, network=True, vgpu=True)
+    assert pipeline.DEFAULT_OPTIONS["enable_vgpu"] is False and "enable_vgpu" in pipeline._SANDBOX_OVERRIDE_KEYS
+    ps = (Path(pipeline.__file__).parent / "sandbox" / "Inside-Sandbox.ps1").read_text(encoding="utf-8")
+    assert "function Get-CrashEvents" in ps and "Crashes         = @($crashes)" in ps
+    assert "ProviderName = 'Application Error'" in ps          # not the localized message text

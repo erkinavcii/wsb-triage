@@ -947,3 +947,23 @@ def test_installer_that_did_something_is_not_flagged(tmp_path, extra):
     job.state["behavior"] = _stalled_behavior(**extra)
     pipeline.compute_verdict(job)
     assert not job.state["verdict"].get("install_not_started")
+
+
+def test_crashes_become_a_plain_note(tmp_path):
+    job = bare_job(tmp_path)
+    job.state["static"] = [_static_entry("Set-up.exe", spoof=True)]
+    job.state["behavior"] = pipeline.sanitize_sandbox_json({"Target": "Set-up.exe", "Crashes": [
+        r"Photoshop.exe 27.11.0.26 | module ntdll.dll | code 0xc0000409 | fastfail 10 | offset 0x127670 | x2 | first 00:32:18 | C:\Program Files\Adobe\Adobe Photoshop 2026\Photoshop.exe",
+        r"helper.exe 1.0 | module helper.dll | code 0xc0000005 | offset 0x10 | x1 | first 00:33:00 | C:\x\helper.exe",
+    ]})
+    pipeline.compute_verdict(job)
+    v = job.state["verdict"]
+    assert not any("çöktü" in x for x in v["red"])
+    note = next(n for n in v["notes"] if "çöktü" in n)
+    assert "3 çökme" in note and "Photoshop.exe 2 kez" in note and "Control Flow Guard" in note
+    assert "geçersiz bellek erişimi" in note and "crack bulguları" in note
+    rep = pipeline.render_report(job) if hasattr(pipeline, "render_report") else ""
+    job2 = bare_job(tmp_path, "t2")
+    job2.state["behavior"] = pipeline.sanitize_sandbox_json({"Target": "Set-up.exe", "Crashes": []})
+    pipeline.compute_verdict(job2)
+    assert not any("çöktü" in x for x in job2.state["verdict"]["notes"])

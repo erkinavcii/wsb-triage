@@ -68,6 +68,7 @@ DEFAULT_OPTIONS = {
     "run_sandbox": True,
     "keep_sandbox_open": False,
     "show_sandbox_window": False,
+    "enable_vgpu": False,
     "simulate_user": True,
     "notify": True,
     "memory_mb": 4096,
@@ -519,7 +520,7 @@ def cleanup_jobs(days: int) -> List[str]:
 
 _SANDBOX_OVERRIDE_KEYS = {
     "target", "target_args", "dll_export", "duration_min", "memory_mb",
-    "network", "keep_sandbox_open", "show_sandbox_window", "simulate_user", "run_as_standard_user",
+    "network", "keep_sandbox_open", "show_sandbox_window", "enable_vgpu", "simulate_user", "run_as_standard_user",
     "seed_honeyfiles", "fake_net", "sandbox_backend", "vbox_vm", "vbox_snapshot", "vbox_user",
 }
 
@@ -1997,7 +1998,12 @@ def stage_sandbox(job: Job) -> None:
             if sbm.sandbox_state() is True:
                 raise PipelineError("Açık bir Windows Sandbox penceresi var (aynı anda yalnızca bir tane açılabilir). Kapatıp tekrar deneyin.")
             wsb = job.case_dir / "analysis.wsb"
-            wsb.write_text(sbm.build_wsb(job.case_dir, bool(job.opt("network")), int(job.opt("memory_mb")), sandbox_input), encoding="utf-8")
+            vgpu = bool(job.opt("enable_vgpu"))
+            wsb.write_text(sbm.build_wsb(job.case_dir, bool(job.opt("network")), int(job.opt("memory_mb")), sandbox_input,
+                                         vgpu=vgpu), encoding="utf-8")
+            if vgpu:
+                job.log("Sandbox'a ekran kartı (vGPU) verildi: GPU isteyen programlar çalışabilir, ama ana bilgisayarın "
+                        "ekran kartı sürücüsü sandbox'a açıldığı için yalıtım daha zayıf.")
             job.stage("sandbox", "running", f"Sandbox açılıyor (internet {net}, {job.opt('duration_min')} dk)...")
             job.log("Windows Sandbox başlatıldı. Örnek bir kurulum penceresi açarsa sandbox penceresinin içinden ilerleyebilirsiniz.")
             wsb_sid = sbm.launch_sandbox(wsb)
@@ -2158,7 +2164,7 @@ _BOOLS = [("LanBlock", "Requested"), ("LanBlock", "Applied"), ("LanBlock", "Tamp
 _STRS = [("RunMode",), ("Target",), ("Started",), ("Ended",), ("CaptureStatus",), ("LanBlock", "Status")]
 
 
-_CAPPED_STR_LISTS = ("MemoryFindings", "FakeNetRequests", "AutoClicks")
+_CAPPED_STR_LISTS = ("MemoryFindings", "FakeNetRequests", "AutoClicks", "Crashes")
 
 
 def sanitize_sandbox_json(d: Any) -> Optional[Dict[str, Any]]:
@@ -2687,6 +2693,55 @@ def _split_memory_findings(items: List[Any]) -> Tuple[List[str], List[str]]:
     return red_items, url_items
 
 
+# Windows exception codes and fast-fail codes (0xc0000409 + P9) seen in crash records, in plain words.
+_CRASH_CODES = {
+    "c0000005": "geçersiz bellek erişimi",
+    "c0000409": "Windows'un güvenlik kontrolü programı durdurdu",
+    "c0000374": "bellek (heap) bozulması",
+    "c00000fd": "yığın taşması",
+    "c000001d": "geçersiz işlemci komutu",
+    "e0434352": ".NET istisnası",
+    "80000003": "kesme noktası",
+}
+_FAST_FAIL = {
+    2: "yığın taşması koruması (stack cookie) tetiklendi",
+    5: "geçersiz parametre",
+    7: "program kendini acil kapattı",
+    10: "Control Flow Guard ihlali: izin verilmeyen bir adrese dolaylı çağrı",
+}
+_CRASH_RX = re.compile(r"^(?P<app>\S+)\s.*?\| module (?P<mod>[^|]+?) \| code 0x(?P<code>[0-9a-f]+)"
+                       r"(?: \| fastfail (?P<ff>\d+))?.*?\| x(?P<n>\d+)", re.I)
+
+
+def _crash_note(crashes: List[Any], has_crack: bool) -> str:
+    """Programs that crashed during the run (Windows crash records). Not a malware sign by itself: shown so a
+    "it closed when I opened an image" run explains itself in the report."""
+    parts, cfg = [], False
+    total = 0
+    for x in crashes:
+        m = _CRASH_RX.match(str(x))
+        if not m:
+            parts.append(str(x)[:160])
+            total += 1
+            continue
+        n = int(m.group("n"))
+        total += n
+        code = m.group("code").lower()
+        why = _CRASH_CODES.get(code, "")
+        if m.group("ff"):
+            ff = int(m.group("ff"))
+            why = _FAST_FAIL.get(ff, f"fast-fail kodu {ff}")
+            cfg = cfg or ff == 10
+        parts.append(f"{m.group('app')} {n} kez ({m.group('mod').strip()}, 0x{code}" + (f": {why}" if why else "") + ")")
+    if not parts:
+        return ""
+    text = f"Çalışma sırasında programlar çöktü ({total} çökme): " + "; ".join(parts[:5]) + "."
+    if cfg:
+        text += (" Control Flow Guard ihlali genelde bellekte ya da dosyada yamalanmış/kancalanmış kodda görülür"
+                 + ("; bu pakette crack bulguları da var, yama bu sürümle uyumsuz olabilir." if has_crack else "."))
+    return text
+
+
 def _installer_never_started(b: Dict[str, Any]) -> str:
     """An installer or disc menu that ran alone the whole time: no child process, nothing clicked, no new program
     file. Typical for a custom-drawn "Install" button the auto-clicker cannot see. The run then says nothing about
@@ -2918,6 +2973,9 @@ def _compute_verdict(job: Job) -> None:
         conns = [c for c in (b.get("Network") or {}).get("Connections") or [] if c.get("FromSample")]
         if conns:
             notes.append(f"Örneğin başlattığı işlemler {len(conns)} ağ bağlantısı açtı.")
+        crash_note = _crash_note(b.get("Crashes") or [], bool(crack))
+        if crash_note:
+            notes.append(crash_note)
         mem_red, mem_urls = _split_memory_findings(b.get("MemoryFindings") or [])
         if mem_red:
             red.append(f"Canlı işlem belleğinde zararlı/şüpheli izler tespit edildi ({len(mem_red)}): "
@@ -3063,6 +3121,7 @@ def write_report(job: Job) -> None:
         sections = [("Yem dosya (honeyfile) uyarıları", b.get("HoneyfileAlerts")),
                     ("Defender değişiklikleri", (b.get("Defender") or {}).get("Added")), ("Defender tespitleri", (b.get("Defender") or {}).get("ThreatsDetected")),
                     ("Yeni servisler", (b.get("Persistence") or {}).get("Services")), ("Yeni sürücüler", (b.get("Persistence") or {}).get("Drivers")),
+                    ("Çöken programlar (Windows hata kayıtları)", b.get("Crashes")),
                     ("Yeni zamanlanmış görevler", (b.get("Persistence") or {}).get("Tasks")), ("Otomatik başlatma kayıtları", (b.get("Persistence") or {}).get("RunKeys")),
                     ("Başlangıç klasörü", (b.get("Persistence") or {}).get("Startup")),
                     ("WMI kalıcılık abonelikleri", (b.get("Persistence") or {}).get("WmiSubscriptions")),

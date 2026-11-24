@@ -115,6 +115,7 @@ function options() {
     run_sandbox: $('optSandbox').checked,
     keep_sandbox_open: $('optKeepOpen').checked,
     show_sandbox_window: $('optShowWindow') ? $('optShowWindow').checked : false,
+    enable_vgpu: $('optVgpu') ? $('optVgpu').checked : false,
     simulate_user: $('optSimUser').checked,
     run_as_standard_user: $('optStdUser') ? $('optStdUser').checked : false,
     seed_honeyfiles: $('optHoneyfiles') ? $('optHoneyfiles').checked : true,
@@ -524,6 +525,7 @@ function renderSandbox(st) {
     : lan.Applied ? `<span class="text-emerald-300">🔒 Ev ağı / ana bilgisayar engelli — sadece internet + DNS (53) açık</span>`
     : lan.Requested ? `<span class="text-amber-300">⚠️ Yerel ağ engeli uygulanamadı: ${esc(lan.Status)}</span>` : `<span class="text-slate-400">İnternet kapalı</span>`;
   $('sbCounters').innerHTML += `<div class="col-span-2 md:col-span-4 text-[11px] flex flex-wrap gap-x-6 gap-y-1">${lanText}
+    ${(st.options || {}).enable_vgpu ? '<span class="text-amber-300">🎮 Ekran kartı (vGPU) açık — yalıtım daha zayıf</span>' : ''}
     ${src.RunMode ? `<span class="text-slate-400">Örnek: ${esc(src.RunMode === 'copied' ? 'sandbox diskine kopyalanıp çalıştırıldı' : 'kopyalanmadan, salt okunur klasörden çalıştırıldı (büyük kurulum)')}</span>` : ''}</div>`;
 
   let pers;
@@ -534,6 +536,7 @@ function renderSandbox(st) {
       + listBox('🛑 Defender değişiklikleri', D.Added, 'rose') + listBox('🛑 Defender tespitleri', D.ThreatsDetected, 'rose')
       + listBox('⚙️ Yeni servisler', P.Services, 'rose') + listBox('🧩 Yeni sürücüler', P.Drivers, 'rose')
       + listBox('🔁 Ayarı değişen mevcut servisler', P.ServicesChanged, 'amber')
+      + listBox('💥 Çöken programlar (Windows hata kayıtları)', b.Crashes, 'amber')
       + listBox('⏰ Zamanlanmış görevler', P.Tasks, 'amber') + listBox('📌 Otomatik başlatma (Run/IFEO)', asArr(P.RunKeys).concat(asArr(P.Startup)), 'amber')
       + listBox('🕵️ Gelişmiş kalıcılık (WMI/COM/AppInit/BITS/PS)', advPers, advPers.length ? 'rose' : 'slate')
       + listBox('📝 hosts (eklenen / silinen)', asArr((b.Hosts || {}).Added).concat(asArr((b.Hosts || {}).Removed).map(x => `[-] ${x}`)), 'amber')
@@ -797,6 +800,7 @@ function openSandboxModal(st) {
   $('sbModalNet').checked = o.network !== false;
   $('sbModalKeepOpen').checked = !!o.keep_sandbox_open;
   if ($('sbModalShowWindow')) $('sbModalShowWindow').checked = !!o.show_sandbox_window;
+  if ($('sbModalVgpu')) $('sbModalVgpu').checked = !!o.enable_vgpu;
   $('sbModalSimUser').checked = o.simulate_user !== false;
   $('sbModalStdUser').checked = !!o.run_as_standard_user;
   $('sbModalHoney').checked = o.seed_honeyfiles !== false;
@@ -827,6 +831,7 @@ if ($('btnSbModalStart')) {
       network: $('sbModalNet').checked,
       keep_sandbox_open: $('sbModalKeepOpen').checked,
       show_sandbox_window: $('sbModalShowWindow') ? $('sbModalShowWindow').checked : false,
+      enable_vgpu: $('sbModalVgpu') ? $('sbModalVgpu').checked : false,
       simulate_user: $('sbModalSimUser').checked,
       run_as_standard_user: $('sbModalStdUser').checked,
       seed_honeyfiles: $('sbModalHoney').checked,

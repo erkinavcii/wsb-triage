@@ -179,6 +179,7 @@ class JobRequest(BaseModel):
     run_sandbox: Optional[bool] = True
     keep_sandbox_open: Optional[bool] = False
     show_sandbox_window: Optional[bool] = False
+    enable_vgpu: Optional[bool] = False
     simulate_user: Optional[bool] = True
     notify: Optional[bool] = True
     memory_mb: Optional[int] = 4096
@@ -201,6 +202,7 @@ class SandboxStartRequest(BaseModel):
     network: Optional[bool] = None
     keep_sandbox_open: Optional[bool] = None
     show_sandbox_window: Optional[bool] = None
+    enable_vgpu: Optional[bool] = None
     simulate_user: Optional[bool] = None
     run_as_standard_user: Optional[bool] = None
     seed_honeyfiles: Optional[bool] = None
