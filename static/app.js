@@ -481,6 +481,10 @@ function renderBanner(st) {
     if (sb.status === 'done' && !target) {
       html += box('rose', "⚠️ Sandbox açıldı ama içinde hiçbir şey çalıştırılmadı",
         ["Dosyanın davranışı incelenmedi; ekran görüntülerinde sadece boş masaüstü görünür. Sonuç notlarındaki nedene bakın."]);
+    } else if (sb.status === 'done' && (st.verdict || {}).install_not_started) {
+      html += box('amber', "⚠️ Kurulum başlamamış görünüyor — sonuç eksik",
+        [`<span class="mono">${esc(target)}</span> çalıştı ama hiçbir alt işlem başlatmadı ve otomatik tıklayıcı hiçbir butona basamadı. Büyük olasılıkla bir butona (ör. "Install") basılmasını bekledi; kurulumun ne yaptığı incelenmedi.`,
+         "Ne yapabilirsiniz: <b>Sandbox'ta tekrar çalıştır</b> → listeden asıl kurulum dosyasını seçin (ör. <span class=\"mono\">Set-up.exe</span>) ve/veya <b>Pencereyi ekranda göster</b>'i açıp butona kendiniz basın."]);
     }
   }
   $('jobBanner').innerHTML = `<div class="space-y-2">${html}</div>`;

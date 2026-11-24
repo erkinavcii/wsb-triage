@@ -477,25 +477,38 @@ _SANDBOX_OVERRIDE_KEYS = {
 }
 
 
+_DEPRIO_NAME_RX = re.compile(r"(uninst|unins\d|crash|helper|vc_?redist|vcredist|dotnet|ndp\d|directx|dxsetup|redist|updater|elevat|report|cleanup|repair)", re.I)
+_INSTALLER_NAME_RX = re.compile(r"^(set-?up|install)", re.I)
+# Disc menus (autoplay/autorun) only show an "Install" button, often custom-drawn so it cannot be auto-clicked;
+# the real installer they would start is picked first when there is one.
+_LAUNCHER_NAME_RX = re.compile(r"^(autorun|autoplay|start)", re.I)
+
+
 def list_runnable_targets(job: Job) -> List[str]:
-    """Returns relative paths of runnable candidates under job.input_dir ordered by likelihood."""
+    """Relative paths of runnable candidates, most likely first. Paths are relative to the folder the sandbox gets as
+    its input: job.input_dir, or the extracted disc image when the input holds only an .iso/.img."""
     inp = job.input_dir
     if not inp.is_dir():
         return []
-    deprio_rx = re.compile(r"(uninst|unins\d|crash|helper|vc_?redist|vcredist|dotnet|ndp\d|directx|dxsetup|redist|updater|elevat|report|cleanup|repair)", re.I)
-    inst_rx = re.compile(r"^(set-?up|install|autorun|autoplay|start)", re.I)
     cands = [p for p in inp.rglob("*") if p.is_file() and p.suffix.lower() in RUNNABLE_EXT]
+    if not cands:
+        img_root = _image_root_for(job)
+        if img_root and img_root.is_dir():
+            inp = img_root
+            cands = [p for p in inp.rglob("*") if p.is_file() and p.suffix.lower() in RUNNABLE_EXT]
 
     def sort_key(p: Path):
         ext = p.suffix.lower()
         if ext == ".dll":
             rank = 10
-        elif deprio_rx.search(p.name):
+        elif _DEPRIO_NAME_RX.search(p.name):
             rank = 9
-        elif inst_rx.search(p.name):
+        elif _INSTALLER_NAME_RX.search(p.name):
             rank = 0
-        elif NAME_RX.search(p.name):
+        elif _LAUNCHER_NAME_RX.search(p.name):
             rank = 1
+        elif NAME_RX.search(p.name):
+            rank = 2
         else:
             rank = 5
         rel = p.relative_to(inp)
@@ -1789,6 +1802,24 @@ SANDBOX_RUNNABLE_EXT = {".exe", ".msi", ".bat", ".cmd", ".ps1", ".vbs", ".vbe", 
 DISC_IMAGE_EXT = {".iso", ".img"}
 
 
+def _image_only_input(job: Job) -> Optional[Path]:
+    """The largest disc image when the input has no runnable file but has an .iso/.img, else None."""
+    inp = job.input_dir
+    files = [p for p in inp.rglob("*") if p.is_file()] if inp.is_dir() else []
+    if not files or any(p.suffix.lower() in SANDBOX_RUNNABLE_EXT for p in files):
+        return None
+    images = sorted((p for p in files if p.suffix.lower() in DISC_IMAGE_EXT), key=lambda p: -p.stat().st_size)
+    return images[0] if images else None
+
+
+def _image_root_for(job: Job) -> Optional[Path]:
+    """Where that image is (or will be) extracted for the sandbox."""
+    img = _image_only_input(job)
+    if img is None:
+        return None
+    return job.case_dir / "image_root" / (re.sub(r"[^\w.-]", "_", img.stem)[:60] or "image")
+
+
 def _prepare_image_input(job: Job) -> Tuple[Path, str]:
     """What the sandbox gets as its read-only input folder.
 
@@ -1796,17 +1827,13 @@ def _prepare_image_input(job: Job) -> Tuple[Path, str]:
     (Mount-DiskImage succeeds there but no volume appears), so in that case the largest image is extracted on the
     host with 7-Zip (nothing is executed) and its contents become the sandbox input. Returns (folder, note)."""
     inp = job.input_dir
-    files = [p for p in inp.rglob("*") if p.is_file()] if inp.is_dir() else []
-    if not files or any(p.suffix.lower() in SANDBOX_RUNNABLE_EXT for p in files):
-        return inp, ""
-    images = sorted((p for p in files if p.suffix.lower() in DISC_IMAGE_EXT), key=lambda p: -p.stat().st_size)
-    if not images:
+    img = _image_only_input(job)
+    if img is None:
         return inp, ""
     sz = sbm.seven_zip_path()
-    img = images[0]
     if not sz:
         return inp, f"{img.name} açılamadı: 7-Zip kurulu değil."
-    dest = job.case_dir / "image_root" / (re.sub(r"[^\w.-]", "_", img.stem)[:60] or "image")
+    dest = _image_root_for(job)
     if not (dest.exists() and any(dest.rglob("*"))):
         job.stage("sandbox", "running", f"Disk görüntüsü açılıyor (çalıştırılmıyor): {img.name}")
         lp = subprocess.run([sz, "l", "-slt", "-pno-password", str(img)], capture_output=True, text=True,
@@ -2487,8 +2514,22 @@ _WSB_NOISE_MODE_CHANGE_RX = re.compile(
 
 
 def _is_wsb_noise_mode_change(change: str) -> bool:
+    """BITS or Windows Sandbox's own IsolationSession service changing only its start mode. Both sides must be the
+    same service with the exact Windows command line, so a swapped binary is never noise."""
     old_l, _, new_l = str(change or "").partition(" -> ")
-    return bool(_WSB_NOISE_MODE_CHANGE_RX.match(old_l.strip()) and _WSB_NOISE_MODE_CHANGE_RX.match(new_l.strip()))
+    old_l, new_l = old_l.strip(), new_l.strip()
+    if old_l.split("|", 1)[0].strip().lower() != new_l.split("|", 1)[0].strip().lower():
+        return False
+    return any(rx.match(old_l) and rx.match(new_l) for rx in (_WSB_NOISE_MODE_CHANGE_RX, _WSB_NOISE_SERVICE_RX))
+
+
+# Windows 11's own tip/notification tasks ("SoftLanding"): created per user, with no action. A task with an action
+# under the same folder is not noise.
+_WSB_NOISE_TASK_RX = re.compile(r"^\\SoftLanding\\S-1-5-21-[\d-]+\\SoftLanding\w*Task[\w{}-]*\s*\|?\s*$", re.I)
+
+
+def _is_wsb_noise_task(task: str) -> bool:
+    return bool(_WSB_NOISE_TASK_RX.match(str(task or "").strip()))
 
 
 def _is_windows_bits_job(job_line: str) -> bool:
@@ -2572,6 +2613,31 @@ def _split_memory_findings(items: List[Any]) -> Tuple[List[str], List[str]]:
             continue
         (red_items if cls == CLASS_ABUSED else url_items).append(text)
     return red_items, url_items
+
+
+def _installer_never_started(b: Dict[str, Any]) -> str:
+    """An installer or disc menu that ran alone the whole time: no child process, nothing clicked, no new program
+    file. Typical for a custom-drawn "Install" button the auto-clicker cannot see. The run then says nothing about
+    what the installation does, so it must not read as a clean result. Returns the note text, or ""."""
+    if not isinstance(b, dict):
+        return ""
+    target = str(b.get("Target") or "").strip()
+    if not target:
+        return ""
+    name = re.split(r"[\\/]", target)[-1]
+    if not (_INSTALLER_NAME_RX.search(name) or _LAUNCHER_NAME_RX.search(name)):
+        return ""
+    tree = [x for x in b.get("Processes") or [] if isinstance(x, dict) and x.get("InTree")]
+    if len(tree) > 1 or b.get("AutoClicks"):
+        return ""
+    files = b.get("Files") or {}
+    if [f for f in files.get("NewExecutables") or [] if not _is_wsb_noise_dropped_file(str(f))]:
+        return ""
+    return (f"Kurulum başlamamış görünüyor: '{name}' çalıştı ama hiçbir alt işlem başlatmadı, otomatik tıklayıcı "
+            "hiçbir butona basamadı ve yeni bir program dosyası oluşmadı. Büyük olasılıkla bir butona (ör. 'Install') "
+            "basılmasını bekledi; kurulumun ne yaptığı incelenmedi. Ekran görüntülerine bakın. 'Sandbox'ta tekrar "
+            "çalıştır' ile asıl kurulum dosyasını seçin ya da canlı ekranda sandbox penceresini öne getirip butona "
+            "kendiniz basın.")
 
 
 def compute_verdict(job: Job) -> None:
@@ -2737,8 +2803,9 @@ def compute_verdict(job: Job) -> None:
             notes.append(f"HKCU COM sınıfı kaydı eklendi ({len(P['ComHijacks'])}) — COM hijacking ihtimali.")
         if P.get("ActiveSetup"):
             notes.append(f"Active Setup kalıcılık kaydı eklendi ({len(P['ActiveSetup'])}).")
-        if P.get("Tasks"):
-            notes.append(f"{len(P['Tasks'])} yeni zamanlanmış görev — ürüne mi ait kontrol edin.")
+        real_tasks = [x for x in (P.get("Tasks") or []) if not _is_wsb_noise_task(x)]
+        if real_tasks:
+            notes.append(f"{len(real_tasks)} yeni zamanlanmış görev — ürüne mi ait kontrol edin.")
         if P.get("RunKeys"):
             notes.append(f"{len(P['RunKeys'])} otomatik başlatma kaydı eklendi/değişti.")
         if (b.get("Hosts") or {}).get("Added"):
@@ -2836,8 +2903,15 @@ def compute_verdict(job: Job) -> None:
                          "dosyanın davranışı incelenmedi — bu sonuç temiz olduğu anlamına gelmez. "
                          + " ".join(x for x in (str((s.get("sandbox") or {}).get("image_note") or ""),
                                                  str(b.get("TargetNote") or "")) if x))
+        else:
+            stalled = _installer_never_started(b)
+            if stalled:
+                missing.append("Kurulum")
+                notes.append(stalled)
     level = "red" if red else ("yellow" if (notes or crack) else ("green" if finished else "pending"))
     verdict_obj: Dict[str, Any] = {"level": level, "red": red, "notes": notes, "crack": crack, "not_run": missing}
+    if "Kurulum" in missing:
+        verdict_obj["install_not_started"] = True
     if known_good:
         verdict_obj["known_good"] = known_good
     s["verdict"] = verdict_obj

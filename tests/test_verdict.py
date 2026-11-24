@@ -888,3 +888,62 @@ def test_memory_findings_windows_wallpaper_links_are_not_red(tmp_path):
     assert any("api.telegram.org/bot" in x for x in v2["red"])
     assert not any("unknown-host" in x for x in v2["red"])
     assert any("unknown-host" in x for x in v2["notes"])
+
+
+def test_isolation_session_mode_change_and_softlanding_tasks_are_noise(tmp_path):
+    job = bare_job(tmp_path)
+    sid = "S-1-5-21-2047949552-857980807-821054962-504"
+    job.state["behavior"] = pipeline.sanitize_sandbox_json({"Target": "Set-up.exe", "Persistence": {
+        "ServicesChanged": [r"IsolationSession | Auto | C:\Windows\system32\svchost.exe -k IsolationSession -p -> "
+                            r"IsolationSession | Manual | C:\Windows\system32\svchost.exe -k IsolationSession -p"],
+        "Tasks": [rf"\SoftLanding\{sid}\SoftLandingDeferralTask-{{0bc7bc3a-1baf-4f4f-98f4-e3637db840b1}} | ",
+                  rf"\SoftLanding\{sid}\SoftLandingTriggerTask-128000000001615609-render-{{26133d04-ad42-449f-aba9-9fd36bab83fb}} | "],
+    }})
+    pipeline.compute_verdict(job)
+    text = " ".join(job.state["verdict"]["notes"] + job.state["verdict"]["red"])
+    assert "IsolationSession" not in text and "zamanlanmış görev" not in text
+
+    job2 = bare_job(tmp_path, "t2")
+    job2.state["behavior"] = pipeline.sanitize_sandbox_json({"Target": "Set-up.exe", "Persistence": {
+        "ServicesChanged": [r"IsolationSession | Auto | C:\Windows\system32\svchost.exe -k IsolationSession -p -> "
+                            r"IsolationSession | Auto | C:\Users\Public\svc.exe"],
+        "Tasks": [rf"\SoftLanding\{sid}\SoftLandingDeferralTask-{{x}} | C:\Users\Public\run.exe"],
+    }})
+    pipeline.compute_verdict(job2)
+    v2 = job2.state["verdict"]
+    assert any("servis ele geçirme" in x for x in v2["red"])
+    assert any("1 yeni zamanlanmış görev" in x for x in v2["notes"])
+
+
+def _stalled_behavior(**extra):
+    b = {"Target": "autoplay.exe", "Processes": [{"Name": "autoplay.exe", "Pid": 5892, "InTree": True}],
+         "AutoClicks": [], "Files": {"NewExecutables": [
+             r"C:\Users\WDAGUtilityAccount\AppData\Local\Packages\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\LocalState\EBWebView\x.dll"]}}
+    b.update(extra)
+    return pipeline.sanitize_sandbox_json(b)
+
+
+def test_installer_that_never_started_is_flagged(tmp_path):
+    job = bare_job(tmp_path)
+    job.state["status"] = "done"
+    for k in ("extract", "inventory", "static", "vt", "sandbox", "report"):
+        job.state["stages"][k]["status"] = "done"
+    job.state["behavior"] = _stalled_behavior()
+    pipeline.compute_verdict(job)
+    v = job.state["verdict"]
+    assert v["level"] == "yellow" and v.get("install_not_started") is True
+    assert "Kurulum" in v["not_run"]
+    assert any("Kurulum başlamamış" in n and "autoplay.exe" in n for n in v["notes"])
+
+
+@pytest.mark.parametrize("extra", [
+    {"Processes": [{"Name": "autoplay.exe", "Pid": 1, "InTree": True}, {"Name": "Set-up.exe", "Pid": 2, "InTree": True}]},
+    {"AutoClicks": ["Install"]},
+    {"Files": {"NewExecutables": [r"C:\Program Files\Adobe\Photoshop.exe"]}},
+    {"Target": "payload.exe"},
+])
+def test_installer_that_did_something_is_not_flagged(tmp_path, extra):
+    job = bare_job(tmp_path)
+    job.state["behavior"] = _stalled_behavior(**extra)
+    pipeline.compute_verdict(job)
+    assert not job.state["verdict"].get("install_not_started")

@@ -853,13 +853,17 @@ if ($sampleBytes -le $copyMax * 1MB) {
 }
 
 $DeprioritizeRx = '(?i)(uninst|unins\d|crash|helper|vc_?redist|vcredist|dotnet|ndp\d|directx|dxsetup|redist|updater|elevat|report|cleanup|repair)'
-$InstallerRx = '(?i)^(set-?up|install|autorun|autoplay|start)'
+$InstallerRx = '(?i)^(set-?up|install)'
+# Disc menus only show an "Install" button (often custom-drawn, so it cannot be auto-clicked): the real installer
+# they would start is picked first when there is one.
+$LauncherRx = '(?i)^(autorun|autoplay|start)'
 $CrackRx = '(?i)(patch|crack|loader|activat|keygen|genp)'
 function Get-TargetRank($f) {
     if ($f.Extension.ToLower() -eq '.dll') { return 10 }
     if ($f.Name -match $DeprioritizeRx) { return 9 }
     if ($f.Name -match $InstallerRx) { return 0 }
-    if ($f.Name -match $CrackRx) { return 1 }
+    if ($f.Name -match $LauncherRx) { return 1 }
+    if ($f.Name -match $CrackRx) { return 2 }
     return 5
 }
 

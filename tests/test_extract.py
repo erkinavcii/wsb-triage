@@ -2,6 +2,7 @@
 import shutil
 import subprocess
 import zipfile
+from pathlib import Path
 
 import pytest
 
@@ -359,3 +360,35 @@ def test_folder_with_a_runnable_file_is_used_as_is(tmp_path):
     job.state["input_path"] = str(src)
     root, note = pipeline._prepare_image_input(job)
     assert root == src and note == ""
+
+
+def test_real_installer_is_picked_before_the_disc_menu(tmp_path):
+    src = tmp_path / "dvd"
+    (src / "Adobe 2026").mkdir(parents=True)
+    (src / "autoplay.exe").write_bytes(b"MZ menu")
+    (src / "Adobe 2026" / "Set-up.exe").write_bytes(b"MZ installer")
+    (src / "Adobe 2026" / "uninstall.exe").write_bytes(b"MZ")
+    job = _bare_job(tmp_path)
+    job.state["input_path"] = str(src)
+    targets = pipeline.list_runnable_targets(job)
+    assert targets[0] == str(Path("Adobe 2026") / "Set-up.exe")
+    assert targets.index("autoplay.exe") < targets.index(str(Path("Adobe 2026") / "uninstall.exe"))
+    ps = (Path(pipeline.__file__).parent / "sandbox" / "Inside-Sandbox.ps1").read_text(encoding="utf-8")
+    assert "$InstallerRx = '(?i)^(set-?up|install)'" in ps and "$LauncherRx" in ps
+
+
+def test_target_list_shows_the_extracted_image_contents(tmp_path):
+    """Folder with only an .iso: after the first run extracted it, the target picker lists what is inside, with
+    paths relative to the folder the sandbox gets."""
+    src = tmp_path / "Photoshop.2026"
+    src.mkdir()
+    (src / "Adobe.Test.iso").write_bytes(b"iso")
+    (src / "Adobe.Test.md5").write_bytes(b"")
+    job = _bare_job(tmp_path)
+    job.state["input_path"] = str(src)
+    assert pipeline.list_runnable_targets(job) == []
+    root = pipeline._image_root_for(job)
+    (root / "Adobe 2026").mkdir(parents=True)
+    (root / "autoplay.exe").write_bytes(b"MZ")
+    (root / "Adobe 2026" / "Set-up.exe").write_bytes(b"MZ")
+    assert pipeline.list_runnable_targets(job)[:2] == [str(Path("Adobe 2026") / "Set-up.exe"), "autoplay.exe"]
