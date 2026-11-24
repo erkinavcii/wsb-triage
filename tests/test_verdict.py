@@ -706,4 +706,38 @@ def test_f8_honeyfile_verdict_distinguishes_confirmed_vs_unattributed_and_filter
     assert [h["host"] for h in ns["http"]] == ["real-c2.example"]
 
 
+def test_win11_wsb_idle_isolation_service_and_cbs_webview_noise_filtered(tmp_path):
+    j_clean = bare_job(tmp_path / "clean_wsb")
+    j_clean.state["stages"]["vt"]["status"] = "done"
+    j_clean.state["stages"]["sandbox"]["status"] = "done"
+    j_clean.state["vt"] = [{"rel": "sample.sfv", "status": "ok", "result": {"malicious": 0, "suspicious": 0}}]
+    j_clean.state["behavior"] = pipeline.sanitize_sandbox_json({
+        "Persistence": {
+            "Services": [r"IsolationSession | Manual | C:\Windows\system32\svchost.exe -k IsolationSession -p"],
+        },
+        "Files": {
+            "NewExecutables": [
+                r"C:\Users\WDAGUtilityAccount\AppData\Local\Packages\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\LocalState\EBWebView\Speech Recognition\1.15.0.1\Microsoft.CognitiveServices.Speech.core.dll",
+                r"C:\Users\WDAGUtilityAccount\AppData\Local\Packages\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\LocalState\EBWebView\Subresource Filter\Unindexed Rules\10.34.0.84\adblock_snippet.js",
+            ],
+        },
+    })
+    pipeline.compute_verdict(j_clean)
+    assert j_clean.state["verdict"]["level"] == "green"
+    assert j_clean.state["verdict"]["red"] == []
+    assert j_clean.state["verdict"]["notes"] == []
+
+    # Spoofed service named IsolationSession pointing to a malicious binary must STILL trigger red
+    j_spoof = bare_job(tmp_path / "spoof_svc")
+    j_spoof.state["behavior"] = pipeline.sanitize_sandbox_json({
+        "Persistence": {
+            "Services": [r"IsolationSession | Auto | C:\Users\Public\evil.exe"],
+        },
+    })
+    pipeline.compute_verdict(j_spoof)
+    assert j_spoof.state["verdict"]["level"] == "red"
+    assert any("yeni servis" in r for r in j_spoof.state["verdict"]["red"])
+
+
+
 

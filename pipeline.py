@@ -2380,6 +2380,25 @@ def _extract_fakenet_targets(items: List[str]) -> tuple[List[str], List[str]]:
     return domains, urls
 
 
+_WSB_NOISE_SERVICE_RX = re.compile(
+    r"^IsolationSession(?:_[0-9a-f]+)?\s*\|\s*(?:Manual|Auto|Disabled)\s*\|\s*"
+    r"C:\\Windows\\system32\\svchost\.exe\s+-k\s+IsolationSession\s+-p$",
+    re.I,
+)
+_WSB_NOISE_DROPPED_RX = re.compile(
+    r"\\AppData\\Local\\Packages\\MicrosoftWindows\.Client\.CBS_cw5n1h2txyewy\\LocalState\\EBWebView\\",
+    re.I,
+)
+
+
+def _is_wsb_noise_service(svc: str) -> bool:
+    return bool(_WSB_NOISE_SERVICE_RX.match(str(svc or "").strip()))
+
+
+def _is_wsb_noise_dropped_file(path: str) -> bool:
+    return bool(_WSB_NOISE_DROPPED_RX.search(str(path or "")))
+
+
 def compute_verdict(job: Job) -> None:
     s = job.state
     red: List[str] = []
@@ -2498,8 +2517,9 @@ def compute_verdict(job: Job) -> None:
                 red.append(f"Yem dosyalara (honeyfile) erişildi/değiştirildi: {'; '.join(confirmed_honey[:4])}")
             if unverified_honey:
                 notes.append(f"Yem dosya erişim izi (işlem doğrulanamadı, arka plan taraması olabilir): {'; '.join(unverified_honey[:3])}")
-        if P.get("Services"):
-            red.append(f"{len(P['Services'])} yeni servis kuruldu.")
+        real_services = [s for s in (P.get("Services") or []) if not _is_wsb_noise_service(s)]
+        if real_services:
+            red.append(f"{len(real_services)} yeni servis kuruldu.")
         if P.get("Drivers"):
             red.append(f"{len(P['Drivers'])} yeni sürücü kuruldu.")
         if P.get("Startup"):
@@ -2543,7 +2563,11 @@ def compute_verdict(job: Job) -> None:
                 red.append(f"Bırakılan dosya '{Path(str(dh.get('Path') or 'dosya')).name}' şüpheli dizgeler içeriyor: {', '.join(str(x) for x in d_flags[:4])}")
             elif dh.get("SigStatus") not in ("Valid", None, "") and float(dh.get("Entropy") or 0) > 7.2:
                 notes.append(f"Bırakılan imzasız dosya '{Path(str(dh.get('Path') or 'dosya')).name}' yüksek entropili ({dh.get('Entropy')}/8).")
-        dropped = [f for f in (b.get("Files") or {}).get("NewExecutables") or [] if re.search(r"\\AppData\\|\\Temp\\|\\ProgramData\\|\\Users\\Public\\", f, re.I)]
+        dropped = [
+            f for f in (b.get("Files") or {}).get("NewExecutables") or []
+            if re.search(r"\\AppData\\|\\Temp\\|\\ProgramData\\|\\Users\\Public\\", f, re.I)
+            and not _is_wsb_noise_dropped_file(f)
+        ]
         if dropped:
             notes.append(f"AppData/Temp/ProgramData içine {len(dropped)} yeni çalıştırılabilir dosya bırakıldı.")
         conns = [c for c in (b.get("Network") or {}).get("Connections") or [] if c.get("FromSample")]
