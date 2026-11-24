@@ -26,3 +26,7 @@ body { background-color: #0b0f19; color: #e2e8f0; font-family: 'Segoe UI', syste
 .border-orange-500\/50{border-color:rgb(249 115 22 / 0.5)}
 .text-orange-200{color:rgb(254 215 170)}
 .text-orange-300{color:rgb(253 186 116)}
+
+/* live sandbox screen */
+.sb-live{display:block;width:100%;max-height:540px;object-fit:contain;background:rgb(2 6 23);border:1px solid rgb(51 65 85);border-radius:0.75rem}
+.font-normal{font-weight:400}

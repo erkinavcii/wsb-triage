@@ -360,3 +360,23 @@ Bu bilgisayardaki gerçek sandbox analizleri incelendi. Bulunan dört sorun ve d
   - *Sorun:* Sandbox'ı kapatan kod yalnızca her şey yolunda giderse çalışıyordu. Gözlem sırasında bir istisna olunca sandbox açık kalıyor, örnek izlenmeden çalışmaya devam ediyor ve sonraki her analiz "açık bir sandbox var" diye reddediliyordu.
   - *Düzeltme:* `stage_sandbox`'ın `finally` bloğu, ortam başlatılmış ama kapatılmamışsa (ve "açık bırak" seçilmemişse) Windows Sandbox'ı ya da VirtualBox VM'ini kapatıyor.
 - **Test:** 189 test geçiyor (G1–G7 için 15 yeni test; iki eski test yeni tasarıma göre güncellendi: biri tam olarak G1'deki "hiçbir şey çalışmadı ama yeşil" durumunu bekliyordu).
+
+## H. Sandbox'ı izleyebilmek ve crack bulgularının puanı (24 Kasım 2026)
+
+Photoshop analizinden sonra iki şikâyet: analizin bittiği anlaşılmıyordu, ekran görüntülerinde hep boş masaüstü vardı (kurulum hiç başlamadığı için). İlerlemeyi görmek için sandbox'ı ekranda gösterme isteği vardı.
+
+- **H1. Canlı sandbox ekranı — ✅ EKLENDİ.**
+  - Sandbox içindeki izleyici her ~5 saniyede ekranı küçültüp (1024 px genişlik) `screenshots/live.png` olarak yazıyor. Panel analiz sürerken bu kareyi her 4 saniyede yeniliyor ("🔴 Canlı sandbox ekranı"). Kare de diğer görüntüler gibi PNG başlığıyla doğrulanıyor (sahte dosya karantinaya alınır) ve galeride görünmüyor.
+  - Galeri için ekran görüntüsü aralığı sabit 30 sn yerine süreye göre ayarlanıyor (`max(30, süre/22)`), uzun analizlerde de galeri ~22 kareyi geçmiyor.
+- **H2. "Sandbox penceresini öne getir" butonu — ✅ EKLENDİ.** Windows Sandbox zaten görünür bir pencere olarak açılıyor; arka planda kaldığı için görünmüyordu. Buton (`POST /api/sandbox/focus`) pencereyi küçültülmüşse geri açıp öne getiriyor. Windows izin vermezse görev çubuğunda yanıp söndüğünü söylüyor. Sandbox'ın içine tıklamak izlemeyi bozmaz, ama kurulumu yarıda kesmek sonucu eksik bırakır.
+- **H3. Bitiş bandı — ✅ EKLENDİ.** Sonucun üstünde durum bandı: sürerken "⏳ Analiz sürüyor — <aşama>", bitince "✅ Analiz tamamlandı — X dk sürdü (başlangıç → bitiş)" ve sandbox'ta çalıştırılan dosya. Sandbox açılıp hiçbir şey çalıştırılmadıysa ayrıca kırmızı uyarı. Sekme başlığı da durumu gösteriyor.
+- **H4. Crack puanları iki kez sayılıyordu — ✅ DÜZELTİLDİ.**
+  - *Sorun:* Crack'ten tekrar paketlenmiş `Set-up.exe`'nin statik puanı (66) neredeyse tamamen crack bulgularından geliyordu: imzasız 20 + "Adobe Inc." üst verisi 30 + … Bunlar zaten turuncu listedeyken bir de "yüksek risk puanı" notu çıkıyordu.
+  - *Düzeltme:* Gerçek zararlı sinyali olmayan dosyalarda, sonuç kuralları uygulanmadan önce crack bulgularının puanı (üretici kimliği, lisans betiği, crack YARA kuralları ve bunlarla birlikte "imzasız PE" puanı) çıkarılıyor (`pipeline._crack_points`). Gerçek zararlı sinyali varsa puan olduğu gibi kalıyor.
+- **H5. Yamanın kendi `.log` dosyası "lisans müdahale betiği" sayılıyordu — ✅ DÜZELTİLDİ.** `Patch_Photoshop.exe_.log` gibi günlük ve metin dosyaları ne yapıldığını yazar ama kendileri hiçbir şey çalıştıramaz. Kurulum/lisans müdahale kontrolü artık sadece betik ve kurulum yapılandırma dosyalarına (`.cmd`, `.bat`, `.ps1`, `.iss`, `.inf`, `.ini` …) bakıyor.
+- **Photoshop sonucunun yeni kurallarla durumu:** kırmızı → sarı. Turuncu listede 3 crack bulgusu var, "yüksek risk puanı" notu yok. Sandbox "çalıştırılmadı" diye işaretli, çünkü bu analiz G2 düzeltmesinden önceki kodla yapılmıştı; yeniden analiz gerekiyor.
+- **H6. Windows'un duvar kâğıdı bağlantıları "bellekte zararlı iz" diye kırmızı çıkıyordu — ✅ DÜZELTİLDİ.** (Canlı ekran için yapılan gerçek sandbox testinde görüldü.)
+  - *Sorun:* Zararsız bir `.bat` çalıştıran `cmd.exe`'nin belleğinde Windows 11'in Spotlight/Bing duvar kâğıdı bağlantıları (`bing.com`, `blogs.windows.com`) vardı; sandbox içindeki tarayıcı sadece `microsoft.com`'u zararsız sayıyor, sonuç kuralı da bellekte görülen **her** adresi kırmızı yapıyordu.
+  - *Düzeltme:* `pipeline._split_memory_findings`: gerçek göstergeler (Telegram bot API, Discord webhook, mimikatz, AMSI atlatma …) ve kötüye kullanılan servislerdeki adresler kırmızı; Windows/Microsoft, Adobe ve yerel adresler atlanıyor; diğer adresler sadece not ("bellekte görüldü", bağlantı kurulduğu anlamına gelmez).
+- **Gerçek sandbox doğrulaması:** 2 dakikalık testte panel 23 farklı canlı kare aldı (ilki 32. saniyede, kurulum penceresi görünüyordu); kare galeriye girmedi; sandbox kendiliğinden kapandı.
+- **Test:** 193 test geçiyor (4 yeni test; `.log` dosyasının lisans betiği sayılmasını bekleyen eski test yeni karara göre güncellendi).

@@ -33,6 +33,34 @@ $script:LastShot = [datetime]::MinValue
 $script:ScreenWarned = $false
 try { Add-Type -AssemblyName System.Windows.Forms, System.Drawing -ErrorAction Stop } catch {}
 
+# Live view for the host panel: a downscaled screenshot overwritten every ~5 s while observing.
+# Written to the sandbox disk first and then copied, so the host rarely sees a half-written file.
+$script:LiveScreenWarned = $false
+function Capture-LiveScreen {
+    if ($TestMode) { return }
+    try {
+        $bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+        if (-not $bounds -or $bounds.Width -lt 10 -or $bounds.Height -lt 10) { return }
+        if (-not (Test-Path -LiteralPath $ScreenshotsDir)) { New-Item -ItemType Directory -Force -Path $ScreenshotsDir | Out-Null }
+        $full = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
+        $g = [System.Drawing.Graphics]::FromImage($full)
+        try { $g.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size) } finally { $g.Dispose() }
+        $scale = [Math]::Min(1.0, 1024.0 / $bounds.Width)
+        $w = [int]($bounds.Width * $scale); $h = [int]($bounds.Height * $scale)
+        $small = New-Object System.Drawing.Bitmap($w, $h)
+        $g2 = [System.Drawing.Graphics]::FromImage($small)
+        try {
+            $g2.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBilinear
+            $g2.DrawImage($full, 0, 0, $w, $h)
+            $tmp = Join-Path $WorkPath 'live_screen.png'
+            $small.Save($tmp, [System.Drawing.Imaging.ImageFormat]::Png)
+            Copy-Item -LiteralPath $tmp -Destination (Join-Path $ScreenshotsDir 'live.png') -Force
+        } finally { $g2.Dispose(); $small.Dispose(); $full.Dispose() }
+    } catch {
+        if (-not $script:LiveScreenWarned) { $script:LiveScreenWarned = $true; Log "Live screen skipped: $($_.Exception.Message)" }
+    }
+}
+
 function Capture-Screen {
     if ($TestMode -or $script:ShotCount -ge 24) { return }
     try {
@@ -1409,6 +1437,8 @@ if ($targetFile) {
 
 $end = $startedAt.AddSeconds($Duration)
 $stoppedEarly = $false
+# 24 gallery shots spread over the observation window (a 30 min install would otherwise only be covered for 12 min)
+$ShotInterval = [Math]::Max(30, [int]($Duration / 22))
 $lastSlowTick = [datetime]::MinValue
 Capture-Screen
 while ((Get-Date) -lt $end) {
@@ -1419,7 +1449,8 @@ while ((Get-Date) -lt $end) {
         Update-HoneyReads $startedAt
         Test-LanBlock
         Invoke-FakeUser
-        if (($now - $script:LastShot).TotalSeconds -ge 30) { Capture-Screen }
+        if (($now - $script:LastShot).TotalSeconds -ge $ShotInterval) { Capture-Screen }
+        Capture-LiveScreen
         $left = [int]($end - $now).TotalSeconds
         $sampleProcs = @($Procs.Values | Where-Object { $_.InTree }).Count
         Set-Status ("Izleniyor: {0} sn kaldi, {1} yeni islem ({2} ornekten), {3} baglanti" -f $left, $Procs.Count, $sampleProcs, $Conns.Count)

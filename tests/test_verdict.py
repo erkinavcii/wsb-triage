@@ -844,3 +844,47 @@ def test_service_binary_swap_and_foreign_bits_job_stay_red(tmp_path):
     pipeline.compute_verdict(job)
     red = " ".join(job.state["verdict"]["red"])
     assert "servis ele geçirme" in red and "BITS" in red
+
+
+def test_crack_points_do_not_trigger_high_static_score(tmp_path):
+    """Unsigned 20 + vendor impersonation 30 + a little more must not add a 'high static risk' note on top of the
+    crack list; the same score from malware signals still does."""
+    job = bare_job(tmp_path)
+    st = _static_entry("Set-up.exe", spoof=True)
+    st["spoof_flags"][0]["points"] = 30
+    st["pe_info"] = {"is_pe": True}
+    st["risk_score"] = 66
+    job.state["static"] = [st]
+    job.state["behavior"] = pipeline.sanitize_sandbox_json({"Target": "Set-up.exe"})
+    pipeline.compute_verdict(job)
+    v = job.state["verdict"]
+    assert not any("risk puanı" in x for x in v["notes"] + v["red"]), v
+    assert v["crack"]
+
+    job2 = bare_job(tmp_path, "t2")
+    st2 = _static_entry("Set-up.exe", malware_yara=True)
+    st2["risk_score"] = 80
+    job2.state["static"] = [st2]
+    pipeline.compute_verdict(job2)
+    assert any("risk puanı" in x for x in job2.state["verdict"]["red"])
+
+
+def test_memory_findings_windows_wallpaper_links_are_not_red(tmp_path):
+    """Seen in a real run: cmd.exe running a harmless .bat had Windows 11 Spotlight/Bing links in memory."""
+    job = bare_job(tmp_path)
+    job.state["behavior"] = pipeline.sanitize_sandbox_json({"Target": "Set-up.bat", "MemoryFindings": [
+        "[cmd.exe:5492] https://blogs.windows.com/windowsexperience/2021/10/06/x/fmicrosoft-edge:https://www.bing.com/search?q=Hamilton",
+        "[cmd.exe:5492] https://www.bing.com/search?q=Yaquina+Head+Lighthouse",
+    ]})
+    pipeline.compute_verdict(job)
+    v = job.state["verdict"]
+    assert not any("bellek" in x.lower() for x in v["red"] + v["notes"]), v
+
+    job2 = bare_job(tmp_path, "t2")
+    job2.state["behavior"] = pipeline.sanitize_sandbox_json({"Target": "Set-up.exe", "MemoryFindings": [
+        "[Set-up.exe:10] api.telegram.org/bot", "[Set-up.exe:10] https://unknown-host.example/gate.php"]})
+    pipeline.compute_verdict(job2)
+    v2 = job2.state["verdict"]
+    assert any("api.telegram.org/bot" in x for x in v2["red"])
+    assert not any("unknown-host" in x for x in v2["red"])
+    assert any("unknown-host" in x for x in v2["notes"])

@@ -453,6 +453,7 @@ def job_state(case_id: str):
     st["procmon_summary"] = pipeline._read_json(job.output_dir / "procmon_summary.json")
     st["has_report"] = (job.case_dir / "report.md").exists()
     st["screenshots"] = pipeline.list_screenshots(job)
+    st["has_live_screen"] = pipeline.live_screen_path(job) is not None
     st["runnable_targets"] = pipeline.list_runnable_targets(job)
     return st
 
@@ -541,6 +542,18 @@ def job_iocs(case_id: str, format: str = "stix", include_noise: bool = False):
             headers={"Content-Disposition": f'attachment; filename="iocs_{job.id}.stix.json"'},
         )
     raise HTTPException(400, "Geçersiz format (csv veya stix olmalı).")
+
+
+@app.get("/api/jobs/{case_id}/live-screen")
+def job_live_screen(case_id: str):
+    p = pipeline.live_screen_path(_job(case_id))
+    if not p:
+        raise HTTPException(404, "Canlı görüntü henüz yok")
+    try:
+        data = p.read_bytes()
+    except OSError:                      # the sandbox is overwriting it right now
+        raise HTTPException(503, "Görüntü yazılıyor, birazdan tekrar deneyin")
+    return Response(content=data, media_type="image/png")
 
 
 @app.get("/api/jobs/{case_id}/screenshots/{name}")
@@ -661,6 +674,11 @@ def browse_dialog(mode: str = "file"):
               "$f.Title = 'Analiz edilecek dosyayi veya arsivi secin'; if ($f.ShowDialog() -eq 'OK') { Write-Output $f.FileName }")
     proc = subprocess.run(["powershell", "-NoProfile", "-Sta", "-Command", ps], capture_output=True, text=True, encoding="utf-8", errors="replace")
     return {"selected_path": proc.stdout.strip()}
+
+
+@app.post("/api/sandbox/focus")
+def sandbox_focus():
+    return sandbox_manager.focus_sandbox_window()
 
 
 @app.post("/api/sandbox/enable")

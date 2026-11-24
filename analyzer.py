@@ -519,7 +519,9 @@ def inspect_msi_file(ext: str, data: bytes) -> List[Dict[str, Any]]:
 
 
 def inspect_installer_config(path_obj: Path, ext: str, text: str) -> List[Dict[str, Any]]:
-    if ext not in (CONFIG_EXTENSIONS | SCRIPT_EXTENSIONS) and not re.search(r"(?i)(patch.*\.log|runonce.*)", path_obj.name):
+    # Only files that can actually run or configure an installer. Logs/text files (e.g. a patcher's own
+    # "Patch_Photoshop.exe_.log") describe what happened; they cannot do anything themselves.
+    if ext not in (CONFIG_EXTENSIONS | SCRIPT_EXTENSIONS):
         return []
     hits: List[str] = []
     for m in _INSTALLER_TAMPER_RX.finditer(text):

@@ -434,11 +434,11 @@ def test_f3_msi_custom_action_and_installer_configs(tmp_path):
     res_pimx = analyzer.analyze_single_file(str(pimx), UNSIGNED)
     assert any(f["category"] == "Kurulum / Lisans Müdahale Betiği" and f["severity"] == "medium" and f["points"] == 15 for f in res_pimx["format_findings"])
 
-    # 4. Patch_*.log (high: sc delete AGSService)
+    # 4. A patcher's own log only records what happened; it cannot run anything, so it is not a license script
     plog = tmp_path / "Patch_Photoshop.exe_.log"
     plog.write_text("[Patch] AdobeGCClient stopped\nsc delete AGSService\n", encoding="utf-8")
     res_log = analyzer.analyze_single_file(str(plog), UNSIGNED)
-    assert any(f["category"] == "Kurulum / Lisans Müdahale Betiği" and f["severity"] == "high" and f["points"] == 25 for f in res_log["format_findings"])
+    assert not any(f["category"] == "Kurulum / Lisans Müdahale Betiği" for f in res_log["format_findings"])
 
 
 def test_all_18_yara_rules_parity_and_clean_sysbins(monkeypatch):
@@ -489,3 +489,12 @@ def test_all_18_yara_rules_parity_and_clean_sysbins(monkeypatch):
             real_r, built_r = scan_both(p.read_bytes())
             assert real_r == set() and built_r == set(), (sysbin, real_r, built_r)
 
+
+
+def test_patch_log_is_not_a_license_script(tmp_path):
+    import analyzer
+    text = "sc stop AGSService\nsc delete AGMService\nschtasks /delete /tn AdobeGCInvoker /f\n"
+    assert analyzer.inspect_installer_config(tmp_path / "Patch_Photoshop.exe_.log", ".log", text) == []
+    assert analyzer.inspect_installer_config(tmp_path / "notes.txt", ".txt", text) == []
+    found = analyzer.inspect_installer_config(tmp_path / "RunOnce.cmd", ".cmd", text)
+    assert found and found[0]["category"] == "Kurulum / Lisans Müdahale Betiği"

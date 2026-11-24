@@ -556,3 +556,72 @@ def set_context_menu(enabled: bool) -> Dict[str, Any]:
             except FileNotFoundError:
                 pass
     return {"status": "ok", "enabled": False, "message": "Dosya Gezgini sağ tık menüsü kaldırıldı."}
+
+
+# ------------------------------------------------------------------ bring the Windows Sandbox window to the front
+_SANDBOX_WINDOW_PROCS = {"windowssandboxremotesession.exe", "windowssandboxclient.exe", "windowssandbox.exe"}
+
+
+def _process_name(pid: int) -> str:
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    h = k32.OpenProcess(0x1000, False, pid)          # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        size = wintypes.DWORD(len(buf))
+        if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+            return os.path.basename(buf.value).lower()
+        return ""
+    finally:
+        k32.CloseHandle(h)
+
+
+def find_windows_of(process_names) -> List[int]:
+    """Visible, titled top-level windows owned by the given process names (lower-case exe names)."""
+    if os.name != "nt":
+        return []
+    import ctypes
+    from ctypes import wintypes
+    u32 = ctypes.WinDLL("user32", use_last_error=True)
+    found: List[int] = []
+    proto = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def cb(hwnd, _):
+        if u32.IsWindowVisible(hwnd) and u32.GetWindowTextLengthW(hwnd) > 0:
+            pid = wintypes.DWORD()
+            u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if _process_name(pid.value) in process_names:
+                found.append(hwnd)
+        return True
+
+    u32.EnumWindows(proto(cb), 0)
+    return found
+
+
+def focus_window(hwnd: int) -> bool:
+    """Restores and brings a window to the front. Windows only lets the foreground process change focus, so a
+    harmless ALT key tap is sent first (the usual way to lift that restriction)."""
+    import ctypes
+    u32 = ctypes.WinDLL("user32", use_last_error=True)
+    VK_MENU, KEYUP = 0x12, 0x0002
+    if u32.IsIconic(hwnd):
+        u32.ShowWindow(hwnd, 9)                      # SW_RESTORE
+    u32.keybd_event(VK_MENU, 0, 0, 0)
+    u32.keybd_event(VK_MENU, 0, KEYUP, 0)
+    u32.BringWindowToTop(hwnd)
+    ok = bool(u32.SetForegroundWindow(hwnd))
+    return ok or u32.GetForegroundWindow() == hwnd
+
+
+def focus_sandbox_window() -> Dict[str, Any]:
+    wins = find_windows_of(_SANDBOX_WINDOW_PROCS)
+    if not wins:
+        return {"status": "not_found", "message": "Açık bir Windows Sandbox penceresi bulunamadı."}
+    ok = focus_window(wins[0])
+    return {"status": "ok" if ok else "partial",
+            "message": "Sandbox penceresi öne getirildi." if ok else
+                       "Pencere bulundu ama Windows öne almaya izin vermedi; görev çubuğunda yanıp sönüyor olmalı."}

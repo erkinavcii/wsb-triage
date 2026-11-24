@@ -377,6 +377,8 @@ function renderJob(st) {
   };
   if ($('bSandbox')) $('bSandbox').onclick = () => openSandboxModal(st);
 
+  renderBanner(st);
+
   // verdict
   const v = st.verdict || { level: 'pending', red: [], notes: [] };
   const vRed = asArr(v.red), vNotes = asArr(v.notes), vCrack = asArr(v.crack);
@@ -452,6 +454,40 @@ function listBox(title, items, color) {
     <div class="text-[11px] mono text-slate-300 space-y-1 max-h-36 overflow-y-auto">${items.length ? items.slice(0, 60).map(x => `<div class="break-all">${esc(x)}</div>`).join('') : '<span class="text-slate-500">yok</span>'}</div></div>`;
 }
 
+// ---------------------------------------------------------------- completion / progress banner
+const parseTs = t => { const m = /^(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)$/.exec(t || ''); return m ? new Date(+m[1], m[2] - 1, +m[3], +m[4], +m[5], +m[6]) : null; };
+const fmtDur = ms => { const m = Math.round(ms / 60000); return m < 1 ? '1 dakikadan kısa' : (m < 60 ? `${m} dk` : `${Math.floor(m / 60)} sa ${m % 60} dk`); };
+function renderBanner(st) {
+  const stages = st.stages || {};
+  const sb = stages.sandbox || {};
+  const target = String(((st.behavior || {}).Target) || '').trim();
+  const box = (color, title, lines) => `<div class="p-3 rounded-xl bg-${color}-950/40 border border-${color}-500/50 space-y-1">
+      <div class="font-semibold text-sm text-${color}-200">${title}</div>${lines.map(l => `<div class="text-xs text-slate-300">${l}</div>`).join('')}</div>`;
+  let html = '', tab = 'SafeBox Analiz Merkezi';
+  if (st.status === 'running') {
+    const cur = Object.values(stages).find(x => ['running', 'queued'].includes(x.status));
+    html = box('indigo', `⏳ Analiz sürüyor — ${esc(cur ? cur.label : 'hazırlanıyor')}`, cur && cur.msg ? [esc(cur.msg)] : []);
+    tab = '⏳ ' + (cur ? cur.label : 'Analiz sürüyor') + ' — SafeBox';
+  } else {
+    const ends = Object.values(stages).map(x => parseTs(x.ended)).filter(Boolean);
+    const start = parseTs(st.created), end = ends.length ? new Date(Math.max(...ends)) : null;
+    const dur = start && end ? ` — ${fmtDur(end - start)} sürdü (${esc(st.created.slice(11, 16))} → ${String(end.getHours()).padStart(2, '0')}:${String(end.getMinutes()).padStart(2, '0')})` : '';
+    const lines = [];
+    if (sb.status === 'done' && target) lines.push(`Sandbox'ta çalıştırılan: <span class="mono">${esc(target)}</span>`);
+    if (sb.status === 'waiting') lines.push("Sandbox adımı onayınızı bekliyor ('Sandbox'ta çalıştır').");
+    if (st.status === 'done' || st.status === 'waiting_sandbox') { html = box('emerald', `✅ Analiz tamamlandı${dur}`, lines); tab = '✅ Tamamlandı — SafeBox'; }
+    else if (st.status === 'cancelled') { html = box('slate', `⏹ Analiz iptal edildi${dur}`, lines); tab = '⏹ İptal — SafeBox'; }
+    else { html = box('rose', `❌ Analiz hatayla bitti${dur}`, lines); tab = '❌ Hata — SafeBox'; }
+    if (sb.status === 'done' && !target) {
+      html += box('rose', "⚠️ Sandbox açıldı ama içinde hiçbir şey çalıştırılmadı",
+        ["Dosyanın davranışı incelenmedi; ekran görüntülerinde sadece boş masaüstü görünür. Sonuç notlarındaki nedene bakın."]);
+    }
+  }
+  $('jobBanner').innerHTML = `<div class="space-y-2">${html}</div>`;
+  document.title = tab;
+}
+
+let lastLiveRefresh = 0;
 function renderSandbox(st) {
   const s = st.stages.sandbox, live = (st.sandbox || {}).live, b = st.behavior;
   const shots = asArr(st.screenshots || (st.sandbox || {}).screenshots);
@@ -460,6 +496,15 @@ function renderSandbox(st) {
   if (!show) return;
   $('sbPulse').className = 'w-2.5 h-2.5 rounded-full ' + (s.status === 'running' ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500');
   $('sbStatusText').textContent = (st.sandbox || {}).status_text || s.msg || '';
+  const liveOn = s.status === 'running' && st.has_live_screen;
+  $('sbLiveWrap').classList.toggle('hidden', !liveOn);
+  if (liveOn && Date.now() - lastLiveRefresh > 4000) {
+    lastLiveRefresh = Date.now();
+    const img = $('sbLiveImg');
+    const next = new Image();
+    next.onload = () => { img.src = next.src; $('sbLiveAge').textContent = '· ' + new Date().toLocaleTimeString('tr-TR'); };
+    next.src = `/api/jobs/${encodeURIComponent(st.id)}/live-screen?t=${Date.now()}`;   // keeps the last good frame if this one fails
+  }
   const procs = asArr(b ? b.Processes : (live || {}).Processes).filter(p => p && typeof p === 'object');
   const conns = asArr(b ? (b.Network || {}).Connections : (live || {}).Connections).filter(c => c && typeof c === 'object');
   const susp = procs.filter(p => p.Suspicious).length, fromSample = procs.filter(p => p.InTree).length;
@@ -925,3 +970,9 @@ loadSystemStatus(); loadJobs(); loadWatch();
 setInterval(loadWatch, 5000);
 setInterval(loadSystemStatus, 30000);
 const last = (location.hash || '').slice(1); if (last) openJob(decodeURIComponent(last));
+
+$('btnSbFocus').onclick = async () => {
+  $('sbFocusMsg').textContent = '';
+  try { const d = await post('/api/sandbox/focus'); $('sbFocusMsg').textContent = d.message || ''; }
+  catch (e) { $('sbFocusMsg').textContent = e.message; }
+};

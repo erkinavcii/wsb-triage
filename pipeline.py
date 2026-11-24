@@ -1952,6 +1952,7 @@ def stage_sandbox(job: Job) -> None:
 # Files the monitor itself writes into output/. Anything else was put there by something inside the sandbox.
 OUTPUT_ALLOWLIST = {"live.json", "behavior.json", "status.txt", "timeline.log", "capture.pcapng", "procmon.pml", "procmon_summary.json", "done.flag"}
 _SCREENSHOT_NAME_RX = re.compile(r"^scr_\d{3}\.png$")
+LIVE_SCREEN_NAME = "live.png"   # overwritten every ~5 s by the monitor; shown in the panel, not in the gallery
 _MAX_SCREENSHOTS = 30
 _MAX_SCREENSHOT_BYTES = 10 * 1024 * 1024
 
@@ -1961,7 +1962,7 @@ def is_valid_screenshot_file(p: Path, screenshots_dir: Path) -> bool:
     try:
         if p.parent.resolve() != screenshots_dir.resolve() or p.is_symlink() or not p.is_file():
             return False
-        if not _SCREENSHOT_NAME_RX.fullmatch(p.name):
+        if not (_SCREENSHOT_NAME_RX.fullmatch(p.name) or p.name == LIVE_SCREEN_NAME):
             return False
         st = p.stat()
         if st.st_size < 33 or st.st_size > _MAX_SCREENSHOT_BYTES:
@@ -1978,8 +1979,16 @@ def list_screenshots(job: Job) -> List[str]:
     scr_dir = job.output_dir / "screenshots"
     if not scr_dir.is_dir():
         return []
-    names = [p.name for p in sorted(scr_dir.iterdir()) if is_valid_screenshot_file(p, scr_dir)]
+    names = [p.name for p in sorted(scr_dir.iterdir())
+             if p.name != LIVE_SCREEN_NAME and is_valid_screenshot_file(p, scr_dir)]
     return names[:_MAX_SCREENSHOTS]
+
+
+def live_screen_path(job: Job) -> Optional[Path]:
+    """The latest live screenshot, if it is a real PNG (written by the sandbox, so validated like the gallery)."""
+    scr_dir = job.output_dir / "screenshots"
+    p = scr_dir / LIVE_SCREEN_NAME
+    return p if is_valid_screenshot_file(p, scr_dir) else None
 
 
 def quarantine_output(out: Path) -> List[str]:
@@ -2523,6 +2532,48 @@ def _file_has_malware_signals(st: Dict[str, Any]) -> bool:
     return False
 
 
+def _crack_points(st: Dict[str, Any]) -> int:
+    """Static score points that come only from crack/license-tampering findings of this file."""
+    pts = 0
+    for sf in st.get("spoof_flags") or []:
+        if sf.get("type") in CRACK_SPOOF_TYPES:
+            pts += int(sf.get("points") or 0)
+    for ff in st.get("format_findings") or []:
+        if ff.get("category") in CRACK_FORMAT_CATEGORIES:
+            pts += int(ff.get("points") or 0)
+    crack_yara = sum(int(ym.get("score") or 15) for ym in st.get("yara_matches") or [] if ym.get("rule") in CRACK_YARA_RULES)
+    pts += min(45, crack_yara)
+    sig_status = (st.get("signature") or {}).get("status")
+    is_pe = bool((st.get("pe_info") or {}).get("is_pe")) or st.get("extension") == ".msi"
+    if pts and is_pe and sig_status not in ("Valid", "HashMismatch", None):
+        pts += 20          # "unsigned" is part of the same repack story when the file is crack-flagged
+    return pts
+
+
+_MEM_URL_RX = re.compile(r"https?://([A-Za-z0-9][A-Za-z0-9.-]*)", re.I)
+_MEM_SKIP_CLASSES = {"Windows/Microsoft (gürültü)", "Yerel (gürültü)", "Adobe"}
+
+
+def _split_memory_findings(items: List[Any]) -> Tuple[List[str], List[str]]:
+    """Memory scan hits -> (red, note). Indicator strings (Telegram bot API, Discord webhook, mimikatz, AMSI ...) and
+    URLs on abused services are red. Windows/Adobe URLs are dropped: Windows 11 keeps Spotlight/Bing wallpaper links in
+    every console process, so cmd.exe running a harmless .bat 'had' bing.com in memory. Other URLs are only a note."""
+    red_items: List[str] = []
+    url_items: List[str] = []
+    for x in items:
+        text = str(x)
+        body = re.sub(r"^\[[^\]]*\]\s*", "", text)
+        m = _MEM_URL_RX.match(body)
+        if not m:
+            red_items.append(text)
+            continue
+        cls = domain_class(m.group(1))
+        if cls in _MEM_SKIP_CLASSES:
+            continue
+        (red_items if cls == CLASS_ABUSED else url_items).append(text)
+    return red_items, url_items
+
+
 def compute_verdict(job: Job) -> None:
     s = job.state
     red: List[str] = []
@@ -2601,6 +2652,10 @@ def compute_verdict(job: Job) -> None:
             else:
                 notes.append(msg_ff)
         score = int(st.get("risk_score") or 0)
+        if not malware_signals:
+            # points from crack/license findings are already reported in the crack list; don't count them twice
+            # as a "high static risk" (a repacked Set-up.exe: unsigned 20 + "Adobe Inc." metadata 30 = 50 already)
+            score -= _crack_points(st)
         if sig_status != "Valid" and score >= 75:
             red.append(f"Statik analiz: '{st.get('rel', '')}' çok yüksek risk puanı aldı ({score}/100).")
         elif score >= 65:
@@ -2719,10 +2774,13 @@ def compute_verdict(job: Job) -> None:
         conns = [c for c in (b.get("Network") or {}).get("Connections") or [] if c.get("FromSample")]
         if conns:
             notes.append(f"Örneğin başlattığı işlemler {len(conns)} ağ bağlantısı açtı.")
-        mem_findings = b.get("MemoryFindings") or []
-        if mem_findings:
-            red.append(f"Canlı işlem belleğinde zararlı/şüpheli izler tespit edildi ({len(mem_findings)}): "
-                       + "; ".join(str(x) for x in mem_findings[:5]))
+        mem_red, mem_urls = _split_memory_findings(b.get("MemoryFindings") or [])
+        if mem_red:
+            red.append(f"Canlı işlem belleğinde zararlı/şüpheli izler tespit edildi ({len(mem_red)}): "
+                       + "; ".join(mem_red[:5]))
+        if mem_urls:
+            notes.append(f"Örneğin belleğinde {len(mem_urls)} adres görüldü (bağlantı kurulduğu anlamına gelmez): "
+                         + "; ".join(mem_urls[:5]))
         fakenet_reqs = b.get("FakeNetRequests") or []
         if fakenet_reqs:
             fn_domains, _ = _extract_fakenet_targets(fakenet_reqs)

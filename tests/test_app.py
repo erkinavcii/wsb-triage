@@ -505,3 +505,37 @@ def test_batch_total_size_limit(client, monkeypatch, tmp_path):
     r = client.post("/api/upload", files={"file": ("b.bin", b"x" * 600)}, data={"batch": batch, "relpath": "b.bin"})
     assert r.status_code == 413
     assert not (tmp_path / "uploads" / f"batch_{batch}" / "b.bin").exists()
+
+
+def test_live_screen_endpoint_and_focus(client, tmp_path, monkeypatch):
+    case_dir = tmp_path / "cases" / "test-live"
+    scr_dir = case_dir / "output" / "screenshots"
+    scr_dir.mkdir(parents=True)
+    (case_dir / "state.json").write_text('{"id":"test-live","status":"running"}', encoding="utf-8")
+    monkeypatch.setattr(pipeline, "CASES_DIR", tmp_path / "cases")
+
+    st = client.get("/api/jobs/test-live").json()
+    assert st["has_live_screen"] is False
+    assert client.get("/api/jobs/test-live/live-screen").status_code == 404
+
+    # a forged live.png is quarantined and never served
+    (scr_dir / "live.png").write_bytes(b"<script>alert(1)</script>")
+    pipeline.quarantine_output(case_dir / "output")
+    assert client.get("/api/jobs/test-live/live-screen").status_code == 404
+
+    valid_png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"\x00" * 20
+    (scr_dir / "live.png").write_bytes(valid_png)
+    pipeline.quarantine_output(case_dir / "output")
+    assert (scr_dir / "live.png").exists()
+    st = client.get("/api/jobs/test-live").json()
+    assert st["has_live_screen"] is True
+    assert "live.png" not in st["screenshots"]          # the live frame is not part of the gallery
+    r = client.get("/api/jobs/test-live/live-screen")
+    assert r.status_code == 200 and r.content == valid_png
+    assert r.headers["content-type"] == "image/png"
+
+    import sandbox_manager
+    monkeypatch.setattr(sandbox_manager, "find_windows_of", lambda names: [])
+    r = client.post("/api/sandbox/focus")
+    assert r.status_code == 200
+    assert r.json()["status"] == "not_found"
