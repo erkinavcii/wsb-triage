@@ -104,6 +104,25 @@ def test_e7_wsb_cli_mock(tmp_path, monkeypatch):
     assert any(c == ["wsb.exe", "stop", "--id", gid_2] for c in calls)
 
 
+def test_f5_sandbox_features_present():
+    ps = (ROOT / "sandbox" / "Inside-Sandbox.ps1").read_text(encoding="utf-8")
+    # F5: Smarter UIA clicker, Live Process Memory Scan, FakeNet Sinkhole
+    for token in (
+        "SafeBoxMem",
+        "Scan-ProcessMemory",
+        "MemoryFindings",
+        "Start-FakeNet",
+        "Stop-FakeNet",
+        "FakeNetRequests",
+        "AutoClicks",
+        "RadioButton",
+        "TogglePattern",
+        "LegacyIAccessiblePattern",
+        "mouse_event",
+    ):
+        assert token in ps, f"Missing F5 token in Inside-Sandbox.ps1: {token}"
+
+
 def test_e8_virtualbox_backend_mock_and_password_never_persisted(tmp_path, monkeypatch):
     import time
     import sandbox_manager as sbm
@@ -158,4 +177,16 @@ def test_e8_virtualbox_backend_mock_and_password_never_persisted(tmp_path, monke
     state_disk = (job.case_dir / "state.json").read_text(encoding="utf-8")
     assert "secret-vbox-pw-999" not in state_disk
     assert "vbox_password" not in job.snapshot().get("options", {})
+
+
+def test_f8_honeyfile_uses_4663_sacl_without_lastaccess_false_positives():
+    ps = (ROOT / "sandbox" / "Inside-Sandbox.ps1").read_text(encoding="utf-8")
+    assert "disablelastaccess" not in ps
+    assert "LastAccessTimeUtc" not in ps
+    assert "0CCE921D-69AE-11D9-BED3-505054503030" in ps
+    assert "S-1-1-0" in ps
+    assert "FileSystemAuditRule" in ps
+    assert "4663" in ps
+    assert "HoneyBenignReaders" in ps
+
 

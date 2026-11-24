@@ -77,32 +77,45 @@ $cfg = Get-Content -LiteralPath (Join-Path $ToolsDir 'config.json') -Raw | Conve
 $Duration = [int]$cfg.DurationSeconds
 if ($Duration -lt 10) { $Duration = 600 }
 $SimulateUser = [bool]($cfg.PSObject.Properties['SimulateUser'] -and $cfg.SimulateUser)
+$FakeNet = [bool]($cfg.PSObject.Properties['FakeNet'] -and $cfg.FakeNet)
 $SeedHoneyfiles = if ($cfg.PSObject.Properties['SeedHoneyfiles']) { [bool]$cfg.SeedHoneyfiles } else { $true }
 $RunAsStandardUser = [bool]($cfg.PSObject.Properties['RunAsStandardUser'] -and $cfg.RunAsStandardUser)
 $TargetArgs = if ($cfg.PSObject.Properties['TargetArgs'] -and $cfg.TargetArgs) { [string]$cfg.TargetArgs } else { '' }
 $DllExport = if ($cfg.PSObject.Properties['DllExport'] -and $cfg.DllExport) { [string]$cfg.DllExport } else { '' }
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-Log "Monitor started. admin=$isAdmin duration=${Duration}s simulateUser=$SimulateUser honey=$SeedHoneyfiles stdUser=$RunAsStandardUser"
+Log "Monitor started. admin=$isAdmin duration=${Duration}s simulateUser=$SimulateUser fakeNet=$FakeNet honey=$SeedHoneyfiles stdUser=$RunAsStandardUser"
 Set-Status 'preparing'
 
 $script:SimLast = [datetime]::MinValue
 $script:SimRng = New-Object System.Random
 $script:ClickedBtns = @{}
 $script:AutoClicks = 0
+$script:ClickedActions = New-Object System.Collections.ArrayList
 $AutoClickBtnRx = '(?i)^(next|i.?leri|install|y.?kle|i\s*agree|accept|agree|kabul|devam|continue|finish|bitir|tamam|ok)(\s*>+)*$'
+$AutoSkipBtnRx = '(?i)(cancel|iptal|decline|reddet|back|geri)'
+$LicenseAcceptRx = '(?i)(i\s*accept|i\s*agree|accept\s+the\s+(agreement|terms|license)|kabul\s*ediyorum|lisans.*kabul|onayl.yorum)'
+$AdwareSkipRx = '(?i)(toolbar|opera|avast|mcafee|norton|yandex|bing|yahoo|sponsor|optional|onerilen|recommended\s+offer)'
 if ($SimulateUser -and -not $TestMode) {
     try {
         Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes -ErrorAction SilentlyContinue
         Add-Type -TypeDefinition @"
+using System;
 using System.Runtime.InteropServices;
 public static class SafeBoxInput {
     [StructLayout(LayoutKind.Sequential)]
     public struct POINT { public int X; public int Y; }
     [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT pt);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
+    [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, int dx, int dy, uint dwData, UIntPtr dwExtraInfo);
 }
 "@ -ErrorAction SilentlyContinue
     } catch {}
+}
+
+function Add-ClickedAction([string]$Entry) {
+    if ($script:ClickedActions.Count -lt 50) {
+        [void]$script:ClickedActions.Add($Entry)
+    }
 }
 
 function Invoke-FakeUser {
@@ -132,19 +145,90 @@ function Invoke-FakeUser {
         foreach ($w in $wins) {
             $wpid = [int]$w.Current.ProcessId
             if (-not $TreePids.ContainsKey($wpid)) { continue }
-            $cond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)
-            $btns = $w.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
+
+            $radioCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::RadioButton)
+            $radios = $w.FindAll([System.Windows.Automation.TreeScope]::Descendants, $radioCond)
+            foreach ($r in $radios) {
+                $rname = ([string]$r.Current.Name).Trim()
+                if (-not $rname -or -not ($rname -match $LicenseAcceptRx) -or ($rname -match $AdwareSkipRx) -or -not $r.Current.IsEnabled -or $r.Current.IsOffscreen) { continue }
+                $rtId = ($r.GetRuntimeId() -join '.')
+                $key = "$wpid|radio|$rtId|$rname"
+                if ($script:ClickedBtns.ContainsKey($key) -and ((Get-Date) - $script:ClickedBtns[$key]).TotalSeconds -lt 25) { continue }
+                $selPat = $null
+                if ($r.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$selPat)) {
+                    if (-not $selPat.Current.IsSelected) {
+                        $script:ClickedBtns[$key] = Get-Date
+                        $script:AutoClicks++
+                        $selPat.Select()
+                        Add-ClickedAction "RadioButton: $rname (pid=$wpid)"
+                        Log "AUTO-SELECT RadioButton '$rname' (pid=$wpid)"
+                        return
+                    }
+                }
+            }
+
+            $chkCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::CheckBox)
+            $chks = $w.FindAll([System.Windows.Automation.TreeScope]::Descendants, $chkCond)
+            foreach ($c in $chks) {
+                $cname = ([string]$c.Current.Name).Trim()
+                if (-not $cname -or -not ($cname -match $LicenseAcceptRx) -or ($cname -match $AdwareSkipRx) -or -not $c.Current.IsEnabled -or $c.Current.IsOffscreen) { continue }
+                $rtId = ($c.GetRuntimeId() -join '.')
+                $key = "$wpid|chk|$rtId|$cname"
+                if ($script:ClickedBtns.ContainsKey($key) -and ((Get-Date) - $script:ClickedBtns[$key]).TotalSeconds -lt 25) { continue }
+                $togPat = $null
+                if ($c.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$togPat)) {
+                    if ("$($togPat.Current.ToggleState)" -eq 'Off') {
+                        $script:ClickedBtns[$key] = Get-Date
+                        $script:AutoClicks++
+                        $togPat.Toggle()
+                        Add-ClickedAction "CheckBox: $cname (pid=$wpid)"
+                        Log "AUTO-TOGGLE CheckBox '$cname' (pid=$wpid)"
+                        return
+                    }
+                }
+            }
+
+            $btnCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)
+            $lnkCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Hyperlink)
+            $actCond = New-Object System.Windows.Automation.OrCondition($btnCond, $lnkCond)
+            $btns = $w.FindAll([System.Windows.Automation.TreeScope]::Descendants, $actCond)
             foreach ($b in $btns) {
                 $bname = ([string]$b.Current.Name).Trim()
-                if (-not $bname -or -not ($bname -match $AutoClickBtnRx) -or -not $b.Current.IsEnabled -or $b.Current.IsOffscreen) { continue }
+                if (-not $bname -or -not ($bname -match $AutoClickBtnRx) -or ($bname -match $AutoSkipBtnRx) -or -not $b.Current.IsEnabled -or $b.Current.IsOffscreen) { continue }
                 $rtId = ($b.GetRuntimeId() -join '.')
                 $key = "$wpid|$rtId|$bname"
                 if ($script:ClickedBtns.ContainsKey($key) -and ((Get-Date) - $script:ClickedBtns[$key]).TotalSeconds -lt 25) { continue }
+                $clicked = $false
                 $pat = $null
                 if ($b.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pat)) {
+                    $pat.Invoke()
+                    $clicked = $true
+                } else {
+                    try {
+                        $legPat = $null
+                        if ($b.TryGetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern, [ref]$legPat)) {
+                            $legPat.DoDefaultAction()
+                            $clicked = $true
+                        }
+                    } catch {}
+                }
+                if (-not $clicked) {
+                    try {
+                        $rect = $b.Current.BoundingRectangle
+                        if (-not $rect.IsEmpty -and $rect.Width -gt 2 -and $rect.Height -gt 2) {
+                            $cx = [int]($rect.Left + ($rect.Width / 2))
+                            $cy = [int]($rect.Top + ($rect.Height / 2))
+                            [void][SafeBoxInput]::SetCursorPos($cx, $cy)
+                            [SafeBoxInput]::mouse_event(0x02, 0, 0, 0, [UIntPtr]::Zero)
+                            [SafeBoxInput]::mouse_event(0x04, 0, 0, 0, [UIntPtr]::Zero)
+                            $clicked = $true
+                        }
+                    } catch {}
+                }
+                if ($clicked) {
                     $script:ClickedBtns[$key] = Get-Date
                     $script:AutoClicks++
-                    $pat.Invoke()
+                    Add-ClickedAction "Button: $bname (pid=$wpid)"
                     Log "AUTO-CLICK '$bname' (pid=$wpid)"
                     return
                 }
@@ -155,9 +239,16 @@ function Invoke-FakeUser {
 
 # ------------------------------------------------------------------ honeyfiles (infostealer / ransomware decoys)
 $script:Honeyfiles = @()
+$HoneyBenignReaders = @(
+    'msmpeng.exe', 'nissrv.exe', 'mpcmdrun.exe', 'securityhealthservice.exe',
+    'searchprotocolhost.exe', 'searchindexer.exe', 'searchfilterhost.exe',
+    'explorer.exe', 'svchost.exe', 'system', 'csrss.exe', 'dllhost.exe',
+    'backgroundtaskhost.exe', 'runtimebroker.exe', 'sihost.exe', 'taskhostw.exe'
+)
 function Initialize-Honeyfiles {
     if (-not $SeedHoneyfiles -or $TestMode) { return }
-    try { & fsutil.exe behavior set disablelastaccess 0 2>&1 | Out-Null } catch {}
+    # Enable File System object access auditing via locale-independent subcategory GUID (Event ID 4663)
+    try { & auditpol.exe /set /subcategory:"{0CCE921D-69AE-11D9-BED3-505054503030}" /success:enable 2>&1 | Out-Null } catch {}
     $specs = @(
         @{ P = "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Login Data"; C = "SQLite format 3`0fake_login_data_canary" },
         @{ P = "$env:LOCALAPPDATA\Google\Chrome\User Data\Local State"; C = '{"os_crypt":{"encrypted_key":"RFBBUEkAAAA="}}' },
@@ -169,6 +260,8 @@ function Initialize-Honeyfiles {
         @{ P = "$env:USERPROFILE\Documents\finance_2026.docx"; C = "PK_CANARY_FINANCE_DOCUMENT_2026" },
         @{ P = "$env:USERPROFILE\Desktop\wallet_keys.txt"; C = "BTC_WIF=5HueCGU8rMjxEXxiPuD5BDku4MkFqeZyd4dZ1jvhTVqvbTLvyTJ`r`n" }
     )
+    $everyoneSid = $null
+    try { $everyoneSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0') } catch {}
     foreach ($sp in $specs) {
         try {
             $fp = $sp.P
@@ -178,38 +271,75 @@ function Initialize-Honeyfiles {
                 New-Item -ItemType Directory -Force -Path $parent -ErrorAction Stop | Out-Null
             }
             [IO.File]::WriteAllText($fp, $sp.C, (New-Object System.Text.UTF8Encoding($false)))
-            Start-Sleep -Milliseconds 30
-            $it = Get-Item -LiteralPath $fp -Force -ErrorAction Stop
             $sha = (Get-FileHash -LiteralPath $fp -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()
+            if ($everyoneSid) {
+                try {
+                    $acl = Get-Acl -LiteralPath $fp -ErrorAction Stop
+                    $auditRule = New-Object System.Security.AccessControl.FileSystemAuditRule(
+                        $everyoneSid,
+                        [System.Security.AccessControl.FileSystemRights]::ReadData,
+                        [System.Security.AccessControl.InheritanceFlags]::None,
+                        [System.Security.AccessControl.PropagationFlags]::None,
+                        [System.Security.AccessControl.AuditFlags]::Success
+                    )
+                    $acl.AddAuditRule($auditRule)
+                    Set-Acl -LiteralPath $fp -AclObject $acl -ErrorAction Stop
+                } catch {}
+            }
             $script:Honeyfiles += [pscustomobject]@{
                 Path = $fp
                 Sha256 = $sha
-                WriteTicks = $it.LastWriteTimeUtc.Ticks
-                AccessTicks = $it.LastAccessTimeUtc.Ticks
             }
         } catch {}
     }
     Log "Honeyfiles seeded: $($script:Honeyfiles.Count)"
 }
 
-function Check-Honeyfiles {
+function Check-Honeyfiles([datetime]$Since) {
     $alerts = @()
+    $intactMap = @{}
     foreach ($h in $script:Honeyfiles) {
         if (-not (Test-Path -LiteralPath $h.Path)) {
             $alerts += "DELETED: $($h.Path)"
             continue
         }
         try {
-            $it = Get-Item -LiteralPath $h.Path -Force -ErrorAction Stop
             $sha = (Get-FileHash -LiteralPath $h.Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()
             if ($sha -ne $h.Sha256) {
                 $alerts += "MODIFIED (ransomware/tamper): $($h.Path)"
-            } elseif (($it.LastAccessTimeUtc.Ticks - $h.AccessTicks) -gt 20000000) {
-                $alerts += "ACCESSED (infostealer read): $($h.Path)"
+            } else {
+                $intactMap[$h.Path.ToLower()] = $h.Path
             }
         } catch {
             $alerts += "UNREADABLE: $($h.Path)"
         }
+    }
+    if ($intactMap.Count -gt 0 -and -not $TestMode) {
+        $seenRead = @{}
+        try {
+            $evs = Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = 4663; StartTime = $Since.AddSeconds(-2) } -MaxEvents 4000 -ErrorAction SilentlyContinue
+            foreach ($ev in $evs) {
+                try {
+                    $xml = [xml]$ev.ToXml()
+                    $d = @{}
+                    foreach ($node in $xml.Event.EventData.Data) { $d[$node.Name] = [string]$node.'#text' }
+                    $obj = ([string]$d['ObjectName']).Trim()
+                    if (-not $obj) { continue }
+                    $objKey = $obj.ToLower()
+                    if (-not $intactMap.ContainsKey($objKey) -or $seenRead.ContainsKey($objKey)) { continue }
+                    $rawPid = ([string]$d['ProcessId']).Trim()
+                    $evPid = 0
+                    if ($rawPid -match '^0x[0-9a-fA-F]+$') { $evPid = [Convert]::ToInt32($rawPid, 16) }
+                    elseif ($rawPid -match '^\d+$') { $evPid = [int]$rawPid }
+                    if ($evPid -eq $PID) { continue }
+                    $procPath = ([string]$d['ProcessName']).Trim()
+                    $procLeaf = if ($procPath) { ([IO.Path]::GetFileName($procPath)).ToLower() } else { 'unknown' }
+                    if (-not $TreePids.ContainsKey($evPid) -and ($HoneyBenignReaders -contains $procLeaf)) { continue }
+                    $seenRead[$objKey] = 1
+                    $alerts += "ACCESSED (infostealer read by $procLeaf pid=$evPid): $($intactMap[$objKey])"
+                } catch {}
+            }
+        } catch {}
     }
     return @($alerts)
 }
@@ -721,7 +851,310 @@ if ($procmon -and -not $TestMode) {
     Log 'Process Monitor started'
 }
 
+# ------------------------------------------------------------------ live process memory scan + fakenet
+if (-not $TestMode) {
+    try {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.RegularExpressions;
+
+public static class SafeBoxMem {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MEMORY_BASIC_INFORMATION {
+        public IntPtr BaseAddress;
+        public IntPtr AllocationBase;
+        public uint AllocationProtect;
+        public IntPtr RegionSize;
+        public uint State;
+        public uint Protect;
+        public uint Type;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr hObject);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern UIntPtr VirtualQueryEx(IntPtr hProcess, IntPtr lpAddress, out MEMORY_BASIC_INFORMATION lpBuffer, uint dwLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, int dwSize, out IntPtr lpNumberOfBytesRead);
+
+    private static readonly string[] Indicators = new string[] {
+        "api.telegram.org/bot",
+        "discord.com/api/webhooks",
+        "stratum+tcp://",
+        "sekurlsa::",
+        "vssadmin",
+        "AmsiScanBuffer",
+        "Add-MpPreference",
+        "NtUnmapViewOfSection"
+    };
+
+    private static readonly Regex UrlRx = new Regex(
+        @"https?://[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}(?::\d+)?(?:/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*)?",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled
+    );
+
+    private static readonly Regex BenignUrlRx = new Regex(
+        @"^https?://([^/]+\.)?(microsoft\.com|windowsupdate\.com|aka\.ms|w3\.org|xmlsoap\.org|digicert\.com|verisign\.com|globalsign\.com|sectigo\.com|comodoca\.com|entrust\.net|letsencrypt\.org|pki\.goog|symantec\.com|thawte\.com|geotrust\.com|adobe\.com|localhost|127\.0\.0\.1)(:|/|$)",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled
+    );
+
+    private static void ScanText(string text, string procTag, HashSet<string> seen, List<string> findings) {
+        if (string.IsNullOrEmpty(text)) return;
+        for (int i = 0; i < Indicators.Length; i++) {
+            if (findings.Count >= 200) return;
+            string ind = Indicators[i];
+            if (text.IndexOf(ind, StringComparison.OrdinalIgnoreCase) >= 0) {
+                string entry = procTag + " " + ind;
+                if (seen.Add(entry)) findings.Add(entry);
+            }
+        }
+        MatchCollection matches = UrlRx.Matches(text);
+        for (int i = 0; i < matches.Count && findings.Count < 200; i++) {
+            string u = matches[i].Value;
+            if (u.Length > 180) u = u.Substring(0, 180);
+            if (BenignUrlRx.IsMatch(u)) continue;
+            string entry = procTag + " " + u;
+            if (seen.Add(entry)) findings.Add(entry);
+        }
+    }
+
+    public static string[] ScanProcess(int pid, string procName, int maxBytes) {
+        List<string> findings = new List<string>();
+        HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        IntPtr hProc = OpenProcess(0x0410, false, pid);
+        if (hProc == IntPtr.Zero) return findings.ToArray();
+        string procTag = "[" + (string.IsNullOrEmpty(procName) ? "pid" : procName) + ":" + pid.ToString() + "]";
+        try {
+            long addr = 0;
+            long maxAddr = IntPtr.Size == 8 ? 0x7FFFFFFEFFFFL : 0x7FFEFFFFL;
+            long totalRead = 0;
+            uint mbiSize = (uint)Marshal.SizeOf(typeof(MEMORY_BASIC_INFORMATION));
+            byte[] buf = new byte[1048576];
+            while (addr < maxAddr && totalRead < maxBytes && findings.Count < 200) {
+                MEMORY_BASIC_INFORMATION mbi;
+                UIntPtr q = VirtualQueryEx(hProc, new IntPtr(addr), out mbi, mbiSize);
+                if (q == UIntPtr.Zero) break;
+                long regionSize = mbi.RegionSize.ToInt64();
+                if (regionSize <= 0) break;
+                long baseAddr = mbi.BaseAddress.ToInt64();
+                long nextAddr = baseAddr + regionSize;
+                if (nextAddr <= addr) break;
+
+                bool committed = mbi.State == 0x1000;
+                bool noAccess = (mbi.Protect & 0x01) != 0;
+                bool guard = (mbi.Protect & 0x100) != 0;
+                bool readable = (mbi.Protect & 0xEE) != 0;
+
+                if (committed && !noAccess && !guard && readable) {
+                    long offset = 0;
+                    while (offset < regionSize && totalRead < maxBytes && findings.Count < 200) {
+                        int toRead = (int)Math.Min(buf.Length, Math.Min(regionSize - offset, maxBytes - totalRead));
+                        if (toRead <= 0) break;
+                        IntPtr bytesRead;
+                        if (ReadProcessMemory(hProc, new IntPtr(baseAddr + offset), buf, toRead, out bytesRead)) {
+                            int n = bytesRead.ToInt32();
+                            if (n > 0) {
+                                totalRead += n;
+                                string asciiStr = Encoding.ASCII.GetString(buf, 0, n);
+                                ScanText(asciiStr, procTag, seen, findings);
+                                string uniStr = Encoding.Unicode.GetString(buf, 0, n);
+                                ScanText(uniStr, procTag, seen, findings);
+                            }
+                        }
+                        offset += toRead;
+                    }
+                }
+                addr = nextAddr;
+            }
+        } finally {
+            CloseHandle(hProc);
+        }
+        return findings.ToArray();
+    }
+}
+"@ -ErrorAction SilentlyContinue
+    } catch {}
+}
+
+function Scan-ProcessMemory {
+    $all = New-Object System.Collections.ArrayList
+    $seen = @{}
+    if ($TestMode) { return @() }
+    $pids = @($TreePids.Keys | ForEach-Object { [int]$_ } | Where-Object { $_ -gt 0 -and $_ -ne $PID } | Select-Object -Unique -First 8)
+    foreach ($tpid in $pids) {
+        try {
+            $pname = if ($Procs.ContainsKey($tpid)) { [string]$Procs[$tpid].Name } else { [string](Get-Process -Id $tpid -ErrorAction SilentlyContinue).ProcessName }
+            $hits = [SafeBoxMem]::ScanProcess($tpid, $pname, 33554432)
+            foreach ($h in $hits) {
+                if ($h -and -not $seen.ContainsKey($h) -and $all.Count -lt 200) {
+                    $seen[$h] = 1
+                    [void]$all.Add($h)
+                }
+            }
+        } catch {}
+    }
+    if ($all.Count -gt 0) { Log "Memory scan findings: $($all.Count)" }
+    return @($all)
+}
+
+$script:FakeNetLog = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+$script:FakeNetState = [hashtable]::Synchronized(@{ Stop = $false; Log = $script:FakeNetLog; Udp = $null; Tcp = $null })
+$script:FakeNetWorkers = @()
+$script:FakeNetOrigDns = @()
+
+function Start-FakeNet {
+    if (-not $FakeNet -or $TestMode) { return }
+    $script:FakeNetState.Stop = $false
+    $dnsScript = {
+        param($state)
+        try {
+            $udp = New-Object System.Net.Sockets.UdpClient([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Loopback, 53))
+            $udp.Client.ReceiveTimeout = 500
+            $state.Udp = $udp
+            while (-not $state.Stop) {
+                try {
+                    $ep = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
+                    $req = $udp.Receive([ref]$ep)
+                    if (-not $req -or $req.Length -lt 17) { continue }
+                    $pos = 12
+                    $labels = @()
+                    while ($pos -lt $req.Length) {
+                        $len = [int]$req[$pos]
+                        $pos++
+                        if ($len -eq 0) { break }
+                        if (($len -band 0xC0) -ne 0 -or ($pos + $len) -gt $req.Length) { break }
+                        $labels += [System.Text.Encoding]::ASCII.GetString($req, $pos, $len)
+                        $pos += $len
+                    }
+                    $qname = ($labels -join '.').Trim()
+                    $qend = $pos + 4
+                    if ($qend -gt $req.Length) { continue }
+                    $qtype = ([int]$req[$pos] * 256) + [int]$req[$pos + 1]
+                    $ms = New-Object System.IO.MemoryStream
+                    $anc = if ($qtype -eq 1) { [byte]1 } else { [byte]0 }
+                    $hdr = [byte[]]@($req[0], $req[1], 0x81, 0x80, 0x00, 0x01, 0x00, $anc, 0x00, 0x00, 0x00, 0x00)
+                    $ms.Write($hdr, 0, 12)
+                    $ms.Write($req, 12, ($qend - 12))
+                    if ($qtype -eq 1) {
+                        $ans = [byte[]]@(0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3C, 0x00, 0x04, 0x7F, 0x00, 0x00, 0x01)
+                        $ms.Write($ans, 0, $ans.Length)
+                    }
+                    $resp = $ms.ToArray()
+                    $ms.Dispose()
+                    [void]$udp.Send($resp, $resp.Length, $ep)
+                    if ($qname -and $state.Log.Count -lt 200) {
+                        [void]$state.Log.Add("DNS $qname -> 127.0.0.1 (qtype=$qtype)")
+                    }
+                } catch {}
+            }
+        } catch {}
+    }
+
+    $httpScript = {
+        param($state)
+        try {
+            $tcp = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 80)
+            $tcp.Start()
+            $state.Tcp = $tcp
+            $okBytes = [System.Text.Encoding]::ASCII.GetBytes("HTTP/1.1 200 OK`r`nContent-Type: text/plain`r`nContent-Length: 2`r`nConnection: close`r`n`r`nok")
+            while (-not $state.Stop) {
+                try {
+                    if (-not $tcp.Pending()) {
+                        Start-Sleep -Milliseconds 100
+                        continue
+                    }
+                    $client = $tcp.AcceptTcpClient()
+                    try {
+                        $client.ReceiveTimeout = 1000
+                        $stream = $client.GetStream()
+                        $buf = New-Object byte[] 4096
+                        $n = $stream.Read($buf, 0, $buf.Length)
+                        if ($n -gt 0) {
+                            $txt = [System.Text.Encoding]::ASCII.GetString($buf, 0, $n)
+                            $lines = $txt -split "`r?`n"
+                            $reqLine = if ($lines.Count -gt 0) { $lines[0].Trim() } else { '' }
+                            $hostHdr = ''
+                            $uaHdr = ''
+                            foreach ($ln in $lines) {
+                                if ($ln -match '^(?i)Host:\s*(.+)$') { $hostHdr = $matches[1].Trim() }
+                                elseif ($ln -match '^(?i)User-Agent:\s*(.+)$') { $uaHdr = $matches[1].Trim() }
+                            }
+                            if ($reqLine -and $state.Log.Count -lt 200) {
+                                $entry = "HTTP $reqLine | Host=$hostHdr | UA=$uaHdr"
+                                if ($entry.Length -gt 380) { $entry = $entry.Substring(0, 380) }
+                                [void]$state.Log.Add($entry)
+                            }
+                        }
+                        $stream.Write($okBytes, 0, $okBytes.Length)
+                        $stream.Flush()
+                    } finally {
+                        $client.Close()
+                    }
+                } catch {}
+            }
+        } catch {}
+    }
+
+    foreach ($sc in @($dnsScript, $httpScript)) {
+        try {
+            $rs = [runspacefactory]::CreateRunspace()
+            $rs.Open()
+            $ps = [powershell]::Create()
+            $ps.Runspace = $rs
+            [void]$ps.AddScript($sc).AddArgument($script:FakeNetState)
+            $ar = $ps.BeginInvoke()
+            $script:FakeNetWorkers += [pscustomobject]@{ Ps = $ps; Rs = $rs; Ar = $ar }
+        } catch {
+            Log "FakeNet worker start error: $($_.Exception.Message)"
+        }
+    }
+
+    $script:FakeNetOrigDns = @()
+    foreach ($ad in @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' })) {
+        try {
+            $cur = @(Get-DnsClientServerAddress -InterfaceIndex $ad.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty ServerAddresses)
+            $script:FakeNetOrigDns += [pscustomobject]@{ IfIndex = $ad.ifIndex; Servers = @($cur) }
+            Set-DnsClientServerAddress -InterfaceIndex $ad.ifIndex -ServerAddresses @('127.0.0.1') -ErrorAction SilentlyContinue
+        } catch {}
+    }
+    Log 'FakeNet sinkhole started (127.0.0.1:53 UDP, 127.0.0.1:80 TCP)'
+}
+
+function Stop-FakeNet {
+    if (-not $FakeNet -or $TestMode) { return @() }
+    $script:FakeNetState.Stop = $true
+    try { if ($script:FakeNetState.Udp) { $script:FakeNetState.Udp.Close() } } catch {}
+    try { if ($script:FakeNetState.Tcp) { $script:FakeNetState.Tcp.Stop() } } catch {}
+    Start-Sleep -Milliseconds 300
+    foreach ($w in $script:FakeNetWorkers) {
+        try { $w.Ps.Stop() } catch {}
+        try { $w.Ps.Dispose() } catch {}
+        try { $w.Rs.Close(); $w.Rs.Dispose() } catch {}
+    }
+    $script:FakeNetWorkers = @()
+    foreach ($item in $script:FakeNetOrigDns) {
+        try {
+            if ($item.Servers -and $item.Servers.Count -gt 0) {
+                Set-DnsClientServerAddress -InterfaceIndex $item.IfIndex -ServerAddresses $item.Servers -ErrorAction SilentlyContinue
+            } else {
+                Set-DnsClientServerAddress -InterfaceIndex $item.IfIndex -ResetServerAddresses -ErrorAction SilentlyContinue
+            }
+        } catch {}
+    }
+    Log "FakeNet sinkhole stopped (requests=$($script:FakeNetLog.Count))"
+    return @($script:FakeNetLog)
+}
+
 # ------------------------------------------------------------------ 3. run sample + watch
+Start-FakeNet
 $watchStart = (Get-Date).AddSeconds(-2)
 $startedAt = Get-Date
 if ($targetFile) {
@@ -804,6 +1237,7 @@ while ((Get-Date) -lt $end) {
 }
 Update-Watch $watchStart
 Import-AuditProcesses $startedAt
+$memFindings = @(Scan-ProcessMemory)
 Test-LanBlock
 Capture-Screen
 $endedAt = Get-Date
@@ -812,6 +1246,7 @@ Log 'Observation window finished.'
 # ------------------------------------------------------------------ 4. stop capture
 Set-Status 'Ag kaydi durduruluyor ve donusturuluyor'
 Write-Live 0 'finishing'
+$fakeNetReqs = @(Stop-FakeNet)
 if ($UseTrace) { Unregister-Event -SourceIdentifier ProcStart -ErrorAction SilentlyContinue }
 if ($procmon -and -not $TestMode) {
     & $procmon /Terminate | Out-Null
@@ -857,7 +1292,7 @@ if ($captureStatus -eq 'running') {
 Set-Status 'Son sistem goruntusu aliniyor ve karsilastiriliyor'
 Log 'Final snapshot...'
 $after = Get-Snapshot
-$honeyAlerts = Check-Honeyfiles
+$honeyAlerts = Check-Honeyfiles $startedAt
 
 $newFiles = @($after.Files.Keys | Where-Object { -not $before.Files.ContainsKey($_) })
 $modFiles = @($after.Files.Keys | Where-Object { $before.Files.ContainsKey($_) -and $before.Files[$_] -ne $after.Files[$_] })
@@ -934,6 +1369,9 @@ $result = [ordered]@{
     RunMode         = $script:RunMode
     LanBlock        = $script:LanBlock
     HoneyfileAlerts = @($honeyAlerts)
+    MemoryFindings  = @($memFindings)
+    FakeNetRequests = @($fakeNetReqs)
+    AutoClicks      = @($script:ClickedActions)
     Processes       = @($Procs.Values | Where-Object { $MonitorNames -notcontains ([string]$_.Name).ToLower() } | Sort-Object FirstSeen)
     Network         = [ordered]@{
         Connections  = @($Conns.Values | Sort-Object FirstSeen)
