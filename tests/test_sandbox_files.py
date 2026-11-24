@@ -227,4 +227,38 @@ def test_f8_honeyfile_uses_4663_sacl_without_lastaccess_false_positives():
     assert "ACCESSED (infostealer read by xcopy.exe pid=4242):" in cp.stdout
 
 
+def test_win11_idle_sandbox_server_daemon_does_not_block_new_sandbox(monkeypatch):
+    import sandbox_manager as sbm
+
+    monkeypatch.setattr(
+        sbm,
+        "_run",
+        lambda args, timeout=30: subprocess.CompletedProcess(
+            args,
+            0,
+            stdout='"WindowsSandboxServer.exe","18712","Console","1","12,000 K"\n"explorer.exe","1234","Console","1","50,000 K"\n',
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr(sbm, "wsb_list_ids", lambda: [])
+    assert sbm._sandbox_processes() == []
+    assert sbm.sandbox_state() is False
+    assert sbm.sandbox_running() is False
+
+    # Active client session must still be detected as running
+    monkeypatch.setattr(
+        sbm,
+        "_run",
+        lambda args, timeout=30: subprocess.CompletedProcess(
+            args,
+            0,
+            stdout='"WindowsSandboxServer.exe","18712","Console","1","12,000 K"\n"WindowsSandboxClient.exe","9999","Console","1","80,000 K"\n',
+            stderr="",
+        ),
+    )
+    assert sbm._sandbox_processes() == ["WindowsSandboxClient.exe"]
+    assert sbm.sandbox_running() is True
+
+
+
 

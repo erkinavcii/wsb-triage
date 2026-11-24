@@ -192,8 +192,12 @@ def build_wsb(case_dir: Path, network: bool, memory_mb: int = 4096, input_dir: O
 """
 
 
+_SANDBOX_IDLE_BROKERS = {"windowssandboxserver.exe"}
+
+
 def _sandbox_processes() -> Optional[List[str]]:
-    """Names of running Windows Sandbox processes, or None if the check itself failed (e.g. tasklist timed out)."""
+    """Names of running Windows Sandbox session processes (excluding the persistent Win11 24H2+
+    WindowsSandboxServer.exe idle broker daemon), or None if the check itself failed."""
     try:
         p = _run(["tasklist", "/fo", "csv", "/nh"], timeout=30)
         if p.returncode != 0 or not p.stdout.strip():
@@ -203,7 +207,8 @@ def _sandbox_processes() -> Optional[List[str]]:
     names = []
     for line in p.stdout.splitlines():
         name = line.split('","')[0].strip('"')
-        if name.lower().startswith("windowssandbox"):
+        low = name.lower()
+        if low.startswith("windowssandbox") and low not in _SANDBOX_IDLE_BROKERS:
             names.append(name)
     return names
 
