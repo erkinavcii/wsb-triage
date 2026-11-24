@@ -21,3 +21,8 @@ body { background-color: #0b0f19; color: #e2e8f0; font-family: 'Segoe UI', syste
 .hover\:border-cyan-500\/40:hover { border-color: rgb(6 182 212 / 0.4); }
 @media (min-width: 640px) { .sm\:col-span-2 { grid-column: span 2 / span 2; } }
 @media (min-width: 768px) { .md\:col-span-2 { grid-column: span 2 / span 2; } .md\:grid-cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+/* crack / license-tampering verdict block (orange) */
+.bg-orange-950\/40{background-color:rgb(67 20 7 / 0.4)}
+.border-orange-500\/50{border-color:rgb(249 115 22 / 0.5)}
+.text-orange-200{color:rgb(254 215 170)}
+.text-orange-300{color:rgb(253 186 116)}

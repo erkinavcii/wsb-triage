@@ -27,7 +27,7 @@ import uuid
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import analyzer
@@ -402,7 +402,7 @@ def _maybe_notify_job(job: Job) -> None:
     elif st == "error":
         notify_desktop(f"SafeBox hata: {sample_name}", "Analiz hata ile sonlandı; ayrıntılar için panele bakın.", level="error")
     elif lvl == "yellow":
-        first = (v.get("notes") or ["İncelenmesi gereken bulgular var"])[0]
+        first = (v.get("notes") or [("Crack/lisans müdahalesine özgü değişiklikler: " + v["crack"][0]) if v.get("crack") else "İncelenmesi gereken bulgular var"])[0]
         notify_desktop(f"SafeBox inceleme: {sample_name}", first, level="yellow")
     elif st == "done":
         notify_desktop(f"SafeBox tamamlandı: {sample_name}", "Otomatik kontroller kırmızı bayrak bulmadı.", level="info")
@@ -435,8 +435,14 @@ def delete_job(case_id: str) -> None:
     # a file dropped onto the panel lives in uploads/<name>/: remove it too if no other analysis uses it
     uploads = (BASE_DIR / "uploads").resolve()
     try:
-        up_dir = sample.resolve().parent
+        sample_res = sample.resolve()
+        up_dir = sample_res.parent
     except OSError:
+        return
+    # several files/folders dropped together live in uploads/batch_<id>/ and the sample is that folder itself
+    if sample_res.parent == uploads and sample_res.name.startswith("batch_"):
+        if not any((_read_json(d / "state.json") or {}).get("sample") == str(sample) for d in CASES_DIR.iterdir() if d.is_dir()):
+            shutil.rmtree(sample_res, ignore_errors=True)
         return
     if up_dir.parent == uploads and not any(
             (_read_json(d / "state.json") or {}).get("sample") == str(sample) for d in CASES_DIR.iterdir() if d.is_dir()):
@@ -1747,7 +1753,7 @@ def _observe_sandbox_loop(job: Job, out: Path, duration: int, check_alive_fn) ->
                 last_beat, last_beat_t = beat, now
         if sample_started_t is None and _timeline_has(out, ("Sample started", "No runnable file")):
             sample_started_t = now
-        status = (out / "status.txt").read_text(encoding="utf-8", errors="replace").strip() if (out / "status.txt").exists() else ""
+        status = _read_text_quiet(out / "status.txt")
         if status:
             job.state["sandbox"]["status_text"] = status
             job.state["stages"]["sandbox"]["msg"] = status
@@ -1778,6 +1784,49 @@ def _observe_sandbox_loop(job: Job, out: Path, duration: int, check_alive_fn) ->
         job.state["sandbox"]["monitor_max_gap"] = int(max_gap)
 
 
+SANDBOX_RUNNABLE_EXT = {".exe", ".msi", ".bat", ".cmd", ".ps1", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".hta",
+                        ".scr", ".com", ".lnk", ".pif", ".jar", ".reg", ".dll"}
+DISC_IMAGE_EXT = {".iso", ".img"}
+
+
+def _prepare_image_input(job: Job) -> Tuple[Path, str]:
+    """What the sandbox gets as its read-only input folder.
+
+    A download folder often holds only "Product.iso" + checksum files. Windows Sandbox cannot mount disc images
+    (Mount-DiskImage succeeds there but no volume appears), so in that case the largest image is extracted on the
+    host with 7-Zip (nothing is executed) and its contents become the sandbox input. Returns (folder, note)."""
+    inp = job.input_dir
+    files = [p for p in inp.rglob("*") if p.is_file()] if inp.is_dir() else []
+    if not files or any(p.suffix.lower() in SANDBOX_RUNNABLE_EXT for p in files):
+        return inp, ""
+    images = sorted((p for p in files if p.suffix.lower() in DISC_IMAGE_EXT), key=lambda p: -p.stat().st_size)
+    if not images:
+        return inp, ""
+    sz = sbm.seven_zip_path()
+    img = images[0]
+    if not sz:
+        return inp, f"{img.name} açılamadı: 7-Zip kurulu değil."
+    dest = job.case_dir / "image_root" / (re.sub(r"[^\w.-]", "_", img.stem)[:60] or "image")
+    if not (dest.exists() and any(dest.rglob("*"))):
+        job.stage("sandbox", "running", f"Disk görüntüsü açılıyor (çalıştırılmıyor): {img.name}")
+        lp = subprocess.run([sz, "l", "-slt", "-pno-password", str(img)], capture_output=True, text=True,
+                            timeout=600, errors="replace", creationflags=NO_WINDOW)
+        if lp.returncode == 0:
+            body = lp.stdout.split("\n----------", 1)[-1]
+            _check_unpacked_size(job, sum(int(x) for x in re.findall(r"^Size = (\d+)", body, re.M)), img)
+        dest.mkdir(parents=True, exist_ok=True)
+        p = subprocess.run([sz, "x", "-y", "-pno-password", f"-o{dest}", str(img)], capture_output=True, text=True,
+                           timeout=7200, errors="replace", creationflags=NO_WINDOW)
+        if p.returncode not in (0, 1):
+            shutil.rmtree(dest, ignore_errors=True)
+            return inp, f"{img.name} açılamadı (7-Zip çıkış kodu {p.returncode})."
+    if not any(q.suffix.lower() in SANDBOX_RUNNABLE_EXT for q in dest.rglob("*") if q.is_file()):
+        return inp, f"{img.name} açıldı ama içinde çalıştırılabilir dosya yok."
+    note = f"Klasörde çalıştırılabilir dosya yoktu; {img.name} ana bilgisayarda açılıp içeriği sandbox'a verildi."
+    job.log(note)
+    return dest, note
+
+
 def stage_sandbox(job: Job) -> None:
     backend = "vbox" if job.opt("sandbox_backend") == "vbox" else "wsb"
     if backend == "wsb" and not sbm.windows_sandbox_available():
@@ -1793,6 +1842,8 @@ def stage_sandbox(job: Job) -> None:
         while not SANDBOX_LOCK.acquire(timeout=5):
             job.check_cancel()
         job.log("Sıra geldi, sandbox hazırlanıyor.")
+    env_started = False      # an environment (sandbox / VM) was launched ...
+    env_stopped = False      # ... and has been closed again
     try:
         out = job.output_dir
         if any(out.iterdir()):
@@ -1808,6 +1859,8 @@ def stage_sandbox(job: Job) -> None:
                 job.log("Process Monitor da sandbox içinde çalışacak.")
                 break
         duration = int(job.opt("duration_min")) * 60
+        sandbox_input, image_note = _prepare_image_input(job)
+        job.state["sandbox"]["image_note"] = image_note
         _write_json(tools / "config.json", {
             "Target": job.opt("target") or "",
             "TargetArgs": job.opt("target_args") or "",
@@ -1831,7 +1884,7 @@ def stage_sandbox(job: Job) -> None:
             used_vbox_snap = sbm.vbox_start_analysis(
                 vbox_vm,
                 str(job.opt("vbox_snapshot") or ""),
-                job.input_dir,
+                sandbox_input,
                 tools,
                 out,
                 bool(job.opt("network")),
@@ -1839,16 +1892,18 @@ def stage_sandbox(job: Job) -> None:
                 job.vbox_password or "",
                 log_cb=job.log,
             )
+            env_started = True
             job.log(f"VirtualBox VM '{vbox_vm}' başlatıldı (snapshot: {used_vbox_snap}).")
             _observe_sandbox_loop(job, out, duration, lambda: sbm._vm_state(vbox_vm) == "running")
         else:
             if sbm.sandbox_state() is True:
                 raise PipelineError("Açık bir Windows Sandbox penceresi var (aynı anda yalnızca bir tane açılabilir). Kapatıp tekrar deneyin.")
             wsb = job.case_dir / "analysis.wsb"
-            wsb.write_text(sbm.build_wsb(job.case_dir, bool(job.opt("network")), int(job.opt("memory_mb")), job.input_dir), encoding="utf-8")
+            wsb.write_text(sbm.build_wsb(job.case_dir, bool(job.opt("network")), int(job.opt("memory_mb")), sandbox_input), encoding="utf-8")
             job.stage("sandbox", "running", f"Sandbox açılıyor (internet {net}, {job.opt('duration_min')} dk)...")
             job.log("Windows Sandbox başlatıldı. Örnek bir kurulum penceresi açarsa sandbox penceresinin içinden ilerleyebilirsiniz.")
             wsb_sid = sbm.launch_sandbox(wsb)
+            env_started = True
             _observe_sandbox_loop(job, out, duration, sbm.sandbox_state)
 
         if job.state.pop("cancel_requested", None):
@@ -1860,6 +1915,7 @@ def stage_sandbox(job: Job) -> None:
             else:
                 job.log("Sandbox kapatılıyor (içindeki her şey silinir).")
                 sbm.stop_sandbox(wsb_sid)
+            env_stopped = True
         elif job.state["sandbox"].get("monitor_lost"):
             job.log("İzleyici durdu; 'kapatma' seçili olmadığı için ortam açık bırakıldı. İçindekileri ana bilgisayara kopyalamayın.")
 
@@ -1879,6 +1935,17 @@ def stage_sandbox(job: Job) -> None:
         else:
             job.stage("sandbox", "error", "Sandbox davranış raporu (behavior.json) oluşmadı.")
     finally:
+        # An error (or cancel) after launch must not leave the sandbox running: the next analysis would be refused
+        # ("a sandbox is already open") and the sample would keep running unobserved.
+        if env_started and not env_stopped and not job.opt("keep_sandbox_open"):
+            try:
+                job.log("Analiz hatayla bittiği için ortam kapatılıyor (içindeki her şey silinir).")
+                if backend == "vbox":
+                    sbm.vbox_stop_and_restore(vbox_vm, used_vbox_snap)
+                else:
+                    sbm.stop_sandbox(wsb_sid)
+            except Exception as stop_err:
+                job.log(f"Ortam kapatılamadı: {stop_err}")
         SANDBOX_LOCK.release()
 
 
@@ -1950,6 +2017,15 @@ def quarantine_output(out: Path) -> List[str]:
     return moved
 
 
+def _read_text_quiet(path: Path) -> str:
+    """Reads a file the sandbox may be writing at this very moment. Windows locks it during the write
+    (PermissionError), which must not abort the analysis: return "" and let the next poll read it."""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+
+
 def _timeline_has(out: Path, needles) -> bool:
     try:
         text = (out / "timeline.log").read_text(encoding="utf-8", errors="replace")
@@ -1961,7 +2037,7 @@ def _timeline_has(out: Path, needles) -> bool:
 # ------------------------------------------------------------------ sandbox output is attacker-controlled
 _STR_LISTS = [("Persistence", "Services"), ("Persistence", "Drivers"), ("Persistence", "Tasks"), ("Persistence", "RunKeys"),
               ("Persistence", "Startup"), ("Persistence", "WmiSubscriptions"), ("Persistence", "ComHijacks"),
-              ("Persistence", "AppInitDlls"), ("Persistence", "BitsJobs"), ("Persistence", "PsProfiles"), ("Persistence", "ActiveSetup"),
+              ("Persistence", "AppInitDlls"), ("Persistence", "BitsJobs"), ("Persistence", "ServicesChanged"), ("Persistence", "PsProfiles"), ("Persistence", "ActiveSetup"),
               ("Defender", "Added"), ("Defender", "ThreatsDetected"), ("Hosts", "Added"),
               ("Hosts", "Removed"), ("Firewall", "Added"), ("Files", "NewExecutables"), ("Files", "ModifiedExecutables"),
               ("Network", "NewListening"), ("Network", "UdpEndpoints"), ("HoneyfileAlerts",),
@@ -2395,14 +2471,63 @@ def _is_wsb_noise_service(svc: str) -> bool:
     return bool(_WSB_NOISE_SERVICE_RX.match(str(svc or "").strip()))
 
 
+# Start-mode flips Windows Sandbox itself makes on every run (seen on Win11 25H2): BITS Manual -> Auto.
+# Matched on the exact service name AND the exact Windows command line; a changed binary path is never noise.
+_WSB_NOISE_MODE_CHANGE_RX = re.compile(
+    r"^BITS\s*\|\s*\w+\s*\|\s*C:\\Windows\\System32\\svchost\.exe\s+-k\s+netsvcs\s+-p$", re.I)
+
+
+def _is_wsb_noise_mode_change(change: str) -> bool:
+    old_l, _, new_l = str(change or "").partition(" -> ")
+    return bool(_WSB_NOISE_MODE_CHANGE_RX.match(old_l.strip()) and _WSB_NOISE_MODE_CHANGE_RX.match(new_l.strip()))
+
+
+def _is_windows_bits_job(job_line: str) -> bool:
+    """BITS jobs Windows starts by itself (e.g. 'Font Download' from fs.microsoft.com). Every URL of the job must be
+    a Microsoft-only host; anything else stays a red flag."""
+    urls = [u.strip() for u in str(job_line or "").split(" | ")[-1].split(",") if u.strip()]
+    if not urls:
+        return False
+    for u in urls:
+        host = (urlparse(u).hostname or "").lower()
+        if not host or domain_class(host) != "Windows/Microsoft (gürültü)":
+            return False
+    return True
+
+
 def _is_wsb_noise_dropped_file(path: str) -> bool:
     return bool(_WSB_NOISE_DROPPED_RX.search(str(path or "")))
+
+
+# Crack / license tampering: expected for cracked software, so it gets its own (orange) list instead of red.
+# A finding only lands there when the same file shows no real-malware signal; otherwise it stays red, so malware
+# cannot hide by also looking like a crack.
+CRACK_YARA_RULES = {"SafeBox_License_Service_Tamper", "SafeBox_Patch_Keygen_Artifacts"}
+CRACK_FORMAT_CATEGORIES = {"Kurulum / Lisans Müdahale Betiği"}
+CRACK_SPOOF_TYPES = {"vendor_impersonation"}
+
+
+def _file_has_malware_signals(st: Dict[str, Any]) -> bool:
+    """True if a statically analysed file shows something beyond crack/license tampering."""
+    for ym in st.get("yara_matches") or []:
+        if ym.get("rule") not in CRACK_YARA_RULES and str(ym.get("severity") or "").lower() in ("critical", "high"):
+            return True
+    if any(f.get("severity") == "critical" for f in st.get("string_findings") or []):
+        return True
+    for ff in st.get("format_findings") or []:
+        if ff.get("category") not in CRACK_FORMAT_CATEGORIES and str(ff.get("severity") or "").lower() in ("critical", "high"):
+            return True
+    for sf in st.get("spoof_flags") or []:
+        if sf.get("type") not in CRACK_SPOOF_TYPES and str(sf.get("severity") or "").lower() in ("critical", "high"):
+            return True
+    return False
 
 
 def compute_verdict(job: Job) -> None:
     s = job.state
     red: List[str] = []
     notes: List[str] = []
+    crack: List[str] = []
     known_good: List[str] = []
     for e in s.get("vt") or []:
         intel = e.get("intel") or {}
@@ -2433,7 +2558,7 @@ def compute_verdict(job: Job) -> None:
         if mal and SEVERE_RX.search(txt):
             red.append(f"VirusTotal: '{e['rel']}' zararlı yazılım ailesi olarak tespit edildi ({mal} motor): {r.get('suggested_threat_label')}")
         elif mal >= 3 and TOOL_RX.search(txt):
-            notes.append(f"VirusTotal: '{e['rel']}' {mal} motor tarafından HackTool/Crack olarak işaretlendi (crack'lerde beklenir ama değiştirilmiş dosyadır).")
+            crack.append(f"VirusTotal: '{e['rel']}' {mal} motor tarafından HackTool/Crack olarak işaretlendi (değiştirilmiş dosya).")
         elif mal >= 3:
             red.append(f"VirusTotal: '{e['rel']}' {mal} motor tarafından zararlı işaretlendi.")
         elif mal > 0:
@@ -2442,27 +2567,36 @@ def compute_verdict(job: Job) -> None:
     if inv.get("missing"):
         red.append(f"{inv['missing']} dosya açıldıktan sonra kayboldu — büyük ihtimalle Windows Defender karantinaya aldı.")
     if inv.get("hash_mismatch"):
-        notes.append(f"{inv['hash_mismatch']} dosyanın imzası bozuk (HashMismatch) — orijinal dosya sonradan değiştirilmiş (crack/yama).")
+        crack.append(f"{inv['hash_mismatch']} dosyanın imzası bozuk (HashMismatch) — orijinal dosya sonradan değiştirilmiş (yama).")
     if inv.get("sig_errors"):
         notes.append(f"{inv['sig_errors']} dosyanın dijital imzası kontrol edilemedi, bu yüzden imzasız sayıldı "
                      f"(imza sonuçları güvenilir değil): {inv.get('sig_error_msg', '')}")
     for st in s.get("static") or []:
         sig = st.get("signature") or {}
         sig_status = sig.get("status")
+        malware_signals = _file_has_malware_signals(st)
         for sf in st.get("spoof_flags") or []:
-            if str(sf.get("severity") or "").lower() in ("critical", "high"):
-                red.append(f"Uzantı/Biçim kandırmacası '{st.get('rel', '')}': {sf.get('reason', '')}")
+            msg_sf = f"Uzantı/Biçim kandırmacası '{st.get('rel', '')}': {sf.get('reason', '')}"
+            if sf.get("type") in CRACK_SPOOF_TYPES and not malware_signals:
+                crack.append(msg_sf)
+            elif str(sf.get("severity") or "").lower() in ("critical", "high"):
+                red.append(msg_sf)
         for ym in st.get("yara_matches") or []:
             sev = str(ym.get("severity") or "medium").lower()
             desc = ym.get("description") or ym.get("rule")
-            if sev in ("critical", "high"):
-                red.append(f"YARA [{ym.get('rule')}]: '{st.get('rel', '')}' ({desc})")
+            msg_ym = f"YARA [{ym.get('rule')}]: '{st.get('rel', '')}' ({desc})"
+            if ym.get("rule") in CRACK_YARA_RULES and not malware_signals:
+                crack.append(msg_ym)
+            elif sev in ("critical", "high"):
+                red.append(msg_ym)
             else:
-                notes.append(f"YARA [{ym.get('rule')}]: '{st.get('rel', '')}' ({desc})")
+                notes.append(msg_ym)
         for ff in st.get("format_findings") or []:
             sev = str(ff.get("severity") or "medium").lower()
             msg_ff = f"{ff.get('category')}: '{st.get('rel', '')}' — {ff.get('description', '')}"
-            if sev in ("critical", "high"):
+            if ff.get("category") in CRACK_FORMAT_CATEGORIES and not malware_signals:
+                crack.append(msg_ff)
+            elif sev in ("critical", "high"):
                 red.append(msg_ff)
             else:
                 notes.append(msg_ff)
@@ -2528,8 +2662,20 @@ def compute_verdict(job: Job) -> None:
             red.append(f"WMI olay aboneliği kalıcılığı eklendi ({len(P['WmiSubscriptions'])} kayıt).")
         if P.get("AppInitDlls"):
             red.append(f"AppInit_DLLs / LogonScript kalıcılığı eklendi: {'; '.join(P['AppInitDlls'][:3])}")
-        if P.get("BitsJobs"):
-            red.append(f"BITS arka plan aktarım görevi oluşturuldu ({len(P['BitsJobs'])} görev).")
+        real_bits = [j for j in (P.get("BitsJobs") or []) if not _is_windows_bits_job(j)]
+        if real_bits:
+            red.append(f"BITS arka plan aktarım görevi oluşturuldu ({len(real_bits)} görev): {'; '.join(real_bits[:3])}")
+        hijacked, mode_only = [], []
+        for ch in [c for c in (P.get("ServicesChanged") or []) if not _is_wsb_noise_mode_change(c)]:
+            old_l, _, new_l = str(ch).partition(" -> ")
+            old_path = old_l.split("|", 2)[-1].strip().lower() if old_l.count("|") >= 2 else ""
+            new_path = new_l.split("|", 2)[-1].strip().lower() if new_l.count("|") >= 2 else ""
+            (hijacked if old_path != new_path else mode_only).append(str(ch))
+        if hijacked:
+            red.append(f"Mevcut servisin çalıştırdığı dosya değiştirildi (servis ele geçirme): {'; '.join(hijacked[:3])}")
+        if mode_only:
+            notes.append(f"{len(mode_only)} mevcut servisin başlatma türü değişti (Windows da yapabilir): "
+                         + "; ".join(c.split(" | ")[0] for c in mode_only[:5]))
         if P.get("PsProfiles"):
             red.append(f"PowerShell profil dosyası oluşturuldu/değiştirildi ({len(P['PsProfiles'])}).")
         if P.get("ComHijacks"):
@@ -2541,11 +2687,11 @@ def compute_verdict(job: Job) -> None:
         if P.get("RunKeys"):
             notes.append(f"{len(P['RunKeys'])} otomatik başlatma kaydı eklendi/değişti.")
         if (b.get("Hosts") or {}).get("Added"):
-            notes.append(f"hosts dosyası değişti ({len(b['Hosts']['Added'])} satır) — crack'ler lisans sunucusunu genelde böyle engeller.")
+            crack.append(f"hosts dosyası değişti ({len(b['Hosts']['Added'])} satır) — lisans sunucularını engelleme.")
         if (b.get("Hosts") or {}).get("Removed"):
             notes.append(f"hosts dosyasından {len(b['Hosts']['Removed'])} satır silindi.")
         if (b.get("Firewall") or {}).get("Added"):
-            notes.append(f"{len(b['Firewall']['Added'])} güvenlik duvarı kuralı eklendi — crack'ler ürünün internetini genelde böyle keser.")
+            crack.append(f"{len(b['Firewall']['Added'])} güvenlik duvarı kuralı eklendi — ürünün internet erişimini kesme.")
         new_listen = (b.get("Network") or {}).get("NewListening") or []
         if new_listen:
             red.append(f"Yeni dinleyici (listening) TCP portu açıldı: {'; '.join(new_listen[:4])}")
@@ -2625,8 +2771,15 @@ def compute_verdict(job: Job) -> None:
             missing.append("Sandbox")
             notes.append("Sandbox adımı çalışmadı: dosyanın davranışı (işlemler, ağ, kalıcılık) incelenmedi; "
                          "bu sonuç sadece statik kontrollere dayanıyor.")
-    level = "red" if red else ("yellow" if notes else ("green" if finished else "pending"))
-    verdict_obj: Dict[str, Any] = {"level": level, "red": red, "notes": notes, "not_run": missing}
+        elif b is not None and not str(b.get("Target") or "").strip():
+            # the sandbox ran, but there was nothing to execute (e.g. only checksum files, or an image that could not be mounted)
+            missing.append("Sandbox")
+            notes.append("Sandbox açıldı ama çalıştırılacak dosya bulunamadı (.exe/.msi/script yok, ISO bağlanamadı); "
+                         "dosyanın davranışı incelenmedi — bu sonuç temiz olduğu anlamına gelmez. "
+                         + " ".join(x for x in (str((s.get("sandbox") or {}).get("image_note") or ""),
+                                                 str(b.get("TargetNote") or "")) if x))
+    level = "red" if red else ("yellow" if (notes or crack) else ("green" if finished else "pending"))
+    verdict_obj: Dict[str, Any] = {"level": level, "red": red, "notes": notes, "crack": crack, "not_run": missing}
     if known_good:
         verdict_obj["known_good"] = known_good
     s["verdict"] = verdict_obj
@@ -2654,10 +2807,10 @@ def write_report(job: Job) -> None:
     L: List[str] = [f"# SafeBox analiz raporu", "", f"- **Örnek:** {s['sample']}", f"- **Tarih:** {s['created']}",
                     f"- **Sonuç seviyesi:** {v['level']}", ""]
     L += ["## Bulgular", ""]
-    L += [f"- **KIRMIZI:** {x}" for x in v["red"]] + [f"- NOT: {x}" for x in v["notes"]]
+    L += [f"- **KIRMIZI:** {x}" for x in v["red"]] + [f"- CRACK/LİSANS: {x}" for x in v.get("crack") or []] + [f"- NOT: {x}" for x in v["notes"]]
     if v.get("known_good"):
         L.append(f"- BİLGİ (CIRCL NSRL bilinen temiz): {', '.join(v['known_good'][:10])}")
-    if not v["red"] and not v["notes"]:
+    if not v["red"] and not v["notes"] and not v.get("crack"):
         L.append("- Otomatik kontroller kırmızı bayrak bulmadı. Bu dosyanın temiz olduğunu **kanıtlamaz**.")
     inv = s.get("inventory") or {}
     L += ["", "## Envanter", "", f"{inv.get('files', 0)} dosya, {inv.get('pe', 0)} çalıştırılabilir, {inv.get('unsigned', 0)} imzasız, "
@@ -2707,6 +2860,7 @@ def write_report(job: Job) -> None:
                     ("COM hijacking kayıtları", (b.get("Persistence") or {}).get("ComHijacks")),
                     ("AppInit / LogonScript", (b.get("Persistence") or {}).get("AppInitDlls")),
                     ("BITS görevleri", (b.get("Persistence") or {}).get("BitsJobs")),
+                    ("Ayarı değişen mevcut servisler", (b.get("Persistence") or {}).get("ServicesChanged")),
                     ("PowerShell profilleri", (b.get("Persistence") or {}).get("PsProfiles")),
                     ("Active Setup kayıtları", (b.get("Persistence") or {}).get("ActiveSetup")),
                     ("hosts eklenen satırlar", (b.get("Hosts") or {}).get("Added")),

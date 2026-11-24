@@ -324,3 +324,38 @@ def test_select_large_archive_manifests_never_starve_exes_or_large_core_archive(
 
 
 
+
+
+# ---------------------------------------------------------------- disc image folder -> sandbox input
+import zipfile as _zipfile  # noqa: E402
+
+import sandbox_manager as _sbm  # noqa: E402
+from conftest import bare_job as _bare_job  # noqa: E402
+
+
+@pytest.mark.skipif(not _sbm.seven_zip_path(), reason="7-Zip needed")
+def test_folder_with_only_an_image_gets_extracted_for_the_sandbox(tmp_path):
+    src = tmp_path / "Photoshop.2026"
+    src.mkdir()
+    with _zipfile.ZipFile(src / "Adobe.Test.iso", "w") as zf:     # 7-Zip detects the format by content, not extension
+        zf.writestr("Adobe 2026/Set-up.exe", b"MZ fake installer")
+        zf.writestr("readme.txt", "x")
+    for ext in ("md5", "sfv"):
+        (src / f"Adobe.Test.{ext}").write_bytes(b"")
+    job = _bare_job(tmp_path)
+    job.state["input_path"] = str(src)
+    root, note = pipeline._prepare_image_input(job)
+    assert root != src and (root / "Adobe 2026" / "Set-up.exe").read_bytes() == b"MZ fake installer"
+    assert "Adobe.Test.iso" in note
+    assert (src / "Adobe.Test.iso").exists()                      # the user's folder is left untouched
+
+
+def test_folder_with_a_runnable_file_is_used_as_is(tmp_path):
+    src = tmp_path / "pkg"
+    src.mkdir()
+    (src / "setup.exe").write_bytes(b"MZ")
+    (src / "extra.iso").write_bytes(b"not used")
+    job = _bare_job(tmp_path)
+    job.state["input_path"] = str(src)
+    root, note = pipeline._prepare_image_input(job)
+    assert root == src and note == ""

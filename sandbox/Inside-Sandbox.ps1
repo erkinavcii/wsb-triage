@@ -477,6 +477,21 @@ function Get-DefenderState {
     } catch { "Defender query failed" }
 }
 
+# Services are compared by NAME: a service that existed before and only changed (start mode / binary path) is
+# reported separately from a newly installed one. Windows itself flips start modes (e.g. BITS -> Auto).
+function Split-ServiceDiff($Before, $After) {
+    $bmap = @{}
+    foreach ($l in @($Before)) { $n = ([string]$l).Split('|')[0].Trim(); if ($n) { $bmap[$n] = [string]$l } }
+    $new = @(); $changed = @()
+    foreach ($l in @($After)) {
+        $n = ([string]$l).Split('|')[0].Trim()
+        if (-not $n) { continue }
+        if (-not $bmap.ContainsKey($n)) { $new += [string]$l }
+        elseif ($bmap[$n] -ne [string]$l) { $changed += "$($bmap[$n]) -> $l" }
+    }
+    [pscustomobject]@{ New = @($new); Changed = @($changed) }
+}
+
 function Get-ServiceList { @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name) | $($_.StartMode) | $($_.PathName)" }) }
 function Get-DriverList { @(Get-CimInstance Win32_SystemDriver -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name) | $($_.PathName)" }) }
 function Get-TaskList {
@@ -764,7 +779,7 @@ function Write-Live([int]$SecondsLeft, [string]$Phase) {
     if (((Get-Date) - $script:LastQuick).TotalSeconds -ge 30) {
         $script:LastQuick = Get-Date
         $script:Quick = [ordered]@{
-            Services = @(Compare-Set $before.Services (Get-ServiceList))
+            Services = @((Split-ServiceDiff $before.Services (Get-ServiceList)).New)
             Tasks    = @(Compare-Set $before.Tasks (Get-TaskList))
             RunKeys  = @(Compare-Set $before.RunKeys @(Get-RunEntries))
             Startup  = @(Compare-Set $before.Startup (Get-StartupList))
@@ -778,6 +793,7 @@ function Write-Live([int]$SecondsLeft, [string]$Phase) {
         Phase              = $Phase
         SecondsLeft        = $SecondsLeft
         Target             = $script:TargetRel
+        TargetNote         = $script:TargetNote
         ProcessCount       = $visible.Count
         SampleProcessCount = @($visible | Where-Object { $_.InTree }).Count
         SuspiciousCount    = @($visible | Where-Object { $_.Suspicious }).Count
@@ -819,19 +835,106 @@ function Get-TargetRank($f) {
     return 5
 }
 
+$RunnableExts = @('.exe', '.msi', '.bat', '.cmd', '.ps1', '.vbs', '.vbe', '.js', '.jse', '.wsf', '.hta', '.scr', '.com', '.lnk', '.pif', '.jar', '.reg', '.dll')
+
+function Find-Runnable([string]$Root) {
+    $c = @(Get-ChildItem -LiteralPath $Root -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $RunnableExts -contains $_.Extension.ToLower() })
+    if (-not $c.Count) { return $null }
+    $c | Sort-Object @{ E = { Get-TargetRank $_ } },
+                     @{ E = { if ($_.Extension -in '.exe', '.msi') { 0 } else { 1 } } },
+                     @{ E = { $_.FullName.Substring($Root.Length).Split('\').Count } },
+                     @{ E = { $_.Length }; Descending = $true } | Select-Object -First 1
+}
+
+# Disc images (.iso/.img) are mounted read-only when the sample has nothing runnable at the top level, e.g. a
+# download folder that holds only "Product.iso" plus checksum files. Mounting straight from the shared folder can
+# fail, so the image is copied to the sandbox disk first in that case.
+$script:MountedRoots = @()
+$script:TargetNote = ''
+function Mount-SampleImage([string]$ImagePath) {
+    foreach ($attempt in 1..2) {
+        $src = $ImagePath
+        if ($attempt -eq 2) {
+            $local = Join-Path $WorkPath ('img_' + [IO.Path]::GetFileName($ImagePath))
+            Log "Copying image to the sandbox disk before mounting: $([IO.Path]::GetFileName($ImagePath))"
+            Set-Status 'Disk goruntusu sandbox diskine kopyalaniyor'
+            try { Copy-Item -LiteralPath $ImagePath -Destination $local -Force -ErrorAction Stop } catch { return "copy failed: $($_.Exception.Message)" }
+            $src = $local
+        }
+        try {
+            $null = Mount-DiskImage -ImagePath $src -StorageType ISO -Access ReadOnly -PassThru -ErrorAction Stop
+            $vol = $null
+            foreach ($i in 1..20) {
+                $vol = Get-DiskImage -ImagePath $src -ErrorAction SilentlyContinue | Get-Volume -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($vol -and $vol.DriveLetter) { break }
+                Start-Sleep -Milliseconds 500
+            }
+            if (-not $vol) {
+                # CD-ROM volumes are not always linked back to the image: look for an unlettered CD-ROM volume
+                $vol = Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.DriveType -eq 'CD-ROM' -and -not $_.DriveLetter } | Select-Object -First 1
+            }
+            Log ("Mount result: volume=" + [bool]$vol + " letter=" + $(if ($vol) { $vol.DriveLetter } else { '' }) + " path=" + $(if ($vol) { $vol.Path } else { '' }))
+            if (-not $vol) { $err = 'mounted but no volume found'; continue }
+            $root = $null
+            if ($vol.DriveLetter) { $root = "$($vol.DriveLetter):\" }
+            else {
+                # Windows Sandbox does not auto-assign letters: pick a free one and assign it with mountvol
+                $used = @(Get-PSDrive -PSProvider FileSystem | ForEach-Object { $_.Name.ToUpper() })
+                $free = @('R','S','T','U','V','W','X','Y','Z') | Where-Object { $used -notcontains $_ } | Select-Object -First 1
+                if ($free -and $vol.Path) {
+                    $mv = & mountvol.exe "${free}:" $vol.Path 2>&1
+                    Log "mountvol ${free}: $($vol.Path) -> exit $LASTEXITCODE $($mv -join ' ')"
+                    if (Test-Path -LiteralPath "${free}:\") { $root = "${free}:\" }
+                }
+                if (-not $root -and $vol.Path -and (Test-Path -LiteralPath $vol.Path)) { $root = $vol.Path }   # \?\Volume{...}\ without a letter
+            }
+            if (-not $root) { $err = 'mounted but no drive letter could be assigned'; continue }
+            $script:MountedRoots += [pscustomobject]@{ Root = $root; Image = [IO.Path]::GetFileName($ImagePath) }
+            Log "Mounted image $([IO.Path]::GetFileName($ImagePath)) as $root (attempt $attempt)"
+            return $null
+        } catch {
+            $err = $_.Exception.Message
+            Log "Mount attempt $attempt failed for $([IO.Path]::GetFileName($ImagePath)): $err"
+        }
+    }
+    return $err
+}
+
 function Resolve-Target {
     if ($cfg.Target) {
         $p = Join-Path $SampleDir $cfg.Target
         if (Test-Path -LiteralPath $p) { return (Get-Item -LiteralPath $p) }
+        foreach ($m in $script:MountedRoots) {
+            $p2 = Join-Path $m.Root $cfg.Target
+            if (Test-Path -LiteralPath $p2) { return (Get-Item -LiteralPath $p2) }
+        }
         Log "Configured target not found: $($cfg.Target) - falling back to auto-pick"
     }
-    $exts = @('.exe', '.msi', '.bat', '.cmd', '.ps1', '.vbs', '.vbe', '.js', '.jse', '.wsf', '.hta', '.scr', '.com', '.lnk', '.pif', '.jar', '.reg', '.dll')
-    $c = @(Get-ChildItem -LiteralPath $SampleDir -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $exts -contains $_.Extension.ToLower() })
-    if (-not $c.Count) { return $null }
-    $c | Sort-Object @{ E = { Get-TargetRank $_ } },
-                     @{ E = { if ($_.Extension -in '.exe', '.msi') { 0 } else { 1 } } },
-                     @{ E = { $_.FullName.Substring($SampleDir.Length).Split('\').Count } },
-                     @{ E = { $_.Length }; Descending = $true } | Select-Object -First 1
+    $hit = Find-Runnable $SampleDir
+    if ($hit) { return $hit }
+    foreach ($m in $script:MountedRoots) {
+        $hit = Find-Runnable $m.Root
+        if ($hit) { return $hit }
+    }
+    return $null
+}
+
+if (-not (Find-Runnable $SampleDir)) {
+    $images = @(Get-ChildItem -LiteralPath $SampleDir -Recurse -File -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension.ToLower() -in '.iso', '.img' } | Sort-Object Length -Descending | Select-Object -First 3)
+    $mountErrors = @()
+    foreach ($im in $images) {
+        if (-not $isAdmin) { $mountErrors += "$($im.Name): not admin"; continue }
+        $e = Mount-SampleImage $im.FullName
+        if ($e) { $mountErrors += "$($im.Name): $e" }
+    }
+    if ($script:MountedRoots.Count) {
+        $script:TargetNote = "Disk goruntusu baglandi: " + (($script:MountedRoots | ForEach-Object { "$($_.Image) -> $($_.Root)" }) -join ', ')
+    } elseif ($mountErrors.Count) {
+        $script:TargetNote = "Disk goruntusu baglanamadi: " + ($mountErrors -join '; ')
+    } elseif (-not $images.Count) {
+        $script:TargetNote = 'Ornekte calistirilabilir dosya ya da disk goruntusu (.iso/.img) yok.'
+    }
 }
 
 # ------------------------------------------------------------------ home-network (LAN) block
@@ -907,8 +1010,13 @@ if ($script:LanBlock.Requested -and $isAdmin -and -not $TestMode) {
 } elseif ($script:LanBlock.Requested) { $script:LanBlock.Status = 'skipped (not admin or test mode)' }
 
 $targetFile = Resolve-Target
-$script:TargetRel = if ($targetFile) { $targetFile.FullName.Substring($SampleDir.Length).TrimStart('\') } else { $null }
-if ($targetFile) { Log "Target: $($targetFile.FullName)" } else { Log 'No runnable file found - only observing the system.' }
+$script:TargetRel = $null
+if ($targetFile) {
+    $mr = $script:MountedRoots | Where-Object { $targetFile.FullName.StartsWith($_.Root, [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
+    if ($mr) { $script:TargetRel = "[$($mr.Image)] " + $targetFile.FullName.Substring($mr.Root.Length) }
+    else { $script:TargetRel = $targetFile.FullName.Substring($SampleDir.Length).TrimStart('\') }
+    Log "Target: $($targetFile.FullName)"
+} else { Log "No runnable file found - only observing the system. $($script:TargetNote)" }
 
 Initialize-Honeyfiles
 
@@ -1456,6 +1564,7 @@ $fwDetail = @(foreach ($r in $fwAdded) {
 
 $result = [ordered]@{
     Target          = $script:TargetRel
+    TargetNote      = $script:TargetNote
     Started         = $startedAt.ToString('yyyy-MM-dd HH:mm:ss')
     Ended           = $endedAt.ToString('yyyy-MM-dd HH:mm:ss')
     StoppedEarly    = $stoppedEarly
@@ -1475,7 +1584,8 @@ $result = [ordered]@{
         UdpEndpoints = @(Compare-Set $before.UdpEndpoints $after.UdpEndpoints)
     }
     Persistence     = [ordered]@{
-        Services         = @(Compare-Set $before.Services $after.Services)
+        Services         = @((Split-ServiceDiff $before.Services $after.Services).New)
+        ServicesChanged  = @((Split-ServiceDiff $before.Services $after.Services).Changed)
         Drivers          = @(Compare-Set $before.Drivers $after.Drivers)
         Tasks            = @(Compare-Set $before.Tasks $after.Tasks)
         RunKeys          = @(Compare-Set $before.RunKeys $after.RunKeys)

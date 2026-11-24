@@ -8,9 +8,9 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
-from fastapi import Body, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -355,12 +355,47 @@ def vt_upload_file(req: VtUploadRequest):
 
 
 # ------------------------------------------------------------------ analysis jobs
+_BATCH_RX = re.compile(r"[a-f0-9]{8,32}")
+
+
+def _safe_relpath(rel: str, fallback: str) -> List[str]:
+    """Browser-supplied relative path -> safe path components (no '..', no drive/root, no reserved characters)."""
+    parts = []
+    for comp in re.split(r"[\\/]+", rel or ""):
+        comp = comp.strip().rstrip(". ")
+        if not comp or comp in (".", ".."):
+            continue
+        comp = re.sub(r'[<>:"|?*\x00-\x1f]', "_", comp)[:120]
+        if comp:
+            parts.append(comp)
+    parts = parts[-20:]
+    return parts or [Path(fallback).name or "yuklenen_dosya.bin"]
+
+
+def _dir_size(d: Path) -> int:
+    return sum(p.stat().st_size for p in d.rglob("*") if p.is_file()) if d.exists() else 0
+
+
 @app.post("/api/upload")
-def upload_file(file: UploadFile = File(...)):
+def upload_file(file: UploadFile = File(...), batch: Optional[str] = Form(None), relpath: Optional[str] = Form(None)):
+    """Single file -> uploads/<name>/<name>. Several files/folders dropped together -> one batch folder
+    uploads/batch_<id>/<relative path>, analysed as one sample (the panel then starts a job on batch_dir)."""
     safe_name = Path(file.filename or "yuklenen_dosya.bin").name
-    dest_dir = UPLOADS_DIR / re.sub(r"[^\w.-]", "_", safe_name)[:60]
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / safe_name
+    batch_dir = None
+    if batch is not None:
+        if not _BATCH_RX.fullmatch(batch):
+            raise HTTPException(400, "Geçersiz yükleme grubu.")
+        batch_dir = (UPLOADS_DIR / f"batch_{batch}").resolve()
+        dest = batch_dir.joinpath(*_safe_relpath(relpath or "", safe_name)).resolve()
+        if batch_dir not in dest.parents:
+            raise HTTPException(400, "Geçersiz dosya yolu.")
+        already = _dir_size(batch_dir)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        already = 0
+        dest_dir = UPLOADS_DIR / re.sub(r"[^\w.-]", "_", safe_name)[:60]
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / safe_name
     written = 0
     try:
         with open(dest, "wb") as buf:
@@ -368,11 +403,16 @@ def upload_file(file: UploadFile = File(...)):
                 written += len(chunk)
                 if written > MAX_UPLOAD_BYTES:      # Content-Length can lie; enforce the real size too
                     raise HTTPException(413, f"Dosya {MAX_UPLOAD_BYTES // 1024 ** 3} GB sınırını aşıyor.")
+                if already + written > MAX_UPLOAD_BYTES:
+                    raise HTTPException(413, f"Birlikte bırakılan dosyaların toplamı {MAX_UPLOAD_BYTES // 1024 ** 3} GB sınırını aşıyor.")
                 buf.write(chunk)
     except BaseException:
         dest.unlink(missing_ok=True)
         raise
-    return {"path": str(dest)}
+    out = {"path": str(dest)}
+    if batch_dir is not None:
+        out["batch_dir"] = str(batch_dir)
+    return out
 
 
 @app.post("/api/jobs")

@@ -162,15 +162,85 @@ async function uploadAndStart(file) {
   } catch (e) { alert('Yükleme hatası: ' + e.message); }
   finally { dz.innerHTML = old; bindDropZone(); }
 }
+// Several files and/or folders dropped together are uploaded into one batch folder and analysed as ONE sample.
+// Nothing is uploaded if any file is over the limit: a partial upload would analyse e.g. only the checksum files
+// next to a huge .iso and could report "clean" for something that was never looked at.
+function readAllEntries(dirEntry) {
+  const reader = dirEntry.createReader();
+  return new Promise((resolve, reject) => {
+    const all = [];
+    const next = () => reader.readEntries(batch => { if (!batch.length) resolve(all); else { all.push(...batch); next(); } }, reject);
+    next();
+  });
+}
+async function collectEntry(entry, prefix, out) {
+  if (entry.isFile) {
+    const file = await new Promise((res, rej) => entry.file(res, rej));
+    out.push({ file, rel: prefix + file.name });
+  } else if (entry.isDirectory) {
+    for (const child of await readAllEntries(entry)) await collectEntry(child, prefix + entry.name + '/', out);
+  }
+}
+async function collectDropped(dt) {
+  const items = Array.from(dt.items || []).filter(i => i.kind === 'file');
+  const entries = items.map(i => (i.webkitGetAsEntry ? i.webkitGetAsEntry() : null));
+  const out = [];
+  if (entries.length && entries.every(Boolean)) {
+    for (const en of entries) await collectEntry(en, '', out);
+  } else {
+    for (const f of Array.from(dt.files || [])) out.push({ file: f, rel: f.name });
+  }
+  return { list: out, hasFolder: entries.some(en => en && en.isDirectory) };
+}
+async function uploadBatchAndStart(list) {
+  if (!list.length) { alert('Bırakılan klasör boş.'); return; }
+  const big = list.filter(x => x.file.size > MAX_UPLOAD);
+  const total = list.reduce((s, x) => s + x.file.size, 0);
+  if (big.length || total > MAX_UPLOAD) {
+    const names = big.map(x => `• ${x.rel} (${(x.file.size / 1024 ** 3).toFixed(1)} GB)`).join('\n');
+    alert(`Bırakılan dosyalar panele yüklenemeyecek kadar büyük (toplam ${(total / 1024 ** 3).toFixed(1)} GB, sınır 4 GB).\n${names}\n\n`
+      + "Hiçbiri yüklenmedi. Klasörü sağdaki '📁 Klasör' butonuyla seçin: kopyalanmadan, olduğu yerden analiz edilir.");
+    return;
+  }
+  const batch = Array.from(crypto.getRandomValues(new Uint8Array(8)), b => b.toString(16).padStart(2, '0')).join('');
+  const dz = $('dropZone'); const old = dz.innerHTML;
+  let batchDir = null;
+  try {
+    for (let i = 0; i < list.length; i++) {
+      const { file, rel } = list[i];
+      dz.innerHTML = `<div class="text-sm text-cyan-300 animate-pulse">${i + 1} / ${list.length} dosya alınıyor: "${esc(rel)}" (${fmtMB(file.size)})</div>`;
+      const fd = new FormData();
+      fd.append('file', file); fd.append('batch', batch); fd.append('relpath', rel);
+      const d = await api('/api/upload', { method: 'POST', body: fd });
+      batchDir = d.batch_dir;
+    }
+    $('pathInput').value = batchDir;
+    await startAnalysis(batchDir);
+  } catch (e) { alert('Yükleme hatası: ' + e.message + '\n\nAnaliz başlatılmadı.'); }
+  finally { dz.innerHTML = old; bindDropZone(); }
+}
+async function handleDrop(dt) {
+  let collected;
+  try { collected = await collectDropped(dt); } catch (e) { alert('Bırakılan dosyalar okunamadı: ' + e.message); return; }
+  const { list, hasFolder } = collected;
+  if (!list.length) return;
+  if (list.length === 1 && !hasFolder) uploadAndStart(list[0].file);
+  else uploadBatchAndStart(list);
+}
 function bindDropZone() {
   const dz = $('dropZone');
   dz.onclick = () => $('fileInput').click();
-  $('fileInput').onchange = e => uploadAndStart(e.target.files[0]);
+  $('fileInput').onchange = e => {
+    const files = Array.from(e.target.files || []);
+    if (files.length === 1) uploadAndStart(files[0]);
+    else if (files.length > 1) uploadBatchAndStart(files.map(f => ({ file: f, rel: f.name })));
+    e.target.value = '';
+  };
 }
 const dz = $('dropZone');
 ['dragenter', 'dragover'].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.add('drop-active'); }));
 ['dragleave', 'drop'].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.remove('drop-active'); }));
-dz.addEventListener('drop', e => { if (e.dataTransfer.files.length) uploadAndStart(e.dataTransfer.files[0]); });
+dz.addEventListener('drop', e => { if (e.dataTransfer) handleDrop(e.dataTransfer); });
 bindDropZone();
 
 // ---------------------------------------------------------------- watcher
@@ -309,12 +379,21 @@ function renderJob(st) {
 
   // verdict
   const v = st.verdict || { level: 'pending', red: [], notes: [] };
-  const vColor = { red: 'rose', yellow: 'amber', green: 'emerald', pending: 'slate' }[v.level];
-  const vTitle = { red: '🚨 Ciddi bulgular var — ana bilgisayarda çalıştırmayın', yellow: '⚠️ İncelenmesi gereken bulgular var', green: '✅ Otomatik kontroller kırmızı bayrak bulmadı (bu, temiz olduğunu kanıtlamaz)', pending: '⏳ Analiz sürüyor...' }[v.level];
+  const vRed = asArr(v.red), vNotes = asArr(v.notes), vCrack = asArr(v.crack);
+  const vColor = { red: 'rose', yellow: 'amber', green: 'emerald', pending: 'slate' }[v.level] || 'slate';
+  const yellowTitle = (!vNotes.length && vCrack.length)
+    ? '🔧 Crack / lisans müdahalesi bulundu — gerçek zararlı sinyali yok'
+    : '⚠️ İncelenmesi gereken bulgular var';
+  const vTitle = { red: '🚨 Ciddi bulgular var — ana bilgisayarda çalıştırmayın', yellow: yellowTitle, green: '✅ Otomatik kontroller kırmızı bayrak bulmadı (bu, temiz olduğunu kanıtlamaz)', pending: '⏳ Analiz sürüyor...' }[v.level] || '';
+  const crackBlock = vCrack.length ? `<div class="mt-2 p-2.5 rounded-lg bg-orange-950/40 border border-orange-500/50 space-y-1">
+        <div class="text-xs font-semibold text-orange-200">🔧 Crack / lisans müdahalesine özgü bulgular (${vCrack.length}) — crack'li yazılımda beklenen davranış; aynı dosyada zararlı sinyali olmadığı için kırmızı sayılmadı</div>
+        ${vCrack.map(x => `<div class="text-xs text-orange-300">• ${esc(x)}</div>`).join('')}
+      </div>` : '';
   $('verdictBox').innerHTML = `<div class="p-4 rounded-xl bg-${vColor}-950/40 border border-${vColor}-500/50 space-y-1.5">
       <div class="font-semibold text-sm text-${vColor}-200">${vTitle}</div>
-      ${v.red.map(x => `<div class="text-xs text-rose-200">• <b>KIRMIZI:</b> ${esc(x)}</div>`).join('')}
-      ${v.notes.map(x => `<div class="text-xs text-amber-200">• ${esc(x)}</div>`).join('')}
+      ${vRed.map(x => `<div class="text-xs text-rose-200">• <b>KIRMIZI:</b> ${esc(x)}</div>`).join('')}
+      ${vNotes.map(x => `<div class="text-xs text-amber-200">• ${esc(x)}</div>`).join('')}
+      ${crackBlock}
     </div>`;
 
   // stages
@@ -401,6 +480,7 @@ function renderSandbox(st) {
     pers = listBox('🍯 Yem dosya (honeyfile) uyarıları', b.HoneyfileAlerts, 'rose')
       + listBox('🛑 Defender değişiklikleri', D.Added, 'rose') + listBox('🛑 Defender tespitleri', D.ThreatsDetected, 'rose')
       + listBox('⚙️ Yeni servisler', P.Services, 'rose') + listBox('🧩 Yeni sürücüler', P.Drivers, 'rose')
+      + listBox('🔁 Ayarı değişen mevcut servisler', P.ServicesChanged, 'amber')
       + listBox('⏰ Zamanlanmış görevler', P.Tasks, 'amber') + listBox('📌 Otomatik başlatma (Run/IFEO)', asArr(P.RunKeys).concat(asArr(P.Startup)), 'amber')
       + listBox('🕵️ Gelişmiş kalıcılık (WMI/COM/AppInit/BITS/PS)', advPers, advPers.length ? 'rose' : 'slate')
       + listBox('📝 hosts (eklenen / silinen)', asArr((b.Hosts || {}).Added).concat(asArr((b.Hosts || {}).Removed).map(x => `[-] ${x}`)), 'amber')

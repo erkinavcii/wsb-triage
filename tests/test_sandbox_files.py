@@ -272,3 +272,46 @@ def test_win11_idle_sandbox_server_daemon_does_not_block_new_sandbox(monkeypatch
 
 
 
+
+
+def test_monitor_mounts_disc_images_when_nothing_is_runnable():
+    ps = (Path(__file__).parent.parent / "sandbox" / "Inside-Sandbox.ps1").read_text(encoding="utf-8")
+    assert "Mount-DiskImage" in ps and "-Access ReadOnly" in ps
+    assert "'.iso', '.img'" in ps
+    assert ps.count("TargetNote") >= 3            # live.json, behavior.json and the fallback message
+
+
+def test_monitor_separates_new_and_changed_services_and_assigns_iso_letters():
+    ps = (Path(__file__).parent.parent / "sandbox" / "Inside-Sandbox.ps1").read_text(encoding="utf-8")
+    assert "function Split-ServiceDiff" in ps and "ServicesChanged" in ps
+    assert "mountvol.exe" in ps          # Windows Sandbox does not auto-assign letters to mounted images
+
+
+def test_status_file_locked_by_the_sandbox_does_not_abort(tmp_path, monkeypatch):
+    import pipeline
+    f = tmp_path / "status.txt"
+    f.write_text("observing")
+    def locked(*a, **k):
+        raise PermissionError(13, "Permission denied", str(f))
+    monkeypatch.setattr(type(f), "read_text", locked)
+    assert pipeline._read_text_quiet(f) == ""
+
+
+def test_sandbox_is_closed_when_observation_fails(tmp_path, monkeypatch):
+    """An exception after launch must still close the sandbox, or every later analysis is refused."""
+    import pipeline
+    import sandbox_manager as sbm
+    from conftest import bare_job
+    job = bare_job(tmp_path)
+    (job.case_dir / "input" / "setup.exe").write_bytes(b"MZ")
+    stopped = []
+    monkeypatch.setattr(sbm, "windows_sandbox_available", lambda: True)
+    monkeypatch.setattr(sbm, "sandbox_state", lambda: False)
+    monkeypatch.setattr(sbm, "launch_sandbox", lambda wsb: "sid-1")
+    monkeypatch.setattr(sbm, "stop_sandbox", lambda sid=None: stopped.append(sid))
+    def boom(*a, **k):
+        raise PermissionError(13, "Permission denied", "status.txt")
+    monkeypatch.setattr(pipeline, "_observe_sandbox_loop", boom)
+    with pytest.raises(PermissionError):
+        pipeline.stage_sandbox(job)
+    assert stopped == ["sid-1"]

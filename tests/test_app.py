@@ -472,3 +472,36 @@ def test_f7_intel_config_circl_tf_and_sandbox_fake_net_api(client, tmp_path, mon
         assert elem_id in html_txt and elem_id in js_txt
 
 
+
+
+# ---------------------------------------------------------------- several files / folders dropped together
+def test_batch_upload_keeps_structure_and_stays_inside(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(app_module, "UPLOADS_DIR", tmp_path / "uploads")
+    (tmp_path / "uploads").mkdir()
+    batch = "a1b2c3d4e5f60718"
+    r1 = client.post("/api/upload", files={"file": ("Set-up.exe", b"MZ fake")},
+                     data={"batch": batch, "relpath": "Photoshop/Adobe 2026/Set-up.exe"})
+    r2 = client.post("/api/upload", files={"file": ("x.md5", b"")},
+                     data={"batch": batch, "relpath": "../../../../Windows/evil.md5"})
+    assert r1.status_code == 200 and r2.status_code == 200, (r1.text, r2.text)
+    root = tmp_path / "uploads" / f"batch_{batch}"
+    assert r1.json()["batch_dir"] == str(root.resolve())
+    assert (root / "Photoshop" / "Adobe 2026" / "Set-up.exe").read_bytes() == b"MZ fake"
+    assert (root / "Windows" / "evil.md5").exists()            # '..' stripped: lands inside the batch folder
+    assert not (tmp_path / "Windows").exists()
+
+
+def test_batch_upload_rejects_bad_batch_id(client):
+    r = client.post("/api/upload", files={"file": ("a.txt", b"x")}, data={"batch": "../../x", "relpath": "a.txt"})
+    assert r.status_code == 400
+
+
+def test_batch_total_size_limit(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(app_module, "UPLOADS_DIR", tmp_path / "uploads")
+    (tmp_path / "uploads").mkdir()
+    monkeypatch.setattr(app_module, "MAX_UPLOAD_BYTES", 1000)   # each request (~850 B incl. multipart) passes the header check
+    batch = "0011223344556677"
+    assert client.post("/api/upload", files={"file": ("a.bin", b"x" * 600)}, data={"batch": batch, "relpath": "a.bin"}).status_code == 200
+    r = client.post("/api/upload", files={"file": ("b.bin", b"x" * 600)}, data={"batch": batch, "relpath": "b.bin"})
+    assert r.status_code == 413
+    assert not (tmp_path / "uploads" / f"batch_{batch}" / "b.bin").exists()

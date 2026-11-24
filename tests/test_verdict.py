@@ -648,8 +648,11 @@ def test_f7_memory_findings_fakenet_threatfox_circl_in_verdict_ioc_and_compare(t
     spoof_job.state["static"] = [{"rel": "known.dll", "risk_score": 30, "signature": {"status": "HashMismatch"},
                                   "spoof_flags": [{"type": "vendor_impersonation", "severity": "high", "reason": "Sahte üretici"}]}]
     pipeline.compute_verdict(spoof_job)
-    assert spoof_job.state["verdict"]["level"] == "red"
-    assert any("HashMismatch" in n for n in spoof_job.state["verdict"]["notes"])
+    # vendor impersonation + broken signature with no malware signal = crack/license category (orange), but a
+    # known-good (NSRL) hash must never turn such a file green
+    assert spoof_job.state["verdict"]["level"] != "green"
+    assert any("Sahte üretici" in n for n in spoof_job.state["verdict"]["crack"])
+    assert any("HashMismatch" in n for n in spoof_job.state["verdict"]["crack"])
 
     # Report & IOC extraction
     pipeline.write_report(job)
@@ -714,6 +717,7 @@ def test_win11_wsb_idle_isolation_service_and_cbs_webview_noise_filtered(tmp_pat
     j_clean.state["network"] = {"dns": [], "sni": [], "http": [], "ips": [], "total_packets": 10}
     j_clean.state["vt"] = [{"rel": "sample.sfv", "status": "VT'de kayıtlı", "result": {"stats": {"malicious": 0, "suspicious": 0}, "total": 60, "engines": []}}]
     j_clean.state["behavior"] = pipeline.sanitize_sandbox_json({
+        "Target": "sample.exe",   # a sample did run; this test is about filtering Windows Sandbox noise
         "Persistence": {
             "Services": [r"IsolationSession | Manual | C:\Windows\system32\svchost.exe -k IsolationSession -p"],
         },
@@ -743,3 +747,100 @@ def test_win11_wsb_idle_isolation_service_and_cbs_webview_noise_filtered(tmp_pat
 
 
 
+
+
+# ---------------------------------------------------------------- nothing executed in the sandbox
+def test_sandbox_with_no_target_is_not_green(tmp_path):
+    job = bare_job(tmp_path)
+    job.state["status"] = "done"
+    for k in ("extract", "inventory", "static", "vt", "sandbox", "report"):
+        job.state["stages"][k]["status"] = "done"
+    job.state["behavior"] = pipeline.sanitize_sandbox_json({"Target": None, "TargetNote": "Disk goruntusu baglanamadi: x.iso: access denied"})
+    pipeline.compute_verdict(job)
+    v = job.state["verdict"]
+    assert v["level"] != "green"
+    assert "Sandbox" in v["not_run"]
+    assert any("çalıştırılacak dosya bulunamadı" in n and "baglanamadi" in n for n in v["notes"])
+
+
+# ---------------------------------------------------------------- crack / license tampering category
+def _static_entry(rel, *, spoof=False, license_script=False, malware_yara=False):
+    st = {"rel": rel, "signature": {"status": "NotSigned"}, "risk_score": 40, "yara_matches": [],
+          "string_findings": [], "format_findings": [], "spoof_flags": []}
+    if spoof:
+        st["spoof_flags"].append({"type": "vendor_impersonation", "severity": "high",
+                                  "reason": "Sahte üretici kimliği şüphesi: 'Adobe Inc.' ama imzasız"})
+    if license_script:
+        st["format_findings"].append({"category": "Kurulum / Lisans Müdahale Betiği", "severity": "high",
+                                      "description": "sc stop AGSService, schtasks /delete"})
+        st["yara_matches"].append({"rule": "SafeBox_License_Service_Tamper", "severity": "medium", "description": "license"})
+    if malware_yara:
+        st["yara_matches"].append({"rule": "SafeBox_Credential_Stealer_Browser_Targets", "severity": "critical", "description": "stealer"})
+    return st
+
+
+def test_crack_typical_findings_are_their_own_category(tmp_path):
+    job = bare_job(tmp_path)
+    job.state["static"] = [_static_entry("Set-up.exe", spoof=True), _static_entry("RunOnce.cmd", license_script=True)]
+    job.state["behavior"] = pipeline.sanitize_sandbox_json({"Hosts": {"Added": ["127.0.0.1 lm.licenses.adobe.com"]},
+                                                           "Firewall": {"Added": ["Block Adobe"]}, "Target": "Set-up.exe"})
+    pipeline.compute_verdict(job)
+    v = job.state["verdict"]
+    assert v["red"] == [], v["red"]
+    assert v["level"] == "yellow"
+    text = " ".join(v["crack"])
+    for needle in ("Sahte üretici", "Lisans Müdahale", "License_Service_Tamper", "hosts", "güvenlik duvarı"):
+        assert needle in text
+
+
+def test_crack_disguise_does_not_hide_real_malware(tmp_path):
+    """The same file also shows a stealer rule -> its crack-looking findings stay red too."""
+    job = bare_job(tmp_path)
+    job.state["static"] = [_static_entry("Set-up.exe", spoof=True, license_script=True, malware_yara=True)]
+    pipeline.compute_verdict(job)
+    v = job.state["verdict"]
+    assert v["level"] == "red"
+    red = " ".join(v["red"])
+    assert "Sahte üretici" in red and "Lisans Müdahale" in red and "Credential_Stealer" in red
+    assert not v["crack"]
+
+
+def test_defender_changes_stay_red_even_with_crack_findings(tmp_path):
+    job = bare_job(tmp_path)
+    job.state["static"] = [_static_entry("RunOnce.cmd", license_script=True)]
+    job.state["behavior"] = pipeline.sanitize_sandbox_json({"Defender": {"Added": ["ExclusionPath: C:\Program Files\Adobe"]},
+                                                           "Target": "Set-up.exe"})
+    pipeline.compute_verdict(job)
+    assert job.state["verdict"]["level"] == "red"
+
+
+# ---------------------------------------------------------------- Windows' own service/BITS changes are not red
+def test_service_start_mode_change_and_windows_bits_job_are_not_red(tmp_path):
+    job = bare_job(tmp_path)
+    job.state["behavior"] = pipeline.sanitize_sandbox_json({
+        "Target": "Set-up.exe",
+        "Persistence": {
+            "ServicesChanged": [
+                r"BITS | Manual | C:\Windows\System32\svchost.exe -k netsvcs -p -> BITS | Auto | C:\Windows\System32\svchost.exe -k netsvcs -p",
+                r"RemoteRegistry | Disabled | C:\Windows\system32\svchost.exe -k localService -p -> RemoteRegistry | Auto | C:\Windows\system32\svchost.exe -k localService -p",
+            ],
+            "BitsJobs": ["Font Download | Download | TransientError | https://fs.microsoft.com/fs/windows/config.json"],
+        }})
+    pipeline.compute_verdict(job)
+    v = job.state["verdict"]
+    assert v["red"] == [], v["red"]
+    mode_notes = [n for n in v["notes"] if "başlatma türü değişti" in n]
+    assert mode_notes and "RemoteRegistry" in mode_notes[0] and "BITS" not in mode_notes[0]   # BITS flip = Windows Sandbox noise
+
+
+def test_service_binary_swap_and_foreign_bits_job_stay_red(tmp_path):
+    job = bare_job(tmp_path)
+    job.state["behavior"] = pipeline.sanitize_sandbox_json({
+        "Target": "Set-up.exe",
+        "Persistence": {
+            "ServicesChanged": [r"BITS | Manual | C:\Windows\System32\svchost.exe -k netsvcs -p -> BITS | Auto | C:\Users\Public\evil.exe"],
+            "BitsJobs": ["Updater | Download | Transferring | https://evil-c2.xyz/payload.bin,https://fs.microsoft.com/a"],
+        }})
+    pipeline.compute_verdict(job)
+    red = " ".join(job.state["verdict"]["red"])
+    assert "servis ele geçirme" in red and "BITS" in red

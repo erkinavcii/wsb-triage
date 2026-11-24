@@ -48,12 +48,12 @@
     <!-- YENİ ANALİZ -->
     <section class="grid grid-cols-1 lg:grid-cols-3 gap-6">
       <div id="dropZone" class="glass-card rounded-2xl p-6 border-2 border-dashed border-slate-700 hover:border-cyan-500/60 transition flex flex-col items-center justify-center text-center cursor-pointer">
-        <input type="file" id="fileInput" class="hidden" />
+        <input type="file" id="fileInput" class="hidden" multiple />
         <div class="w-12 h-12 rounded-2xl bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center text-cyan-400 mb-3">
           <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/></svg>
         </div>
         <h3 class="text-sm font-semibold text-white">Dosyayı buraya bırak</h3>
-        <p class="text-xs text-slate-400 mt-1">.exe, .msi, .zip, .rar, .7z... Bırakınca sağdaki ayarlarla analiz hemen başlar.</p>
+        <p class="text-xs text-slate-400 mt-1">.exe, .msi, .zip, .rar, .7z... Birden fazla dosya ya da klasör de bırakabilirsin: hepsi tek analiz olarak incelenir.</p>
         <p class="text-[11px] text-slate-500 mt-2">Birkaç GB'lık kurulumlar ve çok parçalı arşivler için sağdan yol seçin. Seçilen klasör kopyalanmaz, sandbox'a salt okunur bağlanır.</p>
       </div>
 
