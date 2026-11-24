@@ -193,3 +193,134 @@ def test_analyzer_scan_path_blocks_zip_slip(tmp_path):
     with pytest.raises(ValueError, match="güvenli olmayan yol"):
         analyzer.scan_path(str(bad_zip))
 
+
+def test_folder_with_small_nested_archive_unpacks_to_unpacked_dir_only(tmp_path, run_job):
+    pkg = tmp_path / "InstallFolder"
+    pkg.mkdir()
+    (pkg / "readme.txt").write_text("info", encoding="utf-8")
+    nested = pkg / "AdobeUnlicensedPopupBlocker.zip"
+    with zipfile.ZipFile(nested, "w") as zf:
+        zf.writestr("blocker/RunOnce.cmd", "@echo off\nsc stop AGMService\n")
+        zf.writestr("blocker/install.pimx", "<Installer/>")
+
+    before_names = sorted(p.name for p in pkg.iterdir())
+    job = run_job(pkg)
+    assert job.state["stages"]["extract"]["status"] == "done"
+    # Never write inside the user's source folder
+    assert sorted(p.name for p in pkg.iterdir()) == before_names
+    assert job.unpacked_dir.is_dir()
+    extracted_names = {p.name for p in job.unpacked_dir.rglob("*") if p.is_file()}
+    assert "RunOnce.cmd" in extracted_names
+    assert "install.pimx" in extracted_names
+
+
+def test_large_nested_archive_selective_unpack_and_scoring(tmp_path, run_job, unsigned_exe):
+    pkg = tmp_path / "PhotoshopFolder"
+    pkg.mkdir()
+    # Build a > 32 MB ZIP (ZIP_STORED) simulating a large ISO/Core archive with junk assets + high-signal payloads
+    big_zip = pkg / "AdobePhotoshop27-Core_x64.zip"
+    ps_exe = tmp_path / "Photoshop.exe"
+    unsigned_exe(ps_exe)
+    with zipfile.ZipFile(big_zip, "w", compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr("Adobe/CameraRawProfile/CameraRawProfile.dat", b"\x00" * (33 * 1024 * 1024))
+        zf.writestr("Adobe/Photoshop.exe", ps_exe.read_bytes())
+        zf.writestr("Adobe/RunOnce.cmd", "@echo off\nsc delete AGSService\n")
+        zf.writestr("Adobe/Patch_Photoshop.exe_.log", "Patching amtlib.dll")
+        zf.writestr("Adobe/setup.pimx", "<pimx/>")
+        zf.writestr("Adobe/ui/jquery.min.js", "/*! jQuery */")
+
+    job = run_job(pkg)
+    assert job.state["stages"]["extract"]["status"] == "done"
+    extracted_names = {p.name for p in job.unpacked_dir.rglob("*") if p.is_file()}
+    assert "Photoshop.exe" in extracted_names
+    assert "RunOnce.cmd" in extracted_names
+    assert "setup.pimx" in extracted_names
+    assert "Patch_Photoshop.exe_.log" in extracted_names
+    # Large non-executable junk & boilerplate JS are NOT extracted
+    assert "CameraRawProfile.dat" not in extracted_names
+    assert "jquery.min.js" not in extracted_names
+
+    # Verify inventory config_flag, scoring, and A1 _uploadable privacy guard
+    inv = pipeline._load_inventory(job)
+    by_name = {pipeline.Path(r["rel"]).name: r for r in inv["files"]}
+    assert by_name["setup.pimx"]["config_flag"] is True
+    assert by_name["Patch_Photoshop.exe_.log"]["config_flag"] is True
+    assert pipeline._candidate_score(by_name["setup.pimx"]) >= 45
+    assert pipeline._uploadable(by_name["setup.pimx"], inv) is False
+    assert pipeline._uploadable(by_name["Patch_Photoshop.exe_.log"], inv) is False
+    assert pipeline._uploadable(by_name["Photoshop.exe"], inv) is True
+
+    # Vendor JS down-ranking vs real EXE/script
+    js_rec = {"rel": "ui/jquery.min.js", "size": 1000, "sha256": "a" * 64, "is_pe": False, "is_script": True,
+              "is_doc": False, "config_flag": False, "spoof_flag": False, "name_flag": False, "sig": None, "missing": False}
+    exe_rec = {"rel": "app/Photoshop.exe", "size": 1000, "sha256": "b" * 64, "is_pe": True, "is_script": False,
+               "is_doc": False, "config_flag": False, "spoof_flag": False, "name_flag": False, "sig": None, "missing": False}
+    assert pipeline._candidate_score(js_rec) < pipeline._candidate_score(exe_rec)
+
+
+def test_select_large_archive_entries_caps_and_deprioritizes():
+    entries = [{"clean": "assets/CameraRawProfile.zip", "list_path": "assets/CameraRawProfile.zip", "size": 200 * 1024 * 1024},
+               {"clean": "products/Core_x64.zip", "list_path": "products/Core_x64.zip", "size": 200 * 1024 * 1024},
+               {"clean": "runtime/node.exe", "list_path": "runtime/node.exe", "size": 70 * 1024 * 1024},
+               {"clean": "Photoshop.exe", "list_path": "Photoshop.exe", "size": 5 * 1024 * 1024}]
+    for i in range(45):
+        entries.append({"clean": f"bin/tool_{i}.exe", "list_path": f"bin/tool_{i}.exe", "size": 1024})
+    sel = pipeline._select_large_archive_entries(entries, depth=0, max_depth=2, free_bytes=20 * 1024 ** 3)
+    names = [s["clean"] for s in sel]
+    assert len(sel) == 40
+    assert "products/Core_x64.zip" in names
+    assert "assets/CameraRawProfile.zip" not in names
+    assert "Photoshop.exe" in names
+    assert "runtime/node.exe" not in names  # pushed out beyond top 40
+
+
+def test_select_large_archive_manifests_never_starve_exes_or_large_core_archive():
+    entries = [
+        {"clean": f"Adobe 2026/packages/ACC64/Pkg{i}/Pkg{i}.pimx", "list_path": f"Adobe 2026/packages/ACC64/Pkg{i}/Pkg{i}.pimx", "size": 4096}
+        for i in range(45)
+    ] + [
+        {"clean": f"Adobe 2026/products/PHSP/AdobePhotoshop27-fr_{i}_x64.zip", "list_path": f"Adobe 2026/products/PHSP/AdobePhotoshop27-fr_{i}_x64.zip", "size": 5 * 1024 * 1024}
+        for i in range(25)
+    ] + [
+        {"clean": "Adobe 2026/products/PHSP/AdobePhotoshop27-en_US_x64.zip", "list_path": "Adobe 2026/products/PHSP/AdobePhotoshop27-en_US_x64.zip", "size": 5 * 1024 * 1024},
+        {"clean": "Adobe 2026/products/PHSP/AdobePhotoshop27-SuperCafModels.zip", "list_path": "Adobe 2026/products/PHSP/AdobePhotoshop27-SuperCafModels.zip", "size": 680 * 1024 * 1024},
+        {"clean": "Adobe 2026/Set-up.exe", "list_path": "Adobe 2026/Set-up.exe", "size": 7 * 1024 * 1024},
+        {"clean": "autoplay.exe", "list_path": "autoplay.exe", "size": 2 * 1024 * 1024},
+        {"clean": "Adobe 2026/products/UNPP/AdobeUnlicensedPopupBlocker.zip", "list_path": "Adobe 2026/products/UNPP/AdobeUnlicensedPopupBlocker.zip", "size": 4096},
+        {"clean": "Adobe 2026/products/PHSP/AdobePhotoshop27-Core_x64.zip", "list_path": "Adobe 2026/products/PHSP/AdobePhotoshop27-Core_x64.zip", "size": int(2.87 * 1024 ** 3)},
+    ]
+    sel = pipeline._select_large_archive_entries(entries, depth=0, max_depth=2, free_bytes=20 * 1024 ** 3)
+    names = [s["clean"] for s in sel]
+    assert "Adobe 2026/Set-up.exe" in names
+    assert "autoplay.exe" in names
+    assert "Adobe 2026/products/UNPP/AdobeUnlicensedPopupBlocker.zip" in names
+    assert "Adobe 2026/products/PHSP/AdobePhotoshop27-Core_x64.zip" in names
+    assert "Adobe 2026/products/PHSP/AdobePhotoshop27-SuperCafModels.zip" not in names
+
+    # Non-executable *.LICENSE.txt / .exv / .json matching NAME_RX must not enter tier_scripts or outrank EXEs/scripts
+    core_entries = [
+        {"clean": f"1/Application/UXP/dist/chunk_{i}.js.LICENSE.txt", "list_path": f"1/Application/UXP/dist/chunk_{i}.js.LICENSE.txt", "size": 2048}
+        for i in range(45)
+    ] + [
+        {"clean": f"1/Application/Required/tools/patchTool-{i}.exv", "list_path": f"1/Application/Required/tools/patchTool-{i}.exv", "size": 1024}
+        for i in range(10)
+    ] + [
+        {"clean": "1/Application/Photoshop.exe", "list_path": "1/Application/Photoshop.exe", "size": 200 * 1024 * 1024},
+        {"clean": "1/Application/Patch_Photoshop.exe_.log", "list_path": "1/Application/Patch_Photoshop.exe_.log", "size": 122},
+    ]
+    core_sel = pipeline._select_large_archive_entries(core_entries, depth=1, max_depth=2, free_bytes=20 * 1024 ** 3)
+    core_names = [s["clean"] for s in core_sel]
+    assert "1/Application/Photoshop.exe" in core_names
+    assert "1/Application/Patch_Photoshop.exe_.log" in core_names
+    assert not any(n.endswith((".txt", ".exv")) for n in core_names)
+
+    txt_rec = {"rel": "8530.js.LICENSE.txt", "size": 1000, "sha256": "a" * 64, "is_pe": False, "is_script": False,
+               "is_doc": False, "config_flag": False, "spoof_flag": False, "name_flag": True, "sig": None, "missing": False}
+    cmd_rec = {"rel": "RunOnce.cmd", "size": 600, "sha256": "b" * 64, "is_pe": False, "is_script": True,
+               "is_doc": False, "config_flag": True, "spoof_flag": False, "name_flag": False, "sig": None, "missing": False}
+    pe_rec = {"rel": "Set-up.exe", "size": 7000000, "sha256": "c" * 64, "is_pe": True, "is_script": False,
+              "is_doc": False, "config_flag": False, "spoof_flag": False, "name_flag": False, "sig": {"status": "NotSigned"}, "missing": False}
+    assert pipeline._candidate_score(txt_rec) < pipeline._candidate_score(pe_rec) < pipeline._candidate_score(cmd_rec)
+
+
+

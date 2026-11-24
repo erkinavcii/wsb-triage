@@ -441,3 +441,34 @@ def test_static_frontend_strict_csp_and_css_completeness():
         pat = r"\." + re.escape(cls) + r"(?=[\s,{:\.\>\[])"
         assert re.search(pat, norm_css), f"CSS class missing from static/styles.css: {cls}"
 
+
+def test_f7_intel_config_circl_tf_and_sandbox_fake_net_api(client, tmp_path, monkeypatch):
+    import vt_client
+    from conftest import bare_job
+
+    monkeypatch.setattr(vt_client, "CONFIG_PATH", tmp_path / "cfg.json")
+    r_cfg = client.post("/api/intel/config", json={"circl_enabled": True, "tf_enabled": True})
+    assert r_cfg.status_code == 200
+    assert r_cfg.json()["circl_enabled"] is True
+    assert r_cfg.json()["tf_enabled"] is True
+
+    st = client.get("/api/system-status").json()
+    assert st["circl_enabled"] is True
+    assert st["tf_enabled"] is True
+
+    job = bare_job(tmp_path / "sb_fakenet")
+    job.save()
+    monkeypatch.setattr(pipeline, "get_job", lambda cid: job if cid == job.id else None)
+    seen = {}
+    monkeypatch.setattr(pipeline, "start_sandbox_later", lambda j, overrides=None: seen.update({"overrides": overrides}))
+    r_sb = client.post(f"/api/jobs/{job.id}/sandbox", json={"fake_net": True, "network": False})
+    assert r_sb.status_code == 200
+    assert seen["overrides"]["fake_net"] is True
+    assert seen["overrides"]["network"] is False
+
+    html_txt = (pipeline.BASE_DIR / "static" / "index.html").read_text(encoding="utf-8")
+    js_txt = (pipeline.BASE_DIR / "static" / "app.js").read_text(encoding="utf-8")
+    for elem_id in ("chkCirclEnabled", "chkTfEnabled", "optFakeNet", "sbModFakeNet"):
+        assert elem_id in html_txt and elem_id in js_txt
+
+

@@ -1,4 +1,5 @@
 import html
+import inspect
 import json
 import os
 import re
@@ -141,6 +142,8 @@ class IntelConfigRequest(BaseModel):
     mb_api_key: Optional[str] = None
     ha_api_key: Optional[str] = None
     mb_enabled: Optional[bool] = None
+    circl_enabled: Optional[bool] = None
+    tf_enabled: Optional[bool] = None
     clear_vt: bool = False
     clear_mb: bool = False
     clear_ha: bool = False
@@ -180,6 +183,7 @@ class JobRequest(BaseModel):
     memory_mb: Optional[int] = 4096
     run_as_standard_user: Optional[bool] = False
     seed_honeyfiles: Optional[bool] = True
+    fake_net: Optional[bool] = False
     sandbox_backend: Optional[str] = "wsb"
     vbox_vm: Optional[str] = ""
     vbox_snapshot: Optional[str] = ""
@@ -198,6 +202,7 @@ class SandboxStartRequest(BaseModel):
     simulate_user: Optional[bool] = None
     run_as_standard_user: Optional[bool] = None
     seed_honeyfiles: Optional[bool] = None
+    fake_net: Optional[bool] = None
     sandbox_backend: Optional[str] = None
     vbox_vm: Optional[str] = None
     vbox_snapshot: Optional[str] = None
@@ -265,8 +270,10 @@ def system_status():
     caps["vt_api_masked"] = _mask_key(key)
     caps["procmon"] = any((BASE_DIR / "sandbox" / n).exists() for n in ("Procmon64.exe", "Procmon.exe"))
     caps["yara"] = yara_scanner.rules_status()
-    icfg = intel_client.get_intel_config()
+    icfg = pipeline._get_intel_config()
     caps["mb_enabled"] = icfg["mb_enabled"]
+    caps["circl_enabled"] = bool(icfg.get("circl_enabled", False))
+    caps["tf_enabled"] = bool(icfg.get("tf_enabled", False))
     caps["mb_api_configured"] = bool(icfg["mb_api_key"])
     caps["mb_api_masked"] = _mask_key(icfg["mb_api_key"])
     caps["ha_api_configured"] = bool(icfg["ha_api_key"])
@@ -290,15 +297,29 @@ def save_intel_config(req: IntelConfigRequest):
         vt_client.set_api_key(req.vt_api_key.strip())
     mb_val = "" if req.clear_mb else (req.mb_api_key.strip() if req.mb_api_key and req.mb_api_key.strip() else None)
     ha_val = "" if req.clear_ha else (req.ha_api_key.strip() if req.ha_api_key and req.ha_api_key.strip() else None)
-    icfg = intel_client.set_intel_config(
-        mb_api_key=mb_val,
-        ha_api_key=ha_val,
-        mb_enabled=req.mb_enabled,
-    )
+    sig_params = inspect.signature(intel_client.set_intel_config).parameters
+    kwargs = {"mb_api_key": mb_val, "ha_api_key": ha_val, "mb_enabled": req.mb_enabled}
+    fallback_extra = {}
+    if "circl_enabled" in sig_params:
+        kwargs["circl_enabled"] = req.circl_enabled
+    elif req.circl_enabled is not None:
+        fallback_extra["circl_enabled"] = bool(req.circl_enabled)
+    if "tf_enabled" in sig_params:
+        kwargs["tf_enabled"] = req.tf_enabled
+    elif req.tf_enabled is not None:
+        fallback_extra["tf_enabled"] = bool(req.tf_enabled)
+    icfg = intel_client.set_intel_config(**kwargs)
+    if fallback_extra:
+        raw_cfg = vt_client.load_config()
+        raw_cfg.update(fallback_extra)
+        vt_client.save_config(raw_cfg)
+    icfg = pipeline._get_intel_config()
     return {
         "status": "ok",
         "vt_configured": bool(vt_client.get_api_key()),
         "mb_enabled": icfg["mb_enabled"],
+        "circl_enabled": bool(icfg.get("circl_enabled", False)),
+        "tf_enabled": bool(icfg.get("tf_enabled", False)),
         "mb_configured": bool(icfg["mb_api_key"]),
         "ha_configured": bool(icfg["ha_api_key"]),
     }
@@ -308,7 +329,14 @@ def save_intel_config(req: IntelConfigRequest):
 def intel_query_hash(sha256: str):
     if not re.fullmatch(r"[0-9a-fA-F]{64}", sha256):
         raise HTTPException(400, "Geçersiz SHA-256")
-    return intel_client.query_hash_intel(sha256)
+    icfg = pipeline._get_intel_config()
+    q_params = inspect.signature(intel_client.query_hash_intel).parameters
+    kwargs = {}
+    if "run_circl" in q_params:
+        kwargs["run_circl"] = bool(icfg.get("circl_enabled", False))
+    if "run_tf" in q_params:
+        kwargs["run_tf"] = bool(icfg.get("tf_enabled", False))
+    return intel_client.query_hash_intel(sha256, **kwargs)
 
 
 @app.get("/api/vt/query/{sha256}")

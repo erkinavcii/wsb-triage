@@ -109,6 +109,8 @@
             <input type="checkbox" id="optStdUser" /> Standart kullanıcı yetkisi (admin değil)</label>
           <label class="flex items-center gap-2 bg-slate-900/90 px-3 py-2 rounded-xl border border-slate-700 cursor-pointer" title="Sahte tarayıcı/cüzdan/belge yemleri oluşturup okuma veya şifreleme girişimlerini yakalar.">
             <input type="checkbox" id="optHoneyfiles" checked /> Yem dosyalar (honeyfiles)</label>
+          <label class="flex items-center gap-2 bg-slate-900/90 px-3 py-2 rounded-xl border border-slate-700 cursor-pointer" title="İnternet kapalıyken sandbox içinde sahte DNS (UDP 53) ve HTTP (TCP 80) sunucusu çalıştırıp örneğin bağlanmaya çalıştığı adresleri yakalar.">
+            <input type="checkbox" id="optFakeNet" /> FakeNet (ağ kapalıyken sahte DNS/HTTP tuzağı)</label>
           <label class="flex items-center gap-2 bg-slate-900/90 px-3 py-2 rounded-xl border border-slate-700 cursor-pointer" title="Analiz tamamlandığında veya kırmızı bayrak çıktığında Windows masaüstü bildirimi gönderir.">
             <input type="checkbox" id="optNotify" checked /> Analiz bitince Windows bildirimi göster</label>
         </div>
@@ -240,6 +242,12 @@
         <label class="flex items-center gap-2 text-slate-300 cursor-pointer pt-2">
           <input type="checkbox" id="mbEnabledInput" /> VT anahtarı yoksa veya kota dolarsa MalwareBazaar / HA yedek hash sorgusunu çalıştır
         </label>
+        <label class="flex items-center gap-2 text-slate-300 cursor-pointer">
+          <input type="checkbox" id="chkCirclEnabled" /> CIRCL Hashlookup (NSRL — anahtarsız bilinen temiz yazılım kontrolü)
+        </label>
+        <label class="flex items-center gap-2 text-slate-300 cursor-pointer">
+          <input type="checkbox" id="chkTfEnabled" /> ThreatFox IOC sorgusu (abuse.ch zararlı hash kontrolü)
+        </label>
       </div>
       <div class="flex justify-end gap-2">
         <button data-close="vtModal" class="px-4 py-2 rounded-xl bg-slate-800 text-xs text-slate-300 hover:bg-slate-700">Kapat</button>
@@ -323,6 +331,7 @@
         <label class="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-700 cursor-pointer"><input type="checkbox" id="sbModalSimUser" checked /> Sahte kullanıcı hareketi</label>
         <label class="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-700 cursor-pointer"><input type="checkbox" id="sbModalStdUser" /> Standart kullanıcı</label>
         <label class="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-700 cursor-pointer"><input type="checkbox" id="sbModalHoney" checked /> Yem dosyalar</label>
+        <label class="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-700 cursor-pointer"><input type="checkbox" id="sbModFakeNet" /> FakeNet (ağ kapalıyken sahte DNS/HTTP tuzağı)</label>
       </div>
       <div class="flex justify-end gap-2">
         <button data-close="sandboxModal" class="px-4 py-2 rounded-xl bg-slate-800 text-xs text-slate-300 hover:bg-slate-700">Vazgeç</button>

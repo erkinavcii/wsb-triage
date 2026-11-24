@@ -10,6 +10,7 @@ Each analysis is a "case" folder under cases/:
 """
 import csv
 import hashlib
+import inspect
 import io
 import ipaddress
 import json
@@ -18,13 +19,14 @@ import re
 import shutil
 import struct
 import subprocess
+import tempfile
 import threading
 import time
 import traceback
 import uuid
 import zipfile
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -70,6 +72,7 @@ DEFAULT_OPTIONS = {
     "memory_mb": 4096,
     "run_as_standard_user": False,
     "seed_honeyfiles": True,
+    "fake_net": False,
     "sandbox_backend": "wsb",
     "vbox_vm": "",
     "vbox_snapshot": "",
@@ -464,7 +467,7 @@ def cleanup_jobs(days: int) -> List[str]:
 _SANDBOX_OVERRIDE_KEYS = {
     "target", "target_args", "dll_export", "duration_min", "memory_mb",
     "network", "keep_sandbox_open", "simulate_user", "run_as_standard_user",
-    "seed_honeyfiles", "sandbox_backend", "vbox_vm", "vbox_snapshot", "vbox_user",
+    "seed_honeyfiles", "fake_net", "sandbox_backend", "vbox_vm", "vbox_snapshot", "vbox_user",
 }
 
 
@@ -727,6 +730,412 @@ def _unpack_installers(job: Job, inp: Path) -> int:
     return unpacked_total
 
 
+NESTED_SMALL_ARCHIVE_BYTES = 32 * 1024 * 1024
+NESTED_SMALL_MAX_EXTRACTED_BYTES = 128 * 1024 * 1024
+NESTED_MAX_ARCHIVE_BYTES = 10 * 1024 ** 3
+NESTED_INNER_SMALL_ARCHIVE_BYTES = 64 * 1024 * 1024
+NESTED_LARGE_MAX_ENTRIES = 40
+NESTED_LARGE_MAX_EXTRACTED_BYTES = 650 * 1024 * 1024
+NESTED_TEMP_INNER_ARC_MAX_BYTES = 4 * 1024 ** 3
+NESTED_LARGE_INNER_ARCHIVE_LIMIT = 4
+
+_NESTED_SCRIPT_EXT = {".bat", ".cmd", ".ps1", ".vbs", ".vbe", ".wsf", ".hta", ".reg", ".lnk", ".msi"}
+_NESTED_CONFIG_EXT = {".pimx", ".iss"}
+_NESTED_SIG_NAME_RX = re.compile(r"(runonce|patch.*\.log|unlicensed|blocker|crack|keygen|amtlib)", re.I)
+_NESTED_INNER_ARC_RX = re.compile(r"(phsp|core|unpp|crack|patch|activat|setup|install|app)", re.I)
+_NESTED_ASSET_ARC_RX = re.compile(r"(models|profile|cameraraw|assets|fonts|presets|samples|help|locale|_[a-z]{2}_[A-Z]{2}_)", re.I)
+_NESTED_HIGH_ARC_RX = re.compile(r"(unpp|unlicensed|blocker|crack|patch|activat|keygen|core)", re.I)
+_NESTED_EXE_KW_RX = re.compile(r"(photoshop|setup|install|patch|crack|loader)", re.I)
+_VENDOR_JS_RX = re.compile(r"(^|[\\/])(jquery(\.min)?|bootstrap(\.min)?|carousel)\.js$", re.I)
+_CONFIG_FILE_NAME_RX = re.compile(r"(patch.*\.log|runonce.*)", re.I)
+_NON_EXEC_DATA_EXT = {
+    ".txt", ".md", ".rtf", ".json", ".xml", ".css", ".html", ".htm", ".svg",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".woff", ".woff2", ".ttf",
+    ".exv", ".map", ".yml", ".yaml", ".nfo", ".sfv", ".md5", ".sha",
+}
+
+
+def _clean_archive_entry_path(raw_path: str) -> Optional[str]:
+    """Validates and normalizes an archive member path, returning None on traversal/invalid paths."""
+    if not raw_path or "\x00" in raw_path or "\n" in raw_path or "\r" in raw_path:
+        return None
+    stripped = raw_path.strip().lstrip("/\\")
+    if not stripped:
+        return None
+    parts = [p for p in re.split(r"[/\\]+", stripped) if p and p != "."]
+    if not parts or any(p == ".." for p in parts) or ":" in parts[0]:
+        return None
+    return "/".join(parts)
+
+
+def _parse_7z_slt_entries(stdout: str) -> List[Dict[str, Any]]:
+    """Parses `7z l -slt` stdout into file entries with path and uncompressed size."""
+    body = (stdout or "").split("\n----------", 1)[-1]
+    entries: List[Dict[str, Any]] = []
+    for block in re.split(r"\r?\n\r?\n", body):
+        kv: Dict[str, str] = {}
+        for line in block.splitlines():
+            if " = " in line:
+                k, v = line.split(" = ", 1)
+                kv[k.strip()] = v.strip()
+        raw_path = kv.get("Path", "")
+        if not raw_path:
+            continue
+        is_dir = kv.get("Folder") == "+" or kv.get("Attributes", "").startswith("D")
+        if is_dir:
+            continue
+        clean = _clean_archive_entry_path(raw_path)
+        if not clean:
+            continue
+        try:
+            sz = max(0, int(kv.get("Size") or 0))
+        except ValueError:
+            sz = 0
+        entries.append({
+            "clean": clean,
+            "list_path": raw_path.strip().lstrip("/\\"),
+            "size": sz,
+        })
+    return entries
+
+
+def _select_large_archive_entries(
+    entries: List[Dict[str, Any]], depth: int, max_depth: int, free_bytes: int
+) -> List[Dict[str, Any]]:
+    """Selects up to 40 high-signal entries (capped at 650 MB and DISK_RESERVE_BYTES) from a large archive."""
+    budget_bytes = min(NESTED_LARGE_MAX_EXTRACTED_BYTES, max(0, free_bytes - DISK_RESERVE_BYTES))
+    if budget_bytes <= 0:
+        return []
+
+    tier_scripts: List[tuple] = []
+    tier_small_arcs: List[tuple] = []
+    tier_low_small_arcs: List[tuple] = []
+    tier_large_arcs: List[tuple] = []
+    tier_exes: List[tuple] = []
+    tier_configs: List[tuple] = []
+
+    for e in entries:
+        clean = e["clean"]
+        p = PurePosixPath(clean)
+        name = p.name
+        ext = p.suffix.lower()
+        sz = e["size"]
+        pdepth = len(p.parts)
+
+        if ext in _NESTED_SCRIPT_EXT or _CONFIG_FILE_NAME_RX.search(name) or (
+            ext not in _NON_EXEC_DATA_EXT and ext not in ARCHIVE_EXT and (NAME_RX.search(name) or _NESTED_SIG_NAME_RX.search(name))
+        ):
+            tier_scripts.append(((0 if _NESTED_SIG_NAME_RX.search(name) else 1, pdepth, sz, clean.lower()), e))
+            continue
+
+        if depth < max_depth and ext in ARCHIVE_EXT and not is_later_volume(name) and sz <= NESTED_MAX_ARCHIVE_BYTES:
+            is_asset_or_locale = bool(_NESTED_ASSET_ARC_RX.search(clean)) and not bool(_NESTED_HIGH_ARC_RX.search(clean))
+            if sz <= NESTED_INNER_SMALL_ARCHIVE_BYTES:
+                if is_asset_or_locale:
+                    tier_low_small_arcs.append(((pdepth, sz, clean.lower()), e))
+                else:
+                    tier_small_arcs.append(((0 if _NESTED_HIGH_ARC_RX.search(clean) else (1 if _NESTED_INNER_ARC_RX.search(clean) else 2), pdepth, sz, clean.lower()), e))
+            elif not is_asset_or_locale and _NESTED_INNER_ARC_RX.search(clean):
+                marked = {**e, "_large_inner_arc": True}
+                tier_large_arcs.append(((0 if NAME_RX.search(clean) else 1, 0 if _NESTED_HIGH_ARC_RX.search(clean) else 1, pdepth, sz, clean.lower()), marked))
+            continue
+
+        if ext in {".exe", ".sys"} or (ext == ".dll" and (name.lower() in analyzer.SUSPICIOUS_FILENAMES or NAME_RX.search(name))):
+            is_huge_node = 1 if (name.lower() == "node.exe" and sz > 50 * 1024 * 1024) else 0
+            has_kw = 0 if _NESTED_EXE_KW_RX.search(clean) else 1
+            is_susp_dll = 0 if (ext == ".dll" or NAME_RX.search(name)) else 1
+            tier_exes.append(((is_huge_node, has_kw, is_susp_dll, pdepth, sz, clean.lower()), e))
+            continue
+
+        if ext in _NESTED_CONFIG_EXT:
+            tier_configs.append(((pdepth, sz, clean.lower()), e))
+
+    tier_scripts.sort(key=lambda x: x[0])
+    tier_small_arcs.sort(key=lambda x: x[0])
+    tier_low_small_arcs.sort(key=lambda x: x[0])
+    tier_large_arcs.sort(key=lambda x: x[0])
+    tier_exes.sort(key=lambda x: x[0])
+    tier_configs.sort(key=lambda x: x[0])
+
+    ordered = (
+        [e for _, e in tier_scripts]
+        + [e for _, e in tier_exes[:20]]
+        + [e for _, e in tier_large_arcs[:NESTED_LARGE_INNER_ARCHIVE_LIMIT]]
+        + [e for _, e in tier_small_arcs[:10]]
+        + [e for _, e in tier_exes[20:]]
+        + [e for _, e in tier_configs]
+        + [e for _, e in tier_small_arcs[10:]]
+        + [e for _, e in tier_low_small_arcs[:4]]
+    )
+
+    selected: List[Dict[str, Any]] = []
+    seen_paths: set = set()
+    used_bytes = 0
+    oversized_arc_used = False
+    oversized_arc_bytes = 0
+    for e in ordered:
+        if len(selected) >= NESTED_LARGE_MAX_ENTRIES:
+            break
+        key = e["clean"].lower()
+        if key in seen_paths:
+            continue
+        sz = e["size"]
+        if used_bytes + sz <= budget_bytes:
+            seen_paths.add(key)
+            selected.append(e)
+            used_bytes += sz
+        elif (
+            e.get("_large_inner_arc")
+            and not oversized_arc_used
+            and sz <= NESTED_TEMP_INNER_ARC_MAX_BYTES
+            and (used_bytes + sz) <= max(0, free_bytes - DISK_RESERVE_BYTES - 1024 ** 3)
+        ):
+            seen_paths.add(key)
+            selected.append(e)
+            oversized_arc_used = True
+            oversized_arc_bytes = sz
+    _ = oversized_arc_bytes
+    return selected
+
+
+def _extract_zip_members(
+    zf: zipfile.ZipFile, items: List[tuple], dest_root: Path, pw: str, byte_cap: int
+) -> int:
+    """Streams selected ZipInfo entries into dest_root with zip-slip and total byte guards."""
+    pwd_bytes = pw.encode() if pw else None
+    extracted = 0
+    total_written = 0
+    dest_root.mkdir(parents=True, exist_ok=True)
+    for info, clean in items:
+        target = (dest_root / clean).resolve()
+        if target != dest_root and dest_root not in target.parents:
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with zf.open(info, pwd=pwd_bytes) as src_f, open(target, "wb") as dst_f:
+            while True:
+                chunk = src_f.read(1024 * 1024)
+                if not chunk:
+                    break
+                total_written += len(chunk)
+                if total_written > byte_cap:
+                    break
+                dst_f.write(chunk)
+        extracted += 1
+        if total_written > byte_cap:
+            break
+    return extracted
+
+
+def _extract_7z_selected(job: Job, sz: str, arc: Path, dest_dir: Path, list_paths: List[str], pw: str) -> int:
+    """Extracts only validated relative paths from an archive using 7-Zip @listfile."""
+    if not sz or not list_paths:
+        return 0
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_root = dest_dir.resolve()
+    safe_paths: List[str] = []
+    for lp in list_paths:
+        clean = _clean_archive_entry_path(lp)
+        if not clean:
+            continue
+        target = (dest_root / clean).resolve()
+        if target != dest_root and dest_root not in target.parents:
+            continue
+        stripped = lp.strip().lstrip("/\\")
+        if stripped and "\x00" not in stripped and "\n" not in stripped and "\r" not in stripped:
+            safe_paths.append(stripped)
+    if not safe_paths:
+        return 0
+    tmp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", suffix=".txt", dir=job.case_dir, delete=False
+        ) as tf:
+            tf.write("\n".join(safe_paths) + "\n")
+            tmp_path = Path(tf.name)
+        cmd = [sz, "x", "-y", "-scsUTF-8", f"-p{pw or 'no-password'}", f"-o{dest_dir}", str(arc), f"@{tmp_path}"]
+        subprocess.run(cmd, capture_output=True, text=True, timeout=1800, errors="replace", creationflags=NO_WINDOW)
+        return sum(1 for p in dest_dir.rglob("*") if p.is_file())
+    except Exception as e:
+        job.log(f"Seçici 7-Zip açma hatası ({arc.name}): {e}")
+        return 0
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
+
+def _unpack_small_nested(job: Job, sz: str, arc: Path, dest_dir: Path, pw: str) -> int:
+    """Extracts all files from a small (<= 32 MB) nested archive safely. Returns -1 if unpacked > 128 MB."""
+    if arc.suffix.lower() == ".zip":
+        try:
+            with zipfile.ZipFile(arc) as zf:
+                items: List[tuple] = []
+                total_sz = 0
+                for info in zf.infolist():
+                    if info.is_dir():
+                        continue
+                    clean = _clean_archive_entry_path(info.filename)
+                    if not clean:
+                        job.log(f"İç arşivde güvenli olmayan yol atlandı ({arc.name}): {info.filename}")
+                        return 0
+                    total_sz += max(0, info.file_size)
+                    items.append((info, clean))
+                if not items:
+                    return 0
+                _check_unpacked_size(job, total_sz, arc)
+                if total_sz > NESTED_SMALL_MAX_EXTRACTED_BYTES:
+                    return -1
+                return _extract_zip_members(zf, items, dest_dir, pw, NESTED_SMALL_MAX_EXTRACTED_BYTES)
+        except (NotImplementedError, RuntimeError, zipfile.BadZipFile):
+            if not sz:
+                return 0
+    if not sz:
+        return 0
+    try:
+        lp = subprocess.run(
+            [sz, "l", "-slt", f"-p{pw or 'no-password'}", str(arc)],
+            capture_output=True, text=True, timeout=120, errors="replace", creationflags=NO_WINDOW,
+        )
+    except Exception:
+        return 0
+    if lp.returncode != 0:
+        return 0
+    entries = _parse_7z_slt_entries(lp.stdout or "")
+    if not entries:
+        return 0
+    total_sz = sum(e["size"] for e in entries)
+    _check_unpacked_size(job, total_sz, arc)
+    if total_sz > NESTED_SMALL_MAX_EXTRACTED_BYTES:
+        return -1
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run(
+            [sz, "x", "-y", f"-p{pw or 'no-password'}", f"-o{dest_dir}", str(arc)],
+            capture_output=True, text=True, timeout=600, errors="replace", creationflags=NO_WINDOW,
+        )
+    except Exception as e:
+        job.log(f"Küçük iç arşiv açılamadı ({arc.name}): {e}")
+        return 0
+    return sum(1 for p in dest_dir.rglob("*") if p.is_file())
+
+
+def _unpack_large_nested(
+    job: Job, sz: str, arc: Path, dest_dir: Path, pw: str, depth: int, max_depth: int
+) -> int:
+    """Lists entries of a large (> 32 MB) archive without full extraction and extracts only high-signal targets."""
+    free_bytes = shutil.disk_usage(job.case_dir).free
+    if arc.suffix.lower() == ".zip":
+        try:
+            with zipfile.ZipFile(arc) as zf:
+                entries: List[Dict[str, Any]] = []
+                for info in zf.infolist():
+                    if info.is_dir():
+                        continue
+                    clean = _clean_archive_entry_path(info.filename)
+                    if not clean:
+                        continue
+                    entries.append({"clean": clean, "list_path": info.filename.lstrip("/\\"), "size": max(0, info.file_size), "zip_info": info})
+                selected = _select_large_archive_entries(entries, depth, max_depth, free_bytes)
+                if not selected:
+                    return 0
+                _check_unpacked_size(job, sum(e["size"] for e in selected), arc)
+                byte_cap = NESTED_LARGE_MAX_EXTRACTED_BYTES + sum(
+                    e["size"] for e in selected if e.get("_large_inner_arc") and e["size"] > NESTED_LARGE_MAX_EXTRACTED_BYTES
+                )
+                try:
+                    return _extract_zip_members(
+                        zf, [(e["zip_info"], e["clean"]) for e in selected], dest_dir, pw, byte_cap
+                    )
+                except (NotImplementedError, RuntimeError):
+                    if not sz:
+                        return 0
+                    return _extract_7z_selected(job, sz, arc, dest_dir, [e["list_path"] for e in selected], pw)
+        except zipfile.BadZipFile:
+            if not sz:
+                return 0
+    if not sz:
+        return 0
+    try:
+        lp = subprocess.run(
+            [sz, "l", "-slt", f"-p{pw or 'no-password'}", str(arc)],
+            capture_output=True, text=True, timeout=600, errors="replace", creationflags=NO_WINDOW,
+        )
+    except Exception as e:
+        job.log(f"Büyük arşiv listelenemedi ({arc.name}): {e}")
+        return 0
+    if lp.returncode != 0:
+        return 0
+    entries = _parse_7z_slt_entries(lp.stdout or "")
+    selected = _select_large_archive_entries(entries, depth, max_depth, free_bytes)
+    if not selected:
+        return 0
+    _check_unpacked_size(job, sum(e["size"] for e in selected), arc)
+    return _extract_7z_selected(job, sz, arc, dest_dir, [e["list_path"] for e in selected], pw)
+
+
+def _unpack_nested_archives(job: Job, inp: Path, max_depth: int = 2) -> int:
+    """Scans inp and existing unpacked_dir up to max_depth for nested archives and selectively unpacks them
+    into job.unpacked_dir (never writing into inp, which may be a read-only user folder)."""
+    sz = sbm.seven_zip_path()
+    pw = job.password or ""
+    seen: set = set()
+    unpacked_total = 0
+    counter = 0
+
+    for depth in range(max_depth + 1):
+        roots = [inp, job.unpacked_dir] if depth == 0 else [job.unpacked_dir]
+        cands: List[Path] = []
+        for root in roots:
+            if not root.is_dir():
+                continue
+            for p in root.rglob("*"):
+                if not p.is_file():
+                    continue
+                if p.suffix.lower() not in ARCHIVE_EXT or is_later_volume(p.name):
+                    continue
+                try:
+                    rp = p.resolve()
+                    fsize = p.stat().st_size
+                except OSError:
+                    continue
+                if rp in seen or fsize > NESTED_MAX_ARCHIVE_BYTES:
+                    continue
+                if depth == 0 and p.suffix.lower() == ".cab" and job.unpacked_dir.is_dir():
+                    safe_cab = re.sub(r"[^\w.-]", "_", p.name)[:40]
+                    if any(d.is_dir() and d.name.endswith(f"_{safe_cab}") for d in job.unpacked_dir.iterdir()):
+                        seen.add(rp)
+                        continue
+                seen.add(rp)
+                cands.append(p)
+        if not cands:
+            break
+        cands.sort(key=lambda p: (0 if NAME_RX.search(p.name) else 1, p.stat().st_size, str(p)))
+        for arc in cands:
+            job.check_cancel()
+            counter += 1
+            safe_name = re.sub(r"[^\w.-]", "_", arc.name)[:40]
+            dest = job.unpacked_dir / f"nested_{depth}_{counter}_{safe_name}"
+            fsize = arc.stat().st_size
+            try:
+                if fsize <= NESTED_SMALL_ARCHIVE_BYTES:
+                    n = _unpack_small_nested(job, sz, arc, dest, pw)
+                    if n == -1:
+                        n = _unpack_large_nested(job, sz, arc, dest, pw, depth, max_depth)
+                else:
+                    n = _unpack_large_nested(job, sz, arc, dest, pw, depth, max_depth)
+            except PipelineError as e:
+                job.log(f"İç arşiv atlandı ({arc.name}): {e}")
+                n = 0
+            if n > 0:
+                unpacked_total += n
+                job.log(f"İç arşiv seçici açıldı ({arc.name}, derinlik {depth}): {n} dosya çıkarıldı.")
+            elif dest.exists() and not any(dest.rglob("*")):
+                shutil.rmtree(dest, ignore_errors=True)
+            if depth >= 1 and fsize > NESTED_INNER_SMALL_ARCHIVE_BYTES and job.unpacked_dir.resolve() in arc.resolve().parents:
+                arc.unlink(missing_ok=True)
+                job.log(f"Geçici büyük iç arşiv temizlendi: {arc.name}")
+    return unpacked_total
+
+
 def stage_extract(job: Job) -> None:
     job.stage("extract", "running", "Hazırlanıyor...")
     src = Path(job.state["sample"])
@@ -789,7 +1198,7 @@ def stage_extract(job: Job) -> None:
     count = sum(1 for _ in inp.rglob("*") if _.is_file())
     if count == 0:
         raise PipelineError("Hazırlanan klasörde hiç dosya yok (arşiv boş, şifre yanlış veya antivirüs hepsini silmiş olabilir).")
-    unpacked_count = _unpack_installers(job, inp)
+    unpacked_count = _unpack_installers(job, inp) + _unpack_nested_archives(job, inp)
     msg = f"{count} dosya hazır" + (f" (+ kurulum içi {unpacked_count} dosya çıkarıldı)." if unpacked_count else ".")
     job.stage("extract", "done", msg)
 
@@ -904,6 +1313,7 @@ def stage_inventory(job: Job) -> None:
         rec = {"rel": rel_name, "path": str(p), "size": 0, "sha256": None, "is_pe": False,
                "is_script": p.suffix.lower() in SCRIPT_EXT,
                "is_doc": p.suffix.lower() in DOC_EXT,
+               "config_flag": bool(p.suffix.lower() in {".pimx", ".iss"} or _CONFIG_FILE_NAME_RX.search(p.name)),
                "spoof_flag": False,
                "name_flag": bool(NAME_RX.search(p.name)) or p.name.lower() in analyzer.SUSPICIOUS_FILENAMES,
                "sig": None, "missing": False, "unpacked": is_unpacked}
@@ -967,17 +1377,24 @@ def _candidate_score(r: Dict[str, Any]) -> int:
     if r.get("spoof_flag"):
         score += 120
     if r["name_flag"]:
-        score += 100
+        if r["is_pe"] or r["is_script"] or r.get("is_doc") or r.get("config_flag"):
+            score += 100
+        else:
+            score += 10
     if status == "HashMismatch":
         score += 80
     if r["is_script"]:
         score += 50
+    if r.get("config_flag"):
+        score += 45
     if r["is_pe"] and status != "Valid":
         score += 40
     if r.get("is_doc"):
         score += 30
     if r["rel"].lower().endswith(".exe"):
         score += 10
+    if _VENDOR_JS_RX.search(r["rel"]) and not r["name_flag"] and not r.get("spoof_flag"):
+        score = max(1, score - 45)
     return score
 
 
@@ -1043,29 +1460,59 @@ def _select_vt_picks(job: Job, inv: Dict[str, Any]) -> List[Dict[str, Any]]:
     return list(by_sha.values())[: int(job.opt("max_vt")) + (1 if inv.get("original") else 0)]
 
 
+def _get_intel_config() -> Dict[str, Any]:
+    """Reads intel config with vt_client fallback for circl_enabled/tf_enabled across branches."""
+    icfg = dict(intel_client.get_intel_config())
+    if "circl_enabled" not in icfg or "tf_enabled" not in icfg:
+        raw = vt_client.load_config()
+        icfg.setdefault("circl_enabled", bool(raw.get("circl_enabled", False)))
+        icfg.setdefault("tf_enabled", bool(raw.get("tf_enabled", False)))
+    return icfg
+
+
+def _has_intel_sources() -> bool:
+    if intel_client.has_configured_sources():
+        return True
+    icfg = _get_intel_config()
+    return bool(icfg.get("circl_enabled") or icfg.get("tf_enabled"))
+
+
+def _call_query_hash_intel(sha256: str, run_mb: bool, run_ha: bool, run_circl: bool, run_tf: bool) -> Dict[str, Any]:
+    sig = inspect.signature(intel_client.query_hash_intel)
+    kwargs: Dict[str, Any] = {"run_mb": run_mb, "run_ha": run_ha}
+    if "run_circl" in sig.parameters:
+        kwargs["run_circl"] = run_circl
+    if "run_tf" in sig.parameters:
+        kwargs["run_tf"] = run_tf
+    return intel_client.query_hash_intel(sha256, **kwargs)
+
+
 def _query_extra_intel_for_entries(job: Job, picks: List[Dict[str, Any]], entries: List[Dict[str, Any]], indices: List[int]) -> int:
-    icfg = intel_client.get_intel_config()
-    run_mb = bool(icfg["mb_enabled"] or icfg["mb_api_key"])
-    run_ha = bool(icfg["ha_api_key"])
-    if not (run_mb or run_ha) or not indices:
+    icfg = _get_intel_config()
+    run_mb = bool(icfg.get("mb_enabled") or icfg.get("mb_api_key"))
+    run_ha = bool(icfg.get("ha_api_key"))
+    run_circl = bool(icfg.get("circl_enabled"))
+    run_tf = bool(icfg.get("tf_enabled"))
+    if not (run_mb or run_ha or run_circl or run_tf) or not indices:
         return 0
     hits = 0
     for idx in indices:
         job.check_cancel()
         r, e = picks[idx], entries[idx]
-        job.stage("vt", "running", f"Ek istihbarat (MalwareBazaar/HA) sorgusu: {r['rel']}")
-        res = intel_client.query_hash_intel(r["sha256"], run_mb=run_mb, run_ha=run_ha)
+        job.stage("vt", "running", f"Ek istihbarat (MB/HA/CIRCL/TF) sorgusu: {r['rel']}")
+        res = _call_query_hash_intel(r["sha256"], run_mb=run_mb, run_ha=run_ha, run_circl=run_circl, run_tf=run_tf)
         e["intel"] = res
+        summary = res.get("summary") or ("CIRCL Hashlookup: bilinen temiz (NSRL)" if res.get("known_good") else "")
         if res.get("any_found"):
             hits += 1
             if "kota" in e["status"].lower():
-                e["status"] += f" — {res['summary']}"
+                e["status"] += f" — {summary}"
             else:
-                e["status"] = res["summary"]
+                e["status"] = summary or "Ek istihbaratta kayıtlı"
         elif "kota" in e["status"].lower():
             e["status"] += " (ek istihbarat temiz)"
         elif not e["result"]:
-            e["status"] = "VT/MB/HA'da yok"
+            e["status"] = "VT/ek istihbaratta yok"
         compute_verdict(job)
         job.save()
     return hits
@@ -1073,7 +1520,7 @@ def _query_extra_intel_for_entries(job: Job, picks: List[Dict[str, Any]], entrie
 
 def stage_vt(job: Job) -> None:
     key = vt_client.get_api_key()
-    intel_backup = intel_client.has_configured_sources()
+    intel_backup = _has_intel_sources()
     if not key and not intel_backup:
         job.stage("vt", "skipped", "API anahtarı yok. Sağ üstten anahtar girerseniz bu adım otomatik çalışır.")
         return
@@ -1181,10 +1628,10 @@ def stage_vt(job: Job) -> None:
 
 
 def _check_dropped_files_vt(job: Job, beh: Dict[str, Any]) -> None:
-    """Queries VirusTotal (and MalwareBazaar/Hybrid Analysis fallback) by SHA-256 for dropped executables.
+    """Queries VirusTotal (and MalwareBazaar/Hybrid Analysis/CIRCL/ThreatFox fallback) by SHA-256 for dropped executables.
     Only hash lookup is performed (no uploads, zero data leakage risk)."""
     key = vt_client.get_api_key()
-    intel_backup = intel_client.has_configured_sources()
+    intel_backup = _has_intel_sources()
     if not key and not intel_backup:
         return
     dropped = (beh.get("Files") or {}).get("DroppedHashes") or []
@@ -1218,9 +1665,11 @@ def _check_dropped_files_vt(job: Job, beh: Dict[str, Any]) -> None:
     msg = f"Sandbox içinde bırakılan {len(new_drops)} yeni çalıştırılabilir dosyanın hash'i sorgulanıyor..."
     job.log(msg)
     job.stage("sandbox", "running", msg)
-    icfg = intel_client.get_intel_config() if intel_backup else {}
+    icfg = _get_intel_config() if intel_backup else {}
     run_mb = bool(icfg.get("mb_enabled") or icfg.get("mb_api_key"))
     run_ha = bool(icfg.get("ha_api_key"))
+    run_circl = bool(icfg.get("circl_enabled"))
+    run_tf = bool(icfg.get("tf_enabled"))
     quota = False
     for item in new_drops:
         job.check_cancel()
@@ -1258,13 +1707,14 @@ def _check_dropped_files_vt(job: Job, beh: Dict[str, Any]) -> None:
             need_fallback = True
             entry["status"] = "Sorgulanmadı (VirusTotal kotası doldu)" if quota else "VT anahtarı yok"
 
-        if need_fallback and (run_mb or run_ha):
-            ires = intel_client.query_hash_intel(sha, run_mb=run_mb, run_ha=run_ha)
+        if need_fallback and (run_mb or run_ha or run_circl or run_tf):
+            ires = _call_query_hash_intel(sha, run_mb=run_mb, run_ha=run_ha, run_circl=run_circl, run_tf=run_tf)
             entry["intel"] = ires
             if ires.get("any_found"):
-                entry["status"] = f"{ires['summary']} (bırakılan dosya)"
+                summary = ires.get("summary") or ("CIRCL Hashlookup: bilinen temiz (NSRL)" if ires.get("known_good") else "kayıtlı")
+                entry["status"] = f"{summary} (bırakılan dosya)"
             elif not key:
-                entry["status"] = "MB/HA'da yok (bırakılan dosya)"
+                entry["status"] = "Ek istihbaratta yok (bırakılan dosya)"
 
         job.state["vt"].append(entry)
         compute_verdict(job)
@@ -1367,6 +1817,7 @@ def stage_sandbox(job: Job) -> None:
             "DurationSeconds": duration,
             "CopyMaxMB": COPY_INTO_SANDBOX_MAX_MB,
             "BlockLan": bool(job.opt("network")),
+            "FakeNet": bool(job.opt("fake_net")),
             "SimulateUser": bool(job.opt("simulate_user")),
         })
 
@@ -1523,6 +1974,9 @@ _BOOLS = [("LanBlock", "Requested"), ("LanBlock", "Applied"), ("LanBlock", "Tamp
 _STRS = [("RunMode",), ("Target",), ("Started",), ("Ended",), ("CaptureStatus",), ("LanBlock", "Status")]
 
 
+_CAPPED_STR_LISTS = ("MemoryFindings", "FakeNetRequests", "AutoClicks")
+
+
 def sanitize_sandbox_json(d: Any) -> Optional[Dict[str, Any]]:
     """Coerces live.json / behavior.json to the expected shape. A sample inside the sandbox can write these files,
     so wrong types must not crash the verdict code or reach the panel as something other than plain values."""
@@ -1545,6 +1999,10 @@ def sanitize_sandbox_json(d: Any) -> Optional[Dict[str, Any]]:
         if p is not None:
             v = p[path[-1]]
             p[path[-1]] = [str(x) for x in v if isinstance(x, (str, int, float))][:5000] if isinstance(v, list) else []
+    for key in _CAPPED_STR_LISTS:
+        if key in d:
+            v = d[key]
+            d[key] = [str(x)[:400] for x in v if isinstance(x, (str, int, float))][:200] if isinstance(v, list) else []
     for path in _OBJ_LISTS:
         p = parent(path)
         if p is not None:
@@ -1607,16 +2065,35 @@ def _match(d: str, suffixes) -> bool:
 
 
 def domain_class(d: str) -> str:
-    d = (d or "").lower().rstrip(".")
-    if _match(d, ABUSED):
+    raw = (d or "").strip().lower().rstrip(".")
+    if not raw:
+        return "Yerel (gürültü)"
+    if raw.startswith("[") and "]" in raw:
+        host_only = raw[1:raw.index("]")]
+    elif raw.count(":") == 1:
+        host_only = raw.split(":", 1)[0]
+    else:
+        host_only = raw
+    host_only = host_only.rstrip(".")
+    if not host_only:
+        return "Yerel (gürültü)"
+    if _match(host_only, ABUSED):
         return CLASS_ABUSED
-    if _match(d, ADOBE):
+    if _match(host_only, ADOBE):
         return "Adobe"
-    if _match(d, NOISE):
+    if _match(host_only, NOISE):
         return "Windows/Microsoft (gürültü)"
-    if _match(d, SHARED_CLOUD):
+    if _match(host_only, SHARED_CLOUD):
         return CLASS_CLOUD
-    if d.endswith((".arpa", ".local")) or d == "wpad":
+    ip_obj = _clean_ip(host_only)
+    if ip_obj and (ip_obj.is_multicast or ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_private or ip_obj.is_unspecified):
+        return "Yerel (gürültü)"
+    if (
+        host_only.endswith((".arpa", ".local", ".mshome.net", ".home.arpa", ".internal", ".lan"))
+        or host_only == "wpad"
+        or host_only.startswith("wpad.")
+        or "." not in host_only
+    ):
         return "Yerel (gürültü)"
     return CLASS_UNKNOWN
 
@@ -1818,6 +2295,8 @@ def network_summary(pcap: Path, behavior: Optional[Dict[str, Any]] = None) -> Op
     http_eps: Dict[tuple, set] = {}
     for row in http:
         row += [""] * (6 - len(row))
+        if row[1].strip().upper() in ("M-SEARCH", "NOTIFY") and not row[5].strip():
+            continue
         k = tuple(row[:3])
         ep_ip = (row[3] or row[4]).strip().lower()
         if ep_ip:
@@ -1857,14 +2336,61 @@ SEVERE_RX = re.compile(r"trojan|stealer|backdoor|\brat\b|miner|coinmin|xmrig|red
 TOOL_RX = re.compile(r"hacktool|riskware|crack|keygen|patch|pua|pup|activator|kms", re.I)
 
 
+_FAKENET_FILE_EXT_SKIP = (
+    ".exe", ".dll", ".sys", ".ps1", ".bat", ".cmd", ".vbs", ".js",
+    ".txt", ".log", ".json", ".xml", ".html", ".php", ".asp", ".aspx", ".zip", ".msi", ".arpa",
+)
+_URL_RX = re.compile(r"https?://[^\s\"'<>]+", re.I)
+_HOST_HDR_RX = re.compile(r"\bHost:\s*([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+)", re.I)
+_DOM_TOK_RX = re.compile(r"\b([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+)\b", re.I)
+
+
+def _extract_fakenet_targets(items: List[str]) -> tuple[List[str], List[str]]:
+    """Extracts deduplicated domains and URLs from FakeNetRequests log lines."""
+    domains: List[str] = []
+    urls: List[str] = []
+    seen_d: set = set()
+    seen_u: set = set()
+
+    def _add_dom(raw_d: str) -> None:
+        dom = raw_d.strip().lower().rstrip(".")
+        if not dom or dom in seen_d or _clean_ip(dom):
+            return
+        seen_d.add(dom)
+        domains.append(dom)
+
+    for raw in items or []:
+        s = str(raw or "").strip()
+        if not s:
+            continue
+        for u in _URL_RX.findall(s):
+            if u not in seen_u:
+                seen_u.add(u)
+                urls.append(u)
+            host = (urlparse(u).hostname or "").lower().rstrip(".")
+            if host:
+                _add_dom(host)
+        for hm in _HOST_HDR_RX.findall(s):
+            _add_dom(hm)
+        for tok in _DOM_TOK_RX.findall(s):
+            tl = tok.lower()
+            if _clean_ip(tl) or tl.endswith(_FAKENET_FILE_EXT_SKIP):
+                continue
+            _add_dom(tl)
+    return domains, urls
+
+
 def compute_verdict(job: Job) -> None:
     s = job.state
     red: List[str] = []
     notes: List[str] = []
+    known_good: List[str] = []
     for e in s.get("vt") or []:
         intel = e.get("intel") or {}
         mb = intel.get("malwarebazaar") or {}
         ha = intel.get("hybrid_analysis") or {}
+        tf = intel.get("threatfox") or {}
+        circl = intel.get("circl") or {}
         if mb.get("found"):
             red.append(f"MalwareBazaar: '{e['rel']}' bilinen zararlı örnektir ({mb.get('family') or 'kayıtlı'}).")
         if ha.get("found"):
@@ -1873,6 +2399,13 @@ def compute_verdict(job: Job) -> None:
                 red.append(f"Hybrid Analysis: '{e['rel']}' zararlı olarak sınıflandırılmış ({ha.get('family') or v_ha}).")
             elif v_ha == "suspicious":
                 notes.append(f"Hybrid Analysis: '{e['rel']}' şüpheli işaretlenmiş ({ha.get('family') or v_ha}).")
+        if tf.get("found"):
+            red.append(f"ThreatFox: '{e['rel']}' bilinen zararlı IOC'sidir ({tf.get('family') or tf.get('threat_type') or 'kayıtlı'}).")
+        if circl.get("found") and circl.get("verdict") == "malicious":
+            red.append(f"CIRCL Hashlookup: '{e['rel']}' zararlı olarak işaretli ({circl.get('known_malicious') or 'KnownMalicious'}).")
+        elif intel.get("known_good") or (circl.get("found") and circl.get("verdict") == "known_good" and not intel.get("malicious")):
+            prod = circl.get("product_name") or circl.get("file_name") or ""
+            known_good.append(f"{e['rel']}" + (f" ({prod})" if prod else ""))
         r = e.get("result")
         if not r:
             continue
@@ -1956,7 +2489,15 @@ def compute_verdict(job: Job) -> None:
         if D.get("Added"):
             red.append(f"Defender ayarları değiştirildi (istisna eklendi / koruma kapatıldı): {'; '.join(D['Added'][:5])}")
         if b.get("HoneyfileAlerts"):
-            red.append(f"Yem dosyalara (honeyfile) erişildi/değiştirildi: {'; '.join(b['HoneyfileAlerts'][:4])}")
+            confirmed_honey = [
+                a for a in b["HoneyfileAlerts"]
+                if any(tok in str(a) for tok in ("DELETED", "MODIFIED", "(Modified)", " read by "))
+            ]
+            unverified_honey = [a for a in b["HoneyfileAlerts"] if a not in confirmed_honey]
+            if confirmed_honey:
+                red.append(f"Yem dosyalara (honeyfile) erişildi/değiştirildi: {'; '.join(confirmed_honey[:4])}")
+            if unverified_honey:
+                notes.append(f"Yem dosya erişim izi (işlem doğrulanamadı, arka plan taraması olabilir): {'; '.join(unverified_honey[:3])}")
         if P.get("Services"):
             red.append(f"{len(P['Services'])} yeni servis kuruldu.")
         if P.get("Drivers"):
@@ -2008,6 +2549,17 @@ def compute_verdict(job: Job) -> None:
         conns = [c for c in (b.get("Network") or {}).get("Connections") or [] if c.get("FromSample")]
         if conns:
             notes.append(f"Örneğin başlattığı işlemler {len(conns)} ağ bağlantısı açtı.")
+        mem_findings = b.get("MemoryFindings") or []
+        if mem_findings:
+            red.append(f"Canlı işlem belleğinde zararlı/şüpheli izler tespit edildi ({len(mem_findings)}): "
+                       + "; ".join(str(x) for x in mem_findings[:5]))
+        fakenet_reqs = b.get("FakeNetRequests") or []
+        if fakenet_reqs:
+            fn_domains, _ = _extract_fakenet_targets(fakenet_reqs)
+            abused_fn = [d for d in fn_domains if domain_class(d) == CLASS_ABUSED]
+            if abused_fn:
+                red.append(f"FakeNet tuzağı kötüye kullanılan servise istek yakaladı: {', '.join(abused_fn[:8])}")
+            notes.append(f"FakeNet tuzağı {len(fakenet_reqs)} ağ isteği yakaladı: {'; '.join(str(x) for x in fakenet_reqs[:4])}")
         run_mode = b.get("RunMode") or ""
         if isinstance(run_mode, str) and "in-place" in run_mode:
             notes.append("Kurulum boyutu büyük olduğu için salt okunur paylaşılan klasörden yerinde çalıştırıldı. Kurulum kendi klasörüne dosya yazmaya çalıştıysa hata vermiş olabilir.")
@@ -2050,7 +2602,10 @@ def compute_verdict(job: Job) -> None:
             notes.append("Sandbox adımı çalışmadı: dosyanın davranışı (işlemler, ağ, kalıcılık) incelenmedi; "
                          "bu sonuç sadece statik kontrollere dayanıyor.")
     level = "red" if red else ("yellow" if notes else ("green" if finished else "pending"))
-    s["verdict"] = {"level": level, "red": red, "notes": notes, "not_run": missing}
+    verdict_obj: Dict[str, Any] = {"level": level, "red": red, "notes": notes, "not_run": missing}
+    if known_good:
+        verdict_obj["known_good"] = known_good
+    s["verdict"] = verdict_obj
 
 
 def stage_report(job: Job) -> None:
@@ -2076,6 +2631,8 @@ def write_report(job: Job) -> None:
                     f"- **Sonuç seviyesi:** {v['level']}", ""]
     L += ["## Bulgular", ""]
     L += [f"- **KIRMIZI:** {x}" for x in v["red"]] + [f"- NOT: {x}" for x in v["notes"]]
+    if v.get("known_good"):
+        L.append(f"- BİLGİ (CIRCL NSRL bilinen temiz): {', '.join(v['known_good'][:10])}")
     if not v["red"] and not v["notes"]:
         L.append("- Otomatik kontroller kırmızı bayrak bulmadı. Bu dosyanın temiz olduğunu **kanıtlamaz**.")
     inv = s.get("inventory") or {}
@@ -2085,7 +2642,8 @@ def write_report(job: Job) -> None:
     for e in s.get("vt") or []:
         r = e.get("result") or {}
         mal = f"{r['stats']['malicious']}/{r['stats']['total']}" if r else "-"
-        lbl = (r.get("suggested_threat_label", "") if r else "") or (e.get("intel") or {}).get("summary", "")
+        intel = e.get("intel") or {}
+        lbl = (r.get("suggested_threat_label", "") if r else "") or intel.get("summary", "") or ("CIRCL NSRL (bilinen temiz)" if intel.get("known_good") else "")
         L.append(f"| {e['rel']} | {e['status']} | {mal} | {lbl} | [VT]({e['gui_url']}) |")
     L += ["", "## Statik analiz (en riskli 15)", ""]
     yara_rows: List[str] = []
@@ -2131,6 +2689,9 @@ def write_report(job: Job) -> None:
                     ("hosts silinen satırlar", (b.get("Hosts") or {}).get("Removed")),
                     ("Güvenlik duvarı kuralları", (b.get("Firewall") or {}).get("Added")),
                     ("Yeni dinleyici portlar (TCP)", (b.get("Network") or {}).get("NewListening")),
+                    ("Bellek taraması bulguları (MemoryFindings)", b.get("MemoryFindings")),
+                    ("FakeNet yakalanan istekler", b.get("FakeNetRequests")),
+                    ("Otomatik kurulum tıklamaları (AutoClicks)", b.get("AutoClicks")),
                     ("Yeni çalıştırılabilir dosyalar", (b.get("Files") or {}).get("NewExecutables")),
                     ("Değiştirilen çalıştırılabilir dosyalar", (b.get("Files") or {}).get("ModifiedExecutables"))]
         for title, items in sections:
@@ -2399,9 +2960,11 @@ def collect_iocs(job: Job, include_noise: bool = False) -> List[Dict[str, Any]]:
             r = e.get("result") or {}
             mal = int((r.get("stats") or {}).get("malicious") or 0) if r else 0
             tot = int((r.get("stats") or {}).get("total") or 0) if r else 0
-            lbl = r.get("suggested_threat_label") or e.get("status") or ""
-            cls = f"VT {mal}/{tot} ({lbl})" if tot else f"VT: {lbl}"
-            add("sha256", sha, "vt", cls, e.get("rel", ""), malicious=(mal > 0))
+            intel = e.get("intel") or {}
+            intel_mal = bool(intel.get("malicious") or (intel.get("threatfox") or {}).get("found"))
+            lbl = (r.get("suggested_threat_label") if r else "") or intel.get("summary") or e.get("status") or ""
+            cls = f"VT {mal}/{tot} ({lbl})" if tot else f"VT/İstihbarat: {lbl}"
+            add("sha256", sha, "vt", cls, e.get("rel", ""), malicious=(mal > 0 or intel_mal))
 
     b = s.get("behavior") or {}
     for d in (b.get("Files") or {}).get("DroppedHashes") or []:
@@ -2443,6 +3006,17 @@ def collect_iocs(job: Job, include_noise: bool = False) -> List[Dict[str, Any]]:
         if include_noise or dcls not in _NOISE_DOMAIN_CLASSES:
             add("domain", dom, "behavior", dcls, f"DnsCache -> {dns_row.get('Data') or ''}",
                 malicious=(dcls == CLASS_ABUSED))
+
+    fn_domains, fn_urls = _extract_fakenet_targets(b.get("FakeNetRequests") or [])
+    for dom in fn_domains:
+        dcls = domain_class(dom)
+        if include_noise or dcls not in _NOISE_DOMAIN_CLASSES:
+            add("domain", dom, "fakenet", dcls, "FakeNet tuzağı", malicious=(dcls == CLASS_ABUSED))
+    for u in fn_urls:
+        host = (urlparse(u).hostname or "").lower().rstrip(".")
+        dcls = domain_class(host) if host else CLASS_UNKNOWN
+        if include_noise or not host or dcls not in _NOISE_DOMAIN_CLASSES:
+            add("url", u, "fakenet", dcls, "FakeNet tuzağı", malicious=(dcls == CLASS_ABUSED))
 
     # 3. IP addresses from sandbox connections + tshark SYN targets
     for conn in (b.get("Network") or {}).get("Connections") or []:
@@ -2645,6 +3219,8 @@ def compare_jobs(base_job: Job, target_job: Job) -> Dict[str, Any]:
         "modified_executables": _diff_list((b_beh.get("Files") or {}).get("ModifiedExecutables"), (t_beh.get("Files") or {}).get("ModifiedExecutables")),
         "new_listening": _diff_list((b_beh.get("Network") or {}).get("NewListening"), (t_beh.get("Network") or {}).get("NewListening")),
         "honeyfile_alerts": _diff_list(b_beh.get("HoneyfileAlerts"), t_beh.get("HoneyfileAlerts")),
+        "memory_findings": _diff_list(b_beh.get("MemoryFindings"), t_beh.get("MemoryFindings")),
+        "fakenet_requests": _diff_list(b_beh.get("FakeNetRequests"), t_beh.get("FakeNetRequests")),
         "suspicious_processes": _diff_list(
             [f"{p.get('Name')}: {p.get('CommandLine') or ''}" for p in (b_beh.get("Processes") or []) if isinstance(p, dict) and p.get("Suspicious")],
             [f"{p.get('Name')}: {p.get('CommandLine') or ''}" for p in (t_beh.get("Processes") or []) if isinstance(p, dict) and p.get("Suspicious")],
@@ -2668,7 +3244,7 @@ def compare_jobs(base_job: Job, target_job: Job) -> Dict[str, Any]:
         highlights.append(f"{len(static_deltas)} dosyada statik risk artışı" + (f" ve {yara_hits} yeni YARA eşleşmesi" if yara_hits else "") + ".")
     pers_cnt = sum(len(behavior_diff[k]) for k in (
         "services", "drivers", "tasks", "runkeys", "wmi_subscriptions", "com_hijacks", "appinit_dlls", "bits_jobs", "ps_profiles",
-        "defender", "firewall", "modified_executables", "new_listening", "honeyfile_alerts",
+        "defender", "firewall", "modified_executables", "new_listening", "honeyfile_alerts", "memory_findings", "fakenet_requests",
     ))
     if pers_cnt:
         highlights.append(f"Hedef sandbox'ta fazladan {pers_cnt} kalıcılık/güvenlik/davranış farkı bıraktı.")

@@ -41,6 +41,8 @@ async function loadSystemStatus() {
     $('vtStatusDot').className = 'w-2 h-2 rounded-full ' + (caps.vt_api_configured ? 'bg-emerald-400' : 'bg-amber-400');
     $('vtStatusText').textContent = caps.vt_api_configured ? `VT API aktif (${caps.vt_api_masked})` : 'VT API: anahtar girilmedi';
     if ($('mbEnabledInput') && !vtModalOpen) $('mbEnabledInput').checked = !!caps.mb_enabled;
+    if ($('chkCirclEnabled') && !vtModalOpen) $('chkCirclEnabled').checked = !!caps.circl_enabled;
+    if ($('chkTfEnabled') && !vtModalOpen) $('chkTfEnabled').checked = !!caps.tf_enabled;
     $('sysSubText').textContent = caps.os;
     let h = '';
     h += caps.windows_sandbox_enabled ? badge('✅ Windows Sandbox hazır', 'emerald')
@@ -115,6 +117,7 @@ function options() {
     simulate_user: $('optSimUser').checked,
     run_as_standard_user: $('optStdUser') ? $('optStdUser').checked : false,
     seed_honeyfiles: $('optHoneyfiles') ? $('optHoneyfiles').checked : true,
+    fake_net: $('optFakeNet') ? $('optFakeNet').checked : false,
     notify: $('optNotify') ? $('optNotify').checked : true,
     sandbox_backend: $('backendInput') ? $('backendInput').value : 'wsb',
     vbox_vm: $('vboxVmInput') ? $('vboxVmInput').value : '',
@@ -325,10 +328,23 @@ function renderJob(st) {
   $('jobLog').innerHTML = (st.log || []).slice().reverse().map(l => `<div><span class="text-slate-600">${esc(l.t)}</span> ${esc(l.msg)}</div>`).join('');
 }
 
-function vtCell(r) {
-  if (!r) return '<span class="text-slate-500">—</span>';
-  const m = r.stats.malicious, c = m >= 3 ? 'text-rose-300' : m > 0 ? 'text-amber-300' : 'text-emerald-300';
-  return `<span class="${c} font-semibold">${m} / ${r.stats.total}</span>`;
+function vtCell(r, intel) {
+  const parts = [];
+  if (r) {
+    const m = r.stats.malicious, c = m >= 3 ? 'text-rose-300' : m > 0 ? 'text-amber-300' : 'text-emerald-300';
+    parts.push(`<span class="${c} font-semibold">${m} / ${r.stats.total}</span>`);
+  }
+  if (intel) {
+    if (intel.threatfox && intel.threatfox.found) {
+      parts.push(`<span class="px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-300 font-semibold">ThreatFox: ${esc(intel.threatfox.family || 'zararlı')}</span>`);
+    }
+    if (intel.known_good || (intel.circl && intel.circl.found && intel.circl.verdict === 'known_good' && !intel.malicious)) {
+      parts.push('<span class="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-semibold">CIRCL NSRL: bilinen temiz</span>');
+    } else if (intel.circl && intel.circl.found && intel.circl.verdict === 'malicious') {
+      parts.push('<span class="px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-300 font-semibold">CIRCL: zararlı</span>');
+    }
+  }
+  return parts.length ? parts.join(' ') : '<span class="text-slate-500">—</span>';
 }
 function renderVt(st) {
   const rows = st.vt || [];
@@ -336,10 +352,12 @@ function renderVt(st) {
   if (!rows.length) return;
   $('vtTable').innerHTML = `<tr><th>Dosya</th><th>Durum</th><th>Zararlı</th><th>Etiket / motorlar</th><th></th></tr>` + rows.map(e => {
     const r = e.result;
-    const intelTxt = e.intel && e.intel.summary ? `<div class="text-rose-300 font-semibold">${esc(e.intel.summary)}</div>` : '';
+    const intel = e.intel;
+    const intelCls = intel && intel.malicious ? 'text-rose-300' : (intel && intel.known_good ? 'text-emerald-300' : 'text-amber-300');
+    const intelTxt = intel && intel.summary ? `<div class="${intelCls} font-semibold">${esc(intel.summary)}</div>` : '';
     const fam = r && r.has_dangerous_malware_family ? '<span class="px-1.5 py-0.5 rounded bg-rose-600/40 text-rose-100 font-bold mr-1">ZARARLI AİLE</span>' : '';
     const engines = r ? r.flagged_engines.slice(0, 4).map(x => `${esc(x.engine)}: ${esc(x.result)}`).join(' | ') : '';
-    return `<tr><td class="mono break-all">${esc(e.rel)}</td><td class="text-slate-400">${esc(e.status)}</td><td>${vtCell(r)}</td>
+    return `<tr><td class="mono break-all">${esc(e.rel)}</td><td class="text-slate-400">${esc(e.status)}</td><td>${vtCell(r, intel)}</td>
       <td>${fam}${r ? esc(r.suggested_threat_label) : ''}${intelTxt}<div class="text-slate-500">${engines}</div></td>
       <td><a class="text-cyan-400 underline whitespace-nowrap" target="_blank" rel="noopener" href="${esc(e.gui_url)}">VT ↗</a></td></tr>`;
   }).join('');
@@ -389,7 +407,10 @@ function renderSandbox(st) {
       + listBox('🧱 Güvenlik duvarı kuralları', (b.Firewall || {}).Added, 'amber')
       + listBox('🔌 Yeni dinleyici portlar (TCP)', (b.Network || {}).NewListening, 'rose')
       + listBox(`📂 Yeni çalıştırılabilirler (toplam ${asNum((b.Files || {}).NewCount)} yeni)`, (b.Files || {}).NewExecutables, 'purple')
-      + listBox('✏️ Değiştirilen çalıştırılabilirler', (b.Files || {}).ModifiedExecutables, 'rose');
+      + listBox('✏️ Değiştirilen çalıştırılabilirler', (b.Files || {}).ModifiedExecutables, 'rose')
+      + listBox('🧠 Canlı bellek taraması (MemoryFindings)', b.MemoryFindings, 'rose')
+      + listBox('🕸️ FakeNet yakalanan istekler', b.FakeNetRequests, asArr(b.FakeNetRequests).length ? 'amber' : 'cyan')
+      + listBox('🖱️ Otomatik kurulum tıklamaları (AutoClicks)', b.AutoClicks, 'cyan');
     const pmEvents = asArr((st.procmon_summary || {}).SensitiveEvents);
     if (pmEvents.length) pers += listBox('🔬 Procmon hassas erişimler', pmEvents, 'rose');
   } else {
@@ -466,7 +487,7 @@ function sigBadge(sig) {
 }
 function renderStatic(st) {
   const files = st.static || [];
-  const vtSig = (st.vt || []).map(e => `${e.sha256}:${e.status}:${e.result ? e.result.stats.malicious : ''}:${(e.intel || {}).summary || ''}`).join('|');
+  const vtSig = (st.vt || []).map(e => `${e.sha256}:${e.status}:${e.result ? e.result.stats.malicious : ''}:${(e.intel || {}).summary || ''}:${(e.intel || {}).known_good ? 'kg' : ''}:${((e.intel || {}).threatfox || {}).found ? 'tf' : ''}`).join('|');
   const key = st.id + ':' + files.length + ':' + vtSig;
   $('staticSection').classList.toggle('hidden', !files.length);
   if (key === renderedStaticKey) return;
@@ -496,6 +517,13 @@ function renderStatic(st) {
     if (pe.is_pe) {
       const ovTxt = pe.overlay ? ` • Overlay: ${fmtMB(pe.overlay.size)} (ent ${pe.overlay.entropy}${pe.overlay.packer_hint ? ', ' + pe.overlay.packer_hint : ''})` : '';
       const secRows = asArr(pe.sections).map(sc => `<tr class="${sc.rwx ? 'bg-rose-950/40' : ''}"><td>${esc(sc.name)}</td><td>${sc.entropy}</td><td>${sc.virtual_size}</td><td>${sc.raw_size}</td><td>${sc.rwx ? '🚨 RWX' : sc.executable ? 'X' : ''}</td></tr>`).join('');
+      const vi = pe.version_info || {};
+      const viBits = [
+        vi.ProductName ? `<span>Ürün: <b class="text-slate-200">${esc(vi.ProductName)}</b></span>` : '',
+        vi.CompanyName ? `<span>Üretici: <b class="text-slate-200">${esc(vi.CompanyName)}</b></span>` : '',
+        vi.OriginalFilename ? `<span>Orijinal Ad: <b class="text-slate-200">${esc(vi.OriginalFilename)}</b></span>` : '',
+        vi.FileVersion ? `<span>Sürüm: <b class="text-slate-200">${esc(vi.FileVersion)}</b></span>` : '',
+      ].filter(Boolean).join('');
       peMeta = `<div class="text-[11px] text-slate-400 flex flex-wrap gap-x-3 gap-y-1">
         <span>Mimari: <b class="text-slate-200">${esc(pe.architecture)}</b></span>
         ${pe.compile_time ? `<span>Derleme: <b class="text-slate-200">${esc(pe.compile_time)}</b></span>` : ''}
@@ -505,6 +533,7 @@ function renderStatic(st) {
         ${pe.has_tls_callbacks ? '<span class="text-rose-300 font-semibold">TLS Callback</span>' : ''}
         ${ovTxt ? `<span>${esc(ovTxt.slice(3))}</span>` : ''}
       </div>
+      ${viBits ? `<div class="text-[11px] text-slate-400 flex flex-wrap gap-x-3 gap-y-1">${viBits}</div>` : ''}
       ${secRows ? `<details class="text-[11px]"><summary class="cursor-pointer text-slate-400">PE bölümleri (${asArr(pe.sections).length})</summary><div class="overflow-x-auto mt-1"><table class="tbl w-full"><tr><th>Bölüm</th><th>Entropi</th><th>VSize</th><th>RSize</th><th>Bayrak</th></tr>${secRows}</table></div></details>` : ''}`;
     }
     return `<div class="glass-card rounded-2xl p-5 space-y-3">
@@ -521,8 +550,8 @@ function renderStatic(st) {
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-3"><div class="space-y-2">${spoofs}${fmts}${yaras}${dotnet}${deobf}${strs}${ips}${urls}</div><div class="space-y-2">${apisHtml}</div></div>
       <div class="pt-2 border-t border-slate-800/80 flex flex-wrap items-center gap-2 text-xs">
         <button data-preview="${idx}" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-cyan-200 border border-slate-700 font-semibold">👁️ İçeriği incele</button>
-        ${vt ? `<span>VirusTotal: ${vtCell(vt.result)} <span class="text-slate-500">${esc(vt.status)}</span></span>` : `<button data-vt-query="${idx}" class="px-3 py-1.5 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 border border-cyan-500/40 font-semibold">🛡️ VirusTotal ile sorgula</button>`}
-        <button data-intel-query="${idx}" class="px-3 py-1.5 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-300 border border-indigo-500/40 font-semibold">🔍 MB / HA Sor</button>
+        ${vt ? `<span>VirusTotal: ${vtCell(vt.result, vt.intel)} <span class="text-slate-500">${esc(vt.status)}</span></span>` : `<button data-vt-query="${idx}" class="px-3 py-1.5 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 border border-cyan-500/40 font-semibold">🛡️ VirusTotal ile sorgula</button>`}
+        <button data-intel-query="${idx}" class="px-3 py-1.5 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-300 border border-indigo-500/40 font-semibold">🔍 İstihbarat Sor (MB/HA/CIRCL/TF)</button>
         <a href="https://www.virustotal.com/gui/file/${esc(sha)}" target="_blank" rel="noopener" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200">VT ↗</a>
         <a href="https://www.hybrid-analysis.com/search?query=${esc(sha)}" target="_blank" rel="noopener" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200">Hybrid Analysis ↗</a>
         <a href="https://app.any.run/submissions/#filehash:${esc(sha)}" target="_blank" rel="noopener" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200">ANY.RUN ↗</a>
@@ -551,7 +580,7 @@ async function manualVtUpload(idx) {
 
 async function manualIntelQuery(idx) {
   const f = activeJob.static[idx], box = $('vtBox_' + idx);
-  box.classList.remove('hidden'); box.innerHTML = '<div class="text-indigo-300 animate-pulse">MalwareBazaar & Hybrid Analysis sorgulanıyor (yalnızca hash)...</div>';
+  box.classList.remove('hidden'); box.innerHTML = '<div class="text-indigo-300 animate-pulse">Tehdit istihbaratı sorgulanıyor (yalnızca hash)...</div>';
   try {
     const d = await api('/api/intel/query/' + f.hashes.sha256);
     const lines = [];
@@ -566,6 +595,22 @@ async function manualIntelQuery(idx) {
       lines.push(h.found
         ? `<div><b class="${h.verdict === 'malicious' ? 'text-rose-300' : 'text-amber-300'}">Hybrid Analysis:</b> ${esc(h.verdict)} (skor ${esc(h.threat_score)}/100${h.family ? ', ' + esc(h.family) : ''}) — <a class="text-cyan-400 underline" href="${esc(h.gui_url)}" target="_blank" rel="noopener">detay ↗</a></div>`
         : `<div><b class="text-slate-300">Hybrid Analysis:</b> ${esc(h.message || 'kayıt bulunamadı')}</div>`);
+    }
+    if (d.threatfox) {
+      const tf = d.threatfox;
+      lines.push(tf.found
+        ? `<div><b class="text-rose-300">ThreatFox:</b> Zararlı IOC (${esc(tf.family || tf.threat_type || 'kayıtlı')}) — <a class="text-cyan-400 underline" href="${esc(tf.gui_url)}" target="_blank" rel="noopener">detay ↗</a></div>`
+        : `<div><b class="text-slate-300">ThreatFox:</b> ${esc(tf.message || 'kayıt bulunamadı')}</div>`);
+    }
+    if (d.circl) {
+      const c = d.circl;
+      if (c.found && c.verdict === 'known_good') {
+        lines.push(`<div><b class="text-emerald-300">CIRCL Hashlookup (NSRL):</b> Bilinen temiz (${esc(c.product_name || c.file_name || 'kayıtlı')}) — <a class="text-cyan-400 underline" href="${esc(c.gui_url)}" target="_blank" rel="noopener">detay ↗</a></div>`);
+      } else if (c.found) {
+        lines.push(`<div><b class="text-rose-300">CIRCL Hashlookup:</b> Zararlı işaretli (${esc(c.known_malicious || c.verdict || '')}) — <a class="text-cyan-400 underline" href="${esc(c.gui_url)}" target="_blank" rel="noopener">detay ↗</a></div>`);
+      } else {
+        lines.push(`<div><b class="text-slate-300">CIRCL Hashlookup:</b> ${esc(c.message || 'kayıt bulunamadı')}</div>`);
+      }
     }
     box.innerHTML = lines.join('');
   } catch (e) { box.innerHTML = `<span class="text-rose-300">${esc(e.message)}</span>`; }
@@ -589,6 +634,7 @@ function openSandboxModal(st) {
   $('sbModalSimUser').checked = o.simulate_user !== false;
   $('sbModalStdUser').checked = !!o.run_as_standard_user;
   $('sbModalHoney').checked = o.seed_honeyfiles !== false;
+  if ($('sbModFakeNet')) $('sbModFakeNet').checked = !!o.fake_net;
   $('sbModalUser').value = o.vbox_user || '';
   $('sbModalPass').value = '';
   const syncVbox = () => {
@@ -617,6 +663,7 @@ if ($('btnSbModalStart')) {
       simulate_user: $('sbModalSimUser').checked,
       run_as_standard_user: $('sbModalStdUser').checked,
       seed_honeyfiles: $('sbModalHoney').checked,
+      fake_net: $('sbModFakeNet') ? $('sbModFakeNet').checked : false,
       sandbox_backend: $('sbModalBackend').value,
       vbox_vm: $('sbModalVm').value || '',
       vbox_snapshot: $('sbModalSnap').value || '',
@@ -752,6 +799,7 @@ if ($('btnRunCompare')) {
         ['Yeni kalıcılık (Servis/Görev/Run/WMI/COM)', persAll],
         ['Defender / Firewall / hosts / Honeyfile farkı', (bd.defender || []).concat(bd.firewall || [], bd.hosts || [], bd.hosts_removed || [], bd.honeyfile_alerts || [])],
         ['Ek bırakılan / değiştirilen dosyalar & portlar', (bd.dropped_executables || []).concat(bd.modified_executables || [], bd.new_listening || [])],
+        ['Canlı bellek / FakeNet farkı', (bd.memory_findings || []).concat(bd.fakenet_requests || [])],
         ['Ek ağ hedefleri (Domain/IP)', (d.network_diff.extra_domains || []).map(x => x.value).concat((d.network_diff.extra_ips || []).map(x => x.value))],
       ];
       const behHtml = behPairs.map(([title, items]) => listBox(title, items, items.length ? 'rose' : 'slate')).join('');
@@ -766,6 +814,8 @@ if ($('btnRunCompare')) {
 $('btnVtModal').onclick = () => {
   vtModalOpen = true;
   if ($('mbEnabledInput')) $('mbEnabledInput').checked = !!caps.mb_enabled;
+  if ($('chkCirclEnabled')) $('chkCirclEnabled').checked = !!caps.circl_enabled;
+  if ($('chkTfEnabled')) $('chkTfEnabled').checked = !!caps.tf_enabled;
   if ($('vtCurStatus')) $('vtCurStatus').textContent = caps.vt_api_configured ? `(Kayıtlı: ${caps.vt_api_masked})` : '(Girilmedi)';
   if ($('mbCurStatus')) $('mbCurStatus').textContent = caps.mb_api_configured ? `(Kayıtlı: ${caps.mb_api_masked})` : '(Girilmedi)';
   if ($('haCurStatus')) $('haCurStatus').textContent = caps.ha_api_configured ? `(Kayıtlı: ${caps.ha_api_masked})` : '(Girilmedi)';
@@ -778,6 +828,8 @@ $('btnVtSave').onclick = async () => {
     mb_api_key: $('mbApiKeyInput').value.trim() || null,
     ha_api_key: $('haApiKeyInput').value.trim() || null,
     mb_enabled: $('mbEnabledInput').checked,
+    circl_enabled: $('chkCirclEnabled') ? $('chkCirclEnabled').checked : false,
+    tf_enabled: $('chkTfEnabled') ? $('chkTfEnabled').checked : false,
     clear_vt: $('vtClearInput') ? $('vtClearInput').checked : false,
     clear_mb: $('mbClearInput') ? $('mbClearInput').checked : false,
     clear_ha: $('haClearInput') ? $('haClearInput').checked : false,

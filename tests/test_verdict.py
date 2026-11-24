@@ -67,6 +67,10 @@ def test_panel_escapes_box_titles():
     ("evil-c2.xyz", pipeline.CLASS_UNKNOWN),
     ("notmicrosoft.com", pipeline.CLASS_UNKNOWN),              # suffix match must respect label boundaries
     ("1.168.192.in-addr.arpa", "Yerel (gürültü)"),
+    ("239.255.255.250:1900", "Yerel (gürültü)"),               # SSDP multicast with port
+    ("DAE8853C-7288-4", "Yerel (gürültü)"),                    # single-label NetBIOS computer name
+    ("DAE8853C-7288-4.mshome.net", "Yerel (gürültü)"),         # Windows Sandbox Hyper-V NAT suffix
+    ("wpad.mshome.net", "Yerel (gürültü)"),                    # WPAD auto-discovery
 ])
 def test_domain_class(domain, cls):
     assert pipeline.domain_class(domain) == cls
@@ -577,4 +581,129 @@ def test_network_summary_quic_udp_and_doh(tmp_path, monkeypatch):
     job.state["network"] = ns
     pipeline.compute_verdict(job)
     assert any("DNS-over-HTTPS" in n for n in job.state["verdict"]["notes"])
+
+
+def test_f7_memory_findings_fakenet_threatfox_circl_in_verdict_ioc_and_compare(tmp_path):
+    long_str = "A" * 500
+    raw_beh = {
+        "MemoryFindings": [f"api.telegram.org/bot {long_str}"] + [f"m{i}" for i in range(250)],
+        "FakeNetRequests": ["DNS A evil-c2.example", "HTTP GET http://api.ipify.org/"],
+        "AutoClicks": ["Button: Next (pid=100)"],
+    }
+    clean = pipeline.sanitize_sandbox_json(raw_beh)
+    assert len(clean["MemoryFindings"]) == 200
+    assert len(clean["MemoryFindings"][0]) == 400
+    assert clean["AutoClicks"] == ["Button: Next (pid=100)"]
+
+    job = bare_job(tmp_path / "f7_job")
+    job.state["status"] = "done"
+    job.state["stages"]["vt"]["status"] = "done"
+    job.state["stages"]["sandbox"]["status"] = "done"
+    job.state["behavior"] = clean
+    job.state["vt"] = [
+        {
+            "rel": "evil.exe",
+            "sha256": "a" * 64,
+            "status": "ThreatFox",
+            "result": None,
+            "gui_url": "https://vt.example/a",
+            "intel": {"malicious": True, "threatfox": {"found": True, "family": "LummaStealer"}},
+        },
+        {
+            "rel": "known.dll",
+            "sha256": "b" * 64,
+            "status": "CIRCL",
+            "result": None,
+            "gui_url": "https://vt.example/b",
+            "intel": {"malicious": False, "known_good": True, "circl": {"found": True, "verdict": "known_good", "product_name": "Windows"}},
+        },
+    ]
+    pipeline.compute_verdict(job)
+    v = job.state["verdict"]
+    assert v["level"] == "red"
+    red_txt = "\n".join(v["red"])
+    note_txt = "\n".join(v["notes"])
+    assert "Canlı işlem belleğinde" in red_txt
+    assert "api.ipify.org" in red_txt
+    assert "ThreatFox" in red_txt and "LummaStealer" in red_txt
+    assert "FakeNet tuzağı" in note_txt
+    assert v["known_good"] == ["known.dll (Windows)"]
+
+    # CIRCL known_good on an otherwise clean job must keep verdict green, AND never hide HashMismatch
+    clean_job = bare_job(tmp_path / "kg_clean")
+    clean_job.state["status"] = "done"
+    clean_job.state["stages"]["vt"]["status"] = "done"
+    clean_job.state["stages"]["sandbox"]["status"] = "done"
+    clean_job.state["vt"] = [job.state["vt"][1]]
+    pipeline.compute_verdict(clean_job)
+    assert clean_job.state["verdict"]["level"] == "green"
+    assert clean_job.state["verdict"]["known_good"] == ["known.dll (Windows)"]
+
+    spoof_job = bare_job(tmp_path / "kg_spoof")
+    spoof_job.state["status"] = "done"
+    spoof_job.state["stages"]["vt"]["status"] = "done"
+    spoof_job.state["stages"]["sandbox"]["status"] = "done"
+    spoof_job.state["vt"] = [job.state["vt"][1]]
+    spoof_job.state["inventory"] = {"hash_mismatch": 1}
+    spoof_job.state["static"] = [{"rel": "known.dll", "risk_score": 30, "signature": {"status": "HashMismatch"},
+                                  "spoof_flags": [{"type": "vendor_impersonation", "severity": "high", "reason": "Sahte üretici"}]}]
+    pipeline.compute_verdict(spoof_job)
+    assert spoof_job.state["verdict"]["level"] == "red"
+    assert any("HashMismatch" in n for n in spoof_job.state["verdict"]["notes"])
+
+    # Report & IOC extraction
+    pipeline.write_report(job)
+    rep = (job.case_dir / "report.md").read_text(encoding="utf-8")
+    assert "MemoryFindings" in rep and "FakeNet" in rep and "AutoClicks" in rep
+    iocs = pipeline.collect_iocs(job)
+    vals = {(x["type"], x["value"]): x for x in iocs}
+    assert ("domain", "evil-c2.example") in vals
+    assert ("domain", "api.ipify.org") in vals and vals[("domain", "api.ipify.org")]["malicious"] is True
+    assert ("url", "http://api.ipify.org/") in vals
+    assert vals[("sha256", "a" * 64)]["malicious"] is True
+
+    # compare_jobs
+    base = bare_job(tmp_path / "cmp_base")
+    base.state["behavior"] = pipeline.sanitize_sandbox_json({})
+    diff = pipeline.compare_jobs(base, job)
+    assert len(diff["behavior_diff"]["memory_findings"]) == 200
+    assert diff["behavior_diff"]["fakenet_requests"] == ["DNS A evil-c2.example", "HTTP GET http://api.ipify.org/"]
+
+
+def test_f8_honeyfile_verdict_distinguishes_confirmed_vs_unattributed_and_filters_ssdp(tmp_path, monkeypatch):
+    # 1. Legacy unattributed ACCESSED alert becomes a yellow note, NOT red
+    j_legacy = bare_job(tmp_path / "legacy_honey")
+    j_legacy.state["status"] = "done"
+    j_legacy.state["stages"]["vt"]["status"] = "done"
+    j_legacy.state["stages"]["sandbox"]["status"] = "done"
+    j_legacy.state["behavior"] = pipeline.sanitize_sandbox_json({
+        "HoneyfileAlerts": [r"ACCESSED (infostealer read): C:\Users\WDAGUtilityAccount\Desktop\wallet_keys.txt"],
+    })
+    pipeline.compute_verdict(j_legacy)
+    assert j_legacy.state["verdict"]["level"] == "yellow"
+    assert j_legacy.state["verdict"]["red"] == []
+    assert any("arka plan taraması olabilir" in n for n in j_legacy.state["verdict"]["notes"])
+
+    # 2. 4663 process-attributed read OR MODIFIED/DELETED triggers red
+    j_real = bare_job(tmp_path / "real_honey")
+    j_real.state["behavior"] = pipeline.sanitize_sandbox_json({
+        "HoneyfileAlerts": [r"ACCESSED (infostealer read by stealer.exe pid=4321): C:\Users\WDAGUtilityAccount\Desktop\wallet_keys.txt"],
+    })
+    pipeline.compute_verdict(j_real)
+    assert j_real.state["verdict"]["level"] == "red"
+    assert any("read by stealer.exe" in r for r in j_real.state["verdict"]["red"])
+
+    # 3. UDP SSDP M-SEARCH on 239.255.255.250:1900 is omitted from HTTP rows
+    pcap = tmp_path / "ssdp.pcap"
+    pcap.write_bytes(b"pcap")
+    monkeypatch.setattr(sbm, "tshark_path", lambda: "tshark.exe")
+    monkeypatch.setattr(pipeline, "_tshark_fields", lambda _t, _p, flt, _f: (
+        [["239.255.255.250:1900", "M-SEARCH", "*", "239.255.255.250", "", ""],
+         ["real-c2.example", "GET", "/gate", "185.10.20.30", "", "80"]]
+        if flt == "http.request" else []
+    ))
+    ns = pipeline.network_summary(pcap)
+    assert [h["host"] for h in ns["http"]] == ["real-c2.example"]
+
+
 
