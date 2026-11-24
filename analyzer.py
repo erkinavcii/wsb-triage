@@ -57,6 +57,7 @@ API_COMBOS = [
 ]
 
 SCRIPT_EXTENSIONS = {".bat", ".cmd", ".ps1", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".hta", ".reg"}
+CONFIG_EXTENSIONS = {".pimx", ".iss", ".inf", ".ini"}
 
 # String patterns. A single hit is weak evidence (installers, browser engines and system DLLs contain many of these
 # strings legitimately); several DIFFERENT hits in the same category are what matters, so each rule escalates.
@@ -254,7 +255,12 @@ def _looks_printable(s: str) -> bool:
     return (printable / len(s)) >= 0.75
 
 
-def deobfuscate_script(text: str) -> List[Dict[str, str]]:
+_CARET_DEOBF_KEEP_RX = re.compile(
+    r"(?i)(powershell|https?://|certutil|bitsadmin|mshta|invoke-webrequest|cmd\s*/c|sc\s+(?:stop|delete)|schtasks)"
+)
+
+
+def deobfuscate_script(text: str, allow_caret: bool = True) -> List[Dict[str, str]]:
     """Best-effort decoding of Base64 PowerShell payloads and caret-obfuscated batch lines."""
     snippets: List[Dict[str, str]] = []
     seen: set = set()
@@ -289,11 +295,20 @@ def deobfuscate_script(text: str) -> List[Dict[str, str]]:
             if len(snippets) >= 10:
                 break
 
-    if text.count("^") >= 6:
-        norm = re.sub(r"\^([A-Za-z0-9_.:/\\-])", r"\1", text)
-        if norm != text and re.search(r"(?i)(powershell|https?://|certutil|bitsadmin|mshta|invoke-webrequest|cmd\s*/c)", norm):
-            if norm[:1000] not in seen:
-                snippets.append({"kind": "Batch caret temizliği", "decoded": norm[:4000]})
+    if allow_caret:
+        for line in text.splitlines():
+            if len(line) > 4096 or line.count("^") < 4:
+                continue
+            if len(re.findall(r"\^[A-Za-z0-9]", line)) < 3:
+                continue
+            norm = re.sub(r"\^([A-Za-z0-9_.:/\\-])", r"\1", line)
+            if norm != line and _CARET_DEOBF_KEEP_RX.search(norm):
+                key = norm[:1000]
+                if key not in seen:
+                    seen.add(key)
+                    snippets.append({"kind": "Batch caret temizliği", "decoded": norm[:4000]})
+                    if len(snippets) >= 15:
+                        break
     return snippets
 
 
@@ -464,6 +479,66 @@ def inspect_pdf_file(data: bytes) -> List[Dict[str, Any]]:
     return findings
 
 
+_OLE2_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+_MSI_EXEC_RX = re.compile(
+    r"(?i)(?:\b(?:powershell(?:\.exe)?|cmd(?:\.exe)?\s+/c|mshta|wscript|cscript|rundll32|regsvr32|Invoke-WebRequest|DownloadString|FromBase64String)\b|(?:^|\s)-e(?:nc|ncodedcommand)?\s+[A-Za-z0-9+/=]{16,})"
+)
+_INSTALLER_TAMPER_RX = re.compile(
+    r"(?i)\b(sc(?:\.exe)?\s+(?:stop|delete)|schtasks(?:\.exe)?\s+/delete|AGMService|AGSService|AdobeGCClient|AdobeGCInvoker|SPPExtComObj|Smartversion|amtlib\.dll)\b"
+)
+_INSTALLER_HIGH_RX = re.compile(r"(?i)\b(sc(?:\.exe)?\s+(?:stop|delete)|schtasks(?:\.exe)?\s+/delete)\b")
+
+
+def inspect_msi_file(ext: str, data: bytes) -> List[Dict[str, Any]]:
+    is_msi = ext == ".msi" or (
+        data[:8] == _OLE2_MAGIC
+        and (
+            b"CustomAction" in data
+            or b"InstallExecuteSequence" in data
+            or "CustomAction".encode("utf-16le") in data
+        )
+    )
+    if not is_msi:
+        return []
+    txt = extract_printable_strings(data[:10 * 1024 * 1024], min_len=4)
+    hits: List[str] = []
+    for m in _MSI_EXEC_RX.finditer(txt):
+        tok = m.group(0).strip()[:40]
+        if tok and tok.lower() not in {h.lower() for h in hits}:
+            hits.append(tok)
+            if len(hits) >= 6:
+                break
+    if not hits:
+        return []
+    return [{
+        "category": "MSI Özel Eylemi (CustomAction)",
+        "severity": "high",
+        "points": 30,
+        "description": f"MSI kurulum paketi içinde şüpheli komut/betik çalıştırma izleri: {', '.join(hits)}",
+    }]
+
+
+def inspect_installer_config(path_obj: Path, ext: str, text: str) -> List[Dict[str, Any]]:
+    if ext not in (CONFIG_EXTENSIONS | SCRIPT_EXTENSIONS) and not re.search(r"(?i)(patch.*\.log|runonce.*)", path_obj.name):
+        return []
+    hits: List[str] = []
+    for m in _INSTALLER_TAMPER_RX.finditer(text):
+        tok = m.group(0).strip()[:48]
+        if tok and tok.lower() not in {h.lower() for h in hits}:
+            hits.append(tok)
+            if len(hits) >= 6:
+                break
+    if not hits:
+        return []
+    is_high = bool(_INSTALLER_HIGH_RX.search(text))
+    return [{
+        "category": "Kurulum / Lisans Müdahale Betiği",
+        "severity": "high" if is_high else "medium",
+        "points": 25 if is_high else 15,
+        "description": f"Kurulum/yapılandırma dosyasında servis, görev veya lisans bileşeni müdahalesi: {', '.join(hits)}",
+    }]
+
+
 def _analyze_dotnet_strings(extracted_text: str) -> List[Dict[str, Any]]:
     rules = [
         (25, "high", ".NET bellek içi yükleme (Reflection + Base64/İndirme)",
@@ -500,6 +575,12 @@ def _collect_pe_imports(entries: Any, pe_info: Dict[str, Any]) -> None:
                                 pe_info["suspicious_imports"][category].append(func_name)
 
 
+_VERSION_FIELDS = {
+    "CompanyName", "FileDescription", "OriginalFilename",
+    "ProductName", "InternalName", "FileVersion", "LegalCopyright",
+}
+
+
 def analyze_pe_file(file_path: str, raw_data: bytes, file_size: Optional[int] = None) -> Dict[str, Any]:
     pe_info: Dict[str, Any] = {
         "is_pe": False,
@@ -513,6 +594,7 @@ def analyze_pe_file(file_path: str, raw_data: bytes, file_size: Optional[int] = 
         "anomalies": [],
         "anomaly_points": 0,
         "overlay": None,
+        "version_info": {},
         "dotnet_indicators": [],
         "sections": [],
         "suspicious_imports": {},
@@ -528,6 +610,20 @@ def analyze_pe_file(file_path: str, raw_data: bytes, file_size: Optional[int] = 
             pe_info["imphash"] = pe.get_imphash() or ""
         except Exception:
             pe_info["imphash"] = ""
+
+        for fi_entry in getattr(pe, "FileInfo", None) or []:
+            items = fi_entry if isinstance(fi_entry, list) else [fi_entry]
+            for fi in items:
+                if getattr(fi, "Key", None) == b"StringFileInfo" or hasattr(fi, "StringTable"):
+                    for st in getattr(fi, "StringTable", None) or []:
+                        for k, v in (getattr(st, "entries", None) or {}).items():
+                            k_str = k.decode("utf-8", errors="ignore") if isinstance(k, bytes) else str(k)
+                            k_str = k_str.replace("\x00", "").strip()
+                            if k_str in _VERSION_FIELDS:
+                                v_str = v.decode("utf-8", errors="ignore") if isinstance(v, bytes) else str(v)
+                                v_str = v_str.replace("\x00", "").strip()
+                                if v_str and k_str not in pe_info["version_info"]:
+                                    pe_info["version_info"][k_str] = v_str
 
         is_repro = False
         if hasattr(pe, "DIRECTORY_ENTRY_DEBUG"):
@@ -682,6 +778,16 @@ def analyze_pe_file(file_path: str, raw_data: bytes, file_size: Optional[int] = 
     return pe_info
 
 
+_SPOOF_VENDORS_RX = re.compile(
+    r"(?i)\b(microsoft\s+corporation|google\s+llc|apple\s+inc|adobe\s+(?:inc|systems)|nvidia\s+corporation|intel\s+corporation|mozilla\s+corporation)\b"
+)
+_SYSBIN_NAMES = {
+    "svchost.exe", "lsass.exe", "csrss.exe", "services.exe", "winlogon.exe",
+    "explorer.exe", "rundll32.exe", "conhost.exe", "taskhostw.exe",
+    "smss.exe", "spoolsv.exe", "ntoskrnl.exe",
+}
+
+
 def analyze_single_file(file_path: str, sig_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     path_obj = Path(file_path)
     file_size = path_obj.stat().st_size
@@ -720,15 +826,40 @@ def analyze_single_file(file_path: str, sig_info: Optional[Dict[str, Any]] = Non
         lnk_parts = [lnk_info.get(k, "") for k in ("local_base_path", "relative_path", "working_dir", "arguments", "description")]
         extracted_text += "\n" + " ".join(p for p in lnk_parts if p)
 
-    deobfuscated_snippets = deobfuscate_script(extracted_text)
+    deobfuscated_snippets = deobfuscate_script(extracted_text, allow_caret=(not pe_info["is_pe"]))
     if deobfuscated_snippets:
         extracted_text += "\n" + "\n".join(s["decoded"] for s in deobfuscated_snippets)
 
     if pe_info["is_pe"] and pe_info["is_dotnet"]:
         pe_info["dotnet_indicators"] = _analyze_dotnet_strings(extracted_text)
 
+    sig_status = sig_info.get("status", "Unknown")
     spoof_flags = detect_spoofing(path_obj, sample_data[:64])
-    format_findings = inspect_office_file(file_path, ext, sample_data) + inspect_pdf_file(sample_data)
+    ver_info = pe_info.get("version_info") or {}
+    if ver_info:
+        comp = (ver_info.get("CompanyName") or "").strip()
+        if comp and _SPOOF_VENDORS_RX.search(comp) and sig_status not in ("Valid", "HashMismatch"):
+            spoof_flags.append({
+                "type": "vendor_impersonation",
+                "severity": "high",
+                "points": 30,
+                "reason": f"Sahte üretici kimliği şüphesi: Dosya meta verisinde '{comp}' yazıyor ancak geçerli dijital imzası yok ({sig_status}).",
+            })
+        orig_fn = (ver_info.get("OriginalFilename") or "").strip().lower()
+        if orig_fn in _SYSBIN_NAMES and path_obj.name.lower() != orig_fn and sig_status != "Valid":
+            spoof_flags.append({
+                "type": "sysbin_masquerade",
+                "severity": "high",
+                "points": 25,
+                "reason": f"Sistem dosyası kılığına girme: Orijinal adı '{orig_fn}' olan imzasız dosya '{path_obj.name}' adıyla gizlenmiş.",
+            })
+
+    format_findings = (
+        inspect_office_file(file_path, ext, sample_data)
+        + inspect_pdf_file(sample_data)
+        + inspect_msi_file(ext, sample_data)
+        + inspect_installer_config(path_obj, ext, extracted_text)
+    )
     if lnk_info:
         cmd_blob = " ".join(lnk_info.get(k, "") for k in ("local_base_path", "relative_path", "arguments"))
         if _LOLBIN_RX.search(cmd_blob):
@@ -775,7 +906,6 @@ def analyze_single_file(file_path: str, sig_info: Optional[Dict[str, Any]] = Non
     risk_score = 0
     risk_reasons = []
 
-    sig_status = sig_info.get("status", "Unknown")
     is_script = ext in SCRIPT_EXTENSIONS
     if sig_status == "HashMismatch":
         risk_score += 45
