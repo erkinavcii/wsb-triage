@@ -708,9 +708,11 @@ def test_f8_honeyfile_verdict_distinguishes_confirmed_vs_unattributed_and_filter
 
 def test_win11_wsb_idle_isolation_service_and_cbs_webview_noise_filtered(tmp_path):
     j_clean = bare_job(tmp_path / "clean_wsb")
-    j_clean.state["stages"]["vt"]["status"] = "done"
-    j_clean.state["stages"]["sandbox"]["status"] = "done"
-    j_clean.state["vt"] = [{"rel": "sample.sfv", "status": "ok", "result": {"malicious": 0, "suspicious": 0}}]
+    j_clean.state["status"] = "done"
+    for st in ("extract", "inventory", "static", "vt", "sandbox"):
+        j_clean.state["stages"][st]["status"] = "done"
+    j_clean.state["network"] = {"dns": [], "sni": [], "http": [], "ips": [], "total_packets": 10}
+    j_clean.state["vt"] = [{"rel": "sample.sfv", "status": "VT'de kayıtlı", "result": {"stats": {"malicious": 0, "suspicious": 0}, "total": 60, "engines": []}}]
     j_clean.state["behavior"] = pipeline.sanitize_sandbox_json({
         "Persistence": {
             "Services": [r"IsolationSession | Manual | C:\Windows\system32\svchost.exe -k IsolationSession -p"],
