@@ -4,12 +4,13 @@
 
 Bu belge kodun tamamı okunarak hazırlandı. "Doğrulandı" yazan maddeler kodda ya da küçük bir denemeyle teyit edildi. A bölümünün tamamı, B ve C'nin neredeyse tamamı düzeltildi/yapıldı; her maddenin altında ne yapıldığı yazıyor.
 
-## Durum özeti (20 Kasım 2026)
+## Durum özeti (24 Kasım 2026)
 
-- **Testler:** **149 test** (`149 passed, 0 skipped, 0 failed` — `python -m pytest -v`) yerelde geçiyor (`128` mevcut + `21` yeni E1–E17 regresyon testi), ayrıca `node --check static/app.js` ve PowerShell 5.1 AST/ASCII kontrolleri temiz.
+- **Testler:** **172 test** (`172 passed, 0 skipped, 0 failed` — `python -m pytest -v`) yerelde geçiyor (`18` yerleşik YARA kuralı hem `yara-python` hem yerleşik motorda birebir uyumlu), ayrıca `node --check static/app.js` ve PowerShell 5.1 AST/ASCII kontrolleri temiz.
 - **CI:** 13 Kasım'daki son GitHub Actions çalışması **başarısızdı** (`test_signatures_are_read`: imza kontrolü CI makinesinde sessizce "Unknown" dönüyordu). Hata artık görünür ve olası neden giderildi (aşağıda D1); CI'nin yeşile dönüp dönmediği bir sonraki gönderimde görülecek.
 - **İkinci inceleme (19 Kasım):** Gemini'nin eklediği B/C değişiklikleri incelendi. Sağlam olanlar: API belirteci, CSP, bildirimler, ekran görüntüsü doğrulaması, sağ tık menüsü, otomatik tıklama, panelde güvenli gösterim. Bulunan dört sorun ve düzeltmeleri **D** bölümünde.
-- **Üçüncü inceleme (19–20 Kasım):** Kodda kalan somut hatalar/kopukluklar ve projenin temel amacına (ön tespit + alternatif ortamda çalıştırma) yönelik eksik özellikler **E** bölümüne eklendi; **E1–E17 maddelerinin tamamı uygulandı** (`E7` canlı WSB ve `E8` canlı VirtualBox misafir çalıştırması kod + mock testleri itibarıyla tamamlanmış olup canlı uçtan uca çalıştırma ortam/VM kurulumu beklemektedir).
+- **Üçüncü inceleme (19–20 Kasım):** Kodda kalan somut hatalar/kopukluklar ve projenin temel amacına (ön tespit + alternatif ortamda çalıştırma) yönelik eksik özellikler **E** bölümüne eklendi ve **E1–E17** tamamlandı.
+- **Dördüncü inceleme & canlı repack doğrulaması (24 Kasım):** Gerçek dünya çok katmanlı kurulum testi (`Photoshop.2026`) sonrası saptanan iç içe arşiv / PE yanlış pozitif ve Sandbox yem dosya / yerel ağ gürültüsü sorunları giderildi; ileri seviye statik/istihbarat/dinamik bellek & FakeNet yetenekleri (**F1–F8**) eklendi.
 
 ## D. İkinci incelemede bulunanlar (19 Kasım 2026)
 
@@ -306,3 +307,26 @@ Bu bölümdeki açık hata ve eksik özellik maddelerinin (**E1–E17**) tamamı
 ### 4. Uygulama Durumu Özeti
 
 - Tüm **E1–E17** maddeleri uygulanmış ve test kapsamına alınmıştır. Kalan tek ortam bağımlı adım, hedef makinede isteğe bağlı olarak Windows Sandbox özelliğini etkinleştirmek (`E7`) ve/veya temiz bir VirtualBox Windows VM snapshot'ı hazırlamaktır (`E8`).
+
+---
+
+## F. Dördüncü İnceleme & Gerçek Dünya Paketi Sonrası Geliştirmeler (24 Kasım 2026)
+
+Canlı çok katmanlı kurulum/repack incelemesi (`Photoshop.2026` klasörü -> `5.7 GB .iso` -> alt `.zip` paketleri) sırasında tespit edilen boşluklar ve eklenen yeni yetenekler:
+
+- **F1. Binary PE Dosyalarda "Batch Caret (`^`)" Yanlış Pozitifi Giderildi — ✅ UYGULANDI:**
+  - `analyzer.deobfuscate_script(text, allow_caret=True)` satır bazlı doğrulama (`<= 4096` karakter, en az 4 `^` ve en az 3 `^[A-Za-z0-9]` dizilimi + komut anahtar kelimesi) kullanacak şekilde sıkılaştırıldı; `analyze_single_file` içinde PE ikili dosyalar için `allow_caret=False` geçilerek temiz `.exe`/`.dll` dosyalarındaki rastgele `^` karakterlerinin yanlış pozitif üretmesi engellendi (`tests/test_static.py`).
+- **F2. PE `VS_VERSIONINFO` Çıkarımı ve Üretici/Sistem Dosyası Kimlik Sahtekarlığı Tespiti — ✅ UYGULANDI:**
+  - `analyze_pe_file` artık `StringFileInfo` (`CompanyName`, `ProductName`, `OriginalFilename`, `FileVersion` vb.) bilgisini `pe_info["version_info"]` altına çıkarıyor; geçerli imzası olmadan Microsoft/Adobe/Google/Apple/NVIDIA/Intel/Mozilla olduğunu iddia eden (`vendor_impersonation`) veya `svchost.exe`/`lsass.exe` gibi sistem dosyalarının `OriginalFilename` değerini taşıyıp farklı isimle gizlenen (`sysbin_masquerade`) dosyalar `spoof_flags` ile yakalanıyor (`tests/test_static.py`).
+- **F3. MSI `CustomAction`, Kurulum/Lisans Müdahale Betiği (`.pimx`/`.iss`/`RunOnce`) ve 18 Yerleşik YARA Kuralı — ✅ UYGULANDI:**
+  - `inspect_msi_file` (`.msi` içi şüpheli `CustomAction` LOLBin/PowerShell tespiti) ve `inspect_installer_config` (`.pimx`, `.iss`, `.inf`, `.ini`, `RunOnce*`, `Patch_*.log` içinde servis/zamanlanmış görev silme ve lisans servisi müdahalesi tespiti) eklendi. `rules/safebox_builtin.yar` içine `SafeBox_License_Service_Tamper` ve `SafeBox_Process_Hollowing_APIs` eklenerek yerleşik YARA kural sayısı **18**'e çıkarıldı (`tests/test_static.py`).
+- **F4. Anahtarsız (Zero-Config) Hash İstihbaratı: CIRCL `hashlookup` (NSRL) ve ThreatFox — ✅ UYGULANDI:**
+  - `intel_client.py` içine ücretsiz ve API anahtarsız çalışabilen **CIRCL Hashlookup** (`known_good` NSRL bilinen temiz yazılım doğrulaması + `KnownMalicious` kontrolü) ve **ThreatFox IOC** hash sorgusu eklendi; API Ayarları penceresinden (`chkCirclEnabled`, `chkTfEnabled`) tek tıkla etkinleştirilebiliyor (`tests/test_intel.py`, `tests/test_app.py`).
+- **F5. Akıllı Kurulum Tıklayıcı (`RadioButton`/`CheckBox`), Canlı Süreç Bellek Taraması (`MemoryFindings`) ve FakeNet Tuzağı — ✅ UYGULANDI:**
+  - `sandbox/Inside-Sandbox.ps1` içinde `Invoke-FakeUser`, reklam/bundleware kutularından kaçınarak lisans kabul `RadioButton` (`SelectionItemPattern`) ve `CheckBox` (`TogglePattern`) kontrollerini işaretleyip `Hyperlink`/erişilebilirlik/fare tıklaması yedekleriyle kurulum sihirbazlarını ilerletiyor (`AutoClicks`). Gözlem sonunda örnek süreç ağacı kapanmadan `SafeBoxMem` (`VirtualQueryEx` + `ReadProcessMemory`) ile canlı RAM bölgelerinde şifresi çözülmüş fileless/unpacked C2 ve stealer izleri taranıyor (`MemoryFindings`). İsteğe bağlı `FakeNet` modu ağ kapalıyken `127.0.0.1:53` (DNS) ve `127.0.0.1:80` (HTTP) dinleyerek zararlıların çevrimdışı C2 isteklerini yakalıyor (`FakeNetRequests`) (`tests/test_sandbox_files.py`).
+- **F6. Klasör İçi Arşiv ve Seçici İç İçe Arşiv Çıkarımı (`_unpack_nested_archives`) — ✅ UYGULANDI:**
+  - `pipeline.py` artık hem doğrudan verilen klasörlerin içindeki arşivleri (`.iso`, `.zip`, `.rar`, `.7z` vb.) hem de arşiv içinden çıkan alt arşivleri (`max_depth=2`) salt okunur girdi klasörüne dokunmadan `unpacked/` altına çıkarıyor. Küçük alt arşivler (`<= 32 MB`) tam açılırken, çok gigabaytlık dev arşivlerde (`> 32 MB`) tüm medya dosyalarını açmak yerine merkezi dizin / `7z l -slt` taranarak yalnızca ana çalıştırılabilirler, script'ler, `.pimx`/`.iss` yapılandırmaları ve yama/crack dosyaları seçilerek çıkarılıyor (`tests/test_extract.py`).
+- **F7. Karar Motoru, Rapor, IOC ve Web Arayüzü Entegrasyonu — ✅ UYGULANDI:**
+  - `MemoryFindings`, `FakeNetRequests`, `AutoClicks`, `pe_info.version_info` ve CIRCL/ThreatFox sonuçları `compute_verdict`, `write_report`, `collect_iocs`, `compare_jobs` ve sıkı CSP uyumlu web arayüzüne bağlandı (`tests/test_verdict.py`, `tests/test_app.py`).
+- **F8. Honeyfile `LastAccessTimeUtc` ve Sandbox Ağ Gürültüsü (`.mshome.net` / WPAD / SSDP) Yanlış Pozitifleri Giderildi — ✅ UYGULANDI:**
+  - `sandbox/Inside-Sandbox.ps1` içinde Windows Defender ve Search Indexer'ın tetiklediği `fsutil disablelastaccess 0` / `LastAccessTimeUtc` kontrolü kaldırıldı; yerine yerel dilden bağımsız `S-1-1-0` (`Everyone`) `FileSystemAuditRule` SACL + Security Event ID `4663` süreç doğrulamalı okuma denetimi (`HoneyBenignReaders` istisnalı) eklendi. `pipeline.py` içinde `*.mshome.net`, `wpad.*`, noktasız NetBIOS adları ve yerel/multicast IP'ler (`239.255.255.250:1900` SSDP `M-SEARCH`/`NOTIFY` dahil) `Yerel (gürültü)` olarak sınıflandırılıp filtrelendi (`tests/test_sandbox_files.py`, `tests/test_verdict.py`).
