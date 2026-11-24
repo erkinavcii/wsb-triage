@@ -183,10 +183,48 @@ def test_f8_honeyfile_uses_4663_sacl_without_lastaccess_false_positives():
     ps = (ROOT / "sandbox" / "Inside-Sandbox.ps1").read_text(encoding="utf-8")
     assert "disablelastaccess" not in ps
     assert "LastAccessTimeUtc" not in ps
+    assert "Set-Acl" not in ps
+    assert "SafeBoxPriv" in ps
+    assert "SeSecurityPrivilege" in ps
+    assert "SetAccessControl" in ps
     assert "0CCE921D-69AE-11D9-BED3-505054503030" in ps
     assert "S-1-1-0" in ps
     assert "FileSystemAuditRule" in ps
     assert "4663" in ps
+    assert "Update-HoneyReads" in ps
+    assert "ReadFile|CreateFileMapping" in ps
     assert "HoneyBenignReaders" in ps
+    assert "HoneyShellDocReaders" in ps
+
+    # Verify Vault vs Desktop/Documents read/copy attribution logic in real Windows PowerShell 5.1
+    start = ps.index("$script:Honeyfiles = @()")
+    end = ps.index("function Initialize-Honeyfiles")
+    snippet = ps[start:end]
+    ps_test = (
+        "$TreePids = @{ 4242 = 1 }; function Log($m) {}\n"
+        + snippet
+        + "\n"
+        + "$vaultPath = 'C:\\Users\\WDAGUtilityAccount\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Login Data'\n"
+        + "$docPath = 'C:\\Users\\WDAGUtilityAccount\\Desktop\\wallet_keys.txt'\n"
+        + "$script:HoneyMap[$vaultPath.ToLower()] = [pscustomobject]@{ Path = $vaultPath; Vault = $true }\n"
+        + "$script:HoneyMap[$docPath.ToLower()] = [pscustomobject]@{ Path = $docPath; Vault = $false }\n"
+        + "# 1. Defender scanning vault & explorer thumbnailing Desktop doc -> ignored\n"
+        + "Record-HoneyRead $vaultPath 'C:\\ProgramData\\Microsoft\\Windows Defender\\Platform\\MsMpEng.exe' 1100\n"
+        + "Record-HoneyRead $docPath 'C:\\Windows\\explorer.exe' 2200\n"
+        + "if ($script:HoneyReadAlerts.Count -ne 0) { throw ('unexpected alert: ' + ($script:HoneyReadAlerts -join ';')) }\n"
+        + "# 2. Hollowed explorer.exe reading Chrome Login Data (read-only copy, 0 modification) -> CAUGHT!\n"
+        + "Record-HoneyRead $vaultPath 'C:\\Windows\\explorer.exe' 2200\n"
+        + "# 3. Sample child process copying Desktop wallet_keys.txt (read-only copy, 0 modification) -> CAUGHT!\n"
+        + "Record-HoneyRead $docPath 'C:\\Windows\\System32\\xcopy.exe' 4242\n"
+        + "Write-Output ('COUNT=' + $script:HoneyReadAlerts.Count)\n"
+        + "$script:HoneyReadAlerts | ForEach-Object { Write-Output $_ }\n"
+    )
+    powershell = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    cp = subprocess.run([powershell, "-NoProfile", "-Command", ps_test], capture_output=True, text=True, timeout=20)
+    assert cp.returncode == 0, cp.stderr
+    assert "COUNT=2" in cp.stdout
+    assert "ACCESSED (infostealer read by explorer.exe pid=2200):" in cp.stdout
+    assert "ACCESSED (infostealer read by xcopy.exe pid=4242):" in cp.stdout
+
 
 

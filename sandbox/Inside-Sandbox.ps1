@@ -238,30 +238,99 @@ function Invoke-FakeUser {
 }
 
 # ------------------------------------------------------------------ honeyfiles (infostealer / ransomware decoys)
+if (-not ('SafeBoxPriv' -as [type])) {
+    try {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class SafeBoxPriv {
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool LookupPrivilegeValue(string lpSystemName, string lpName, out LUID lpLuid);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool AdjustTokenPrivileges(IntPtr TokenHandle, bool DisableAllPrivileges, ref TOKEN_PRIVILEGES NewState, uint BufferLength, IntPtr PreviousState, IntPtr ReturnLength);
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll")]
+    private static extern bool CloseHandle(IntPtr hObject);
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LUID { public uint LowPart; public int HighPart; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct TOKEN_PRIVILEGES { public uint PrivilegeCount; public LUID Luid; public uint Attributes; }
+    public static bool EnablePrivilege(string privilegeName) {
+        IntPtr hTok;
+        if (!OpenProcessToken(GetCurrentProcess(), 0x0028, out hTok)) return false;
+        try {
+            LUID luid;
+            if (!LookupPrivilegeValue(null, privilegeName, out luid)) return false;
+            TOKEN_PRIVILEGES tp = new TOKEN_PRIVILEGES { PrivilegeCount = 1, Luid = luid, Attributes = 0x00000002 };
+            if (!AdjustTokenPrivileges(hTok, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero)) return false;
+            return Marshal.GetLastWin32Error() == 0;
+        } finally {
+            CloseHandle(hTok);
+        }
+    }
+}
+"@ -ErrorAction SilentlyContinue
+    } catch {}
+}
+
 $script:Honeyfiles = @()
+$script:HoneyMap = @{}
+$script:HoneySeenReads = @{}
+$script:HoneyReadAlerts = New-Object System.Collections.ArrayList
+$script:HoneyLastPoll = [datetime]::MinValue
 $HoneyBenignReaders = @(
     'msmpeng.exe', 'nissrv.exe', 'mpcmdrun.exe', 'securityhealthservice.exe',
-    'searchprotocolhost.exe', 'searchindexer.exe', 'searchfilterhost.exe',
-    'explorer.exe', 'svchost.exe', 'system', 'csrss.exe', 'dllhost.exe',
-    'backgroundtaskhost.exe', 'runtimebroker.exe', 'sihost.exe', 'taskhostw.exe'
+    'searchprotocolhost.exe', 'searchindexer.exe', 'searchfilterhost.exe', 'system'
 )
+$HoneyShellDocReaders = @(
+    'explorer.exe', 'dllhost.exe', 'backgroundtaskhost.exe', 'runtimebroker.exe', 'sihost.exe'
+)
+
+function Test-HoneyBenignReader([string]$ProcLeaf, [int]$EvPid, [bool]$IsVault) {
+    if ($EvPid -gt 0 -and $TreePids.ContainsKey($EvPid)) { return $false }
+    $leaf = ([string]$ProcLeaf).ToLower()
+    if ($HoneyBenignReaders -contains $leaf) { return $true }
+    if ((-not $IsVault) -and ($HoneyShellDocReaders -contains $leaf)) { return $true }
+    return $false
+}
+
+function Record-HoneyRead([string]$ObjPath, [string]$ProcLeaf, [int]$EvPid) {
+    if (-not $ObjPath -or $EvPid -eq $PID) { return }
+    $objKey = $ObjPath.ToLower()
+    if (-not $script:HoneyMap.ContainsKey($objKey) -or $script:HoneySeenReads.ContainsKey($objKey)) { return }
+    $h = $script:HoneyMap[$objKey]
+    $leaf = if ($ProcLeaf) { ([IO.Path]::GetFileName($ProcLeaf)).ToLower() } else { 'unknown' }
+    if (Test-HoneyBenignReader $leaf $EvPid ([bool]$h.Vault)) { return }
+    $script:HoneySeenReads[$objKey] = 1
+    $msg = "ACCESSED (infostealer read by $leaf pid=$EvPid): $($h.Path)"
+    [void]$script:HoneyReadAlerts.Add($msg)
+    Log "HONEYFILE READ by $leaf pid=${EvPid}: $($h.Path)"
+}
+
 function Initialize-Honeyfiles {
     if (-not $SeedHoneyfiles -or $TestMode) { return }
-    # Enable File System object access auditing via locale-independent subcategory GUID (Event ID 4663)
-    try { & auditpol.exe /set /subcategory:"{0CCE921D-69AE-11D9-BED3-505054503030}" /success:enable 2>&1 | Out-Null } catch {}
+    $privOk = $false
+    try { $privOk = [SafeBoxPriv]::EnablePrivilege('SeSecurityPrivilege') } catch {}
+    # Enable File System object access auditing via locale-independent subcategory GUID (Event ID 4663 / 4656)
+    try { & auditpol.exe /set /subcategory:"{0CCE921D-69AE-11D9-BED3-505054503030}" /success:enable /failure:enable 2>&1 | Out-Null } catch {}
     $specs = @(
-        @{ P = "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Login Data"; C = "SQLite format 3`0fake_login_data_canary" },
-        @{ P = "$env:LOCALAPPDATA\Google\Chrome\User Data\Local State"; C = '{"os_crypt":{"encrypted_key":"RFBBUEkAAAA="}}' },
-        @{ P = "$env:APPDATA\Mozilla\Firefox\Profiles\default.canary\logins.json"; C = '{"nextId":2,"logins":[{"hostname":"https://canary.invalid","encryptedUsername":"canary"}]}' },
-        @{ P = "$env:APPDATA\Mozilla\Firefox\Profiles\default.canary\cookies.sqlite"; C = "SQLite format 3`0fake_cookie_canary" },
-        @{ P = "$env:APPDATA\Exodus\exodus.wallet\seed.seco"; C = "SECO_CANARY_WALLET_0001" },
-        @{ P = "$env:APPDATA\Electrum\wallets\default_wallet"; C = '{"seed_version":17,"use_encryption":false,"canary":true}' },
-        @{ P = "$env:USERPROFILE\Documents\passwords_backup.txt"; C = "bank_pin=4821`r`nseed=abandon ability able about above absent`r`n" },
-        @{ P = "$env:USERPROFILE\Documents\finance_2026.docx"; C = "PK_CANARY_FINANCE_DOCUMENT_2026" },
-        @{ P = "$env:USERPROFILE\Desktop\wallet_keys.txt"; C = "BTC_WIF=5HueCGU8rMjxEXxiPuD5BDku4MkFqeZyd4dZ1jvhTVqvbTLvyTJ`r`n" }
+        @{ P = "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Login Data"; V = $true; C = "SQLite format 3`0fake_login_data_canary" },
+        @{ P = "$env:LOCALAPPDATA\Google\Chrome\User Data\Local State"; V = $true; C = '{"os_crypt":{"encrypted_key":"RFBBUEkAAAA="}}' },
+        @{ P = "$env:APPDATA\Mozilla\Firefox\Profiles\default.canary\logins.json"; V = $true; C = '{"nextId":2,"logins":[{"hostname":"https://canary.invalid","encryptedUsername":"canary"}]}' },
+        @{ P = "$env:APPDATA\Mozilla\Firefox\Profiles\default.canary\cookies.sqlite"; V = $true; C = "SQLite format 3`0fake_cookie_canary" },
+        @{ P = "$env:APPDATA\Exodus\exodus.wallet\seed.seco"; V = $true; C = "SECO_CANARY_WALLET_0001" },
+        @{ P = "$env:APPDATA\Electrum\wallets\default_wallet"; V = $true; C = '{"seed_version":17,"use_encryption":false,"canary":true}' },
+        @{ P = "$env:USERPROFILE\Documents\passwords_backup.txt"; V = $false; C = "bank_pin=4821`r`nseed=abandon ability able about above absent`r`n" },
+        @{ P = "$env:USERPROFILE\Documents\finance_2026.docx"; V = $false; C = "PK_CANARY_FINANCE_DOCUMENT_2026" },
+        @{ P = "$env:USERPROFILE\Desktop\wallet_keys.txt"; V = $false; C = "BTC_WIF=5HueCGU8rMjxEXxiPuD5BDku4MkFqeZyd4dZ1jvhTVqvbTLvyTJ`r`n" }
     )
     $everyoneSid = $null
     try { $everyoneSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0') } catch {}
+    $saclCount = 0
+    $lastSaclErr = ''
     foreach ($sp in $specs) {
         try {
             $fp = $sp.P
@@ -274,30 +343,73 @@ function Initialize-Honeyfiles {
             $sha = (Get-FileHash -LiteralPath $fp -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()
             if ($everyoneSid) {
                 try {
-                    $acl = Get-Acl -LiteralPath $fp -ErrorAction Stop
+                    $acl = [IO.File]::GetAccessControl($fp, [System.Security.AccessControl.AccessControlSections]::Audit)
+                    $auditRights = [System.Security.AccessControl.FileSystemRights]::ReadData -bor [System.Security.AccessControl.FileSystemRights]::ExecuteFile
+                    $auditFlags = [System.Security.AccessControl.AuditFlags]::Success -bor [System.Security.AccessControl.AuditFlags]::Failure
                     $auditRule = New-Object System.Security.AccessControl.FileSystemAuditRule(
                         $everyoneSid,
-                        [System.Security.AccessControl.FileSystemRights]::ReadData,
+                        $auditRights,
                         [System.Security.AccessControl.InheritanceFlags]::None,
                         [System.Security.AccessControl.PropagationFlags]::None,
-                        [System.Security.AccessControl.AuditFlags]::Success
+                        $auditFlags
                     )
                     $acl.AddAuditRule($auditRule)
-                    Set-Acl -LiteralPath $fp -AclObject $acl -ErrorAction Stop
-                } catch {}
+                    [IO.File]::SetAccessControl($fp, $acl)
+                    $saclCount++
+                } catch {
+                    $lastSaclErr = $_.Exception.Message
+                }
             }
-            $script:Honeyfiles += [pscustomobject]@{
+            $hObj = [pscustomobject]@{
                 Path = $fp
                 Sha256 = $sha
+                Vault = [bool]$sp.V
             }
+            $script:Honeyfiles += $hObj
+            $script:HoneyMap[$fp.ToLower()] = $hObj
         } catch {}
     }
-    Log "Honeyfiles seeded: $($script:Honeyfiles.Count)"
+    $script:HoneyLastPoll = Get-Date
+    Log "Honeyfiles seeded: $($script:Honeyfiles.Count) (SACL active: $saclCount, SeSecurityPrivilege: $privOk)"
+    if ($saclCount -eq 0 -and $lastSaclErr) { Log "Honeyfile SACL warning: $lastSaclErr" }
+}
+
+function Update-HoneyReads([datetime]$FloorTime) {
+    if ($script:HoneyMap.Count -eq 0 -or $TestMode) { return }
+    $from = if ($script:HoneyLastPoll -gt $FloorTime) { $script:HoneyLastPoll.AddSeconds(-3) } else { $FloorTime.AddSeconds(-2) }
+    $pollTs = Get-Date
+    try {
+        $evs = Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = @(4663, 4656); StartTime = $from } -MaxEvents 2500 -ErrorAction SilentlyContinue
+        foreach ($ev in $evs) {
+            try {
+                $xml = [xml]$ev.ToXml()
+                $d = @{}
+                foreach ($node in $xml.Event.EventData.Data) { $d[$node.Name] = [string]$node.'#text' }
+                $obj = ([string]$d['ObjectName']).Trim()
+                if (-not $obj -or -not $script:HoneyMap.ContainsKey($obj.ToLower())) { continue }
+                $rawMask = ([string]$d['AccessMask']).Trim()
+                if ($rawMask) {
+                    $maskVal = 0
+                    if ($rawMask -match '^0x[0-9a-fA-F]+$') { $maskVal = [Convert]::ToInt64($rawMask, 16) }
+                    elseif ($rawMask -match '^\d+$') { $maskVal = [int64]$rawMask }
+                    if ($maskVal -gt 0 -and (($maskVal -band 0x21) -eq 0)) { continue }
+                }
+                $rawPid = ([string]$d['ProcessId']).Trim()
+                $evPid = 0
+                if ($rawPid -match '^0x[0-9a-fA-F]+$') { $evPid = [Convert]::ToInt32($rawPid, 16) }
+                elseif ($rawPid -match '^\d+$') { $evPid = [int]$rawPid }
+                if ($evPid -eq $PID) { continue }
+                $procPath = ([string]$d['ProcessName']).Trim()
+                Record-HoneyRead $obj $procPath $evPid
+            } catch {}
+        }
+    } catch {}
+    $script:HoneyLastPoll = $pollTs
 }
 
 function Check-Honeyfiles([datetime]$Since) {
+    Update-HoneyReads $Since
     $alerts = @()
-    $intactMap = @{}
     foreach ($h in $script:Honeyfiles) {
         if (-not (Test-Path -LiteralPath $h.Path)) {
             $alerts += "DELETED: $($h.Path)"
@@ -307,39 +419,13 @@ function Check-Honeyfiles([datetime]$Since) {
             $sha = (Get-FileHash -LiteralPath $h.Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()
             if ($sha -ne $h.Sha256) {
                 $alerts += "MODIFIED (ransomware/tamper): $($h.Path)"
-            } else {
-                $intactMap[$h.Path.ToLower()] = $h.Path
             }
         } catch {
             $alerts += "UNREADABLE: $($h.Path)"
         }
     }
-    if ($intactMap.Count -gt 0 -and -not $TestMode) {
-        $seenRead = @{}
-        try {
-            $evs = Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = 4663; StartTime = $Since.AddSeconds(-2) } -MaxEvents 4000 -ErrorAction SilentlyContinue
-            foreach ($ev in $evs) {
-                try {
-                    $xml = [xml]$ev.ToXml()
-                    $d = @{}
-                    foreach ($node in $xml.Event.EventData.Data) { $d[$node.Name] = [string]$node.'#text' }
-                    $obj = ([string]$d['ObjectName']).Trim()
-                    if (-not $obj) { continue }
-                    $objKey = $obj.ToLower()
-                    if (-not $intactMap.ContainsKey($objKey) -or $seenRead.ContainsKey($objKey)) { continue }
-                    $rawPid = ([string]$d['ProcessId']).Trim()
-                    $evPid = 0
-                    if ($rawPid -match '^0x[0-9a-fA-F]+$') { $evPid = [Convert]::ToInt32($rawPid, 16) }
-                    elseif ($rawPid -match '^\d+$') { $evPid = [int]$rawPid }
-                    if ($evPid -eq $PID) { continue }
-                    $procPath = ([string]$d['ProcessName']).Trim()
-                    $procLeaf = if ($procPath) { ([IO.Path]::GetFileName($procPath)).ToLower() } else { 'unknown' }
-                    if (-not $TreePids.ContainsKey($evPid) -and ($HoneyBenignReaders -contains $procLeaf)) { continue }
-                    $seenRead[$objKey] = 1
-                    $alerts += "ACCESSED (infostealer read by $procLeaf pid=$evPid): $($intactMap[$objKey])"
-                } catch {}
-            }
-        } catch {}
+    foreach ($ra in $script:HoneyReadAlerts) {
+        $alerts += [string]$ra
     }
     return @($alerts)
 }
@@ -1222,6 +1308,7 @@ while ((Get-Date) -lt $end) {
     if (($now - $lastSlowTick).TotalSeconds -ge 5) {
         $lastSlowTick = $now
         Update-Watch $watchStart
+        Update-HoneyReads $startedAt
         Test-LanBlock
         Invoke-FakeUser
         if (($now - $script:LastShot).TotalSeconds -ge 30) { Capture-Screen }
@@ -1237,6 +1324,7 @@ while ((Get-Date) -lt $end) {
 }
 Update-Watch $watchStart
 Import-AuditProcesses $startedAt
+Update-HoneyReads $startedAt
 $memFindings = @(Scan-ProcessMemory)
 Test-LanBlock
 Capture-Screen
@@ -1261,13 +1349,20 @@ if ($procmon -and -not $TestMode) {
             if (Test-Path -LiteralPath $pmlCsv) {
                 $sensitiveHits = @()
                 $hitSeen = @{}
-                $rxSens = '(?i)(Login Data|Local State|wallet\.dat|logins\.json|cookies\.sqlite|lsass\.exe|CurrentVersion\\Run|Windows Defender)'
+                $rxSens = '(?i)(Login Data|Local State|wallet\.dat|logins\.json|cookies\.sqlite|seed\.seco|default_wallet|lsass\.exe|CurrentVersion\\Run|Windows Defender)'
+                $rxHoneyCsv = '^"[^"]*","([^"]+)","(\d+)","(ReadFile|CreateFileMapping)","([^"]+)"'
                 $sr = [IO.File]::OpenText($pmlCsv)
                 try {
                     $lineNo = 0
-                    while ($null -ne ($line = $sr.ReadLine()) -and $lineNo -lt 50000 -and $sensitiveHits.Count -lt 100) {
+                    while ($null -ne ($line = $sr.ReadLine()) -and $lineNo -lt 250000) {
                         $lineNo++
-                        if ($line -match $rxSens) {
+                        if ($script:HoneyMap.Count -gt 0 -and ($line.IndexOf('ReadFile', [StringComparison]::OrdinalIgnoreCase) -ge 0 -or $line.IndexOf('CreateFileMapping', [StringComparison]::OrdinalIgnoreCase) -ge 0)) {
+                            $hm = [regex]::Match($line, $rxHoneyCsv)
+                            if ($hm.Success) {
+                                Record-HoneyRead $hm.Groups[4].Value $hm.Groups[1].Value ([int]$hm.Groups[2].Value)
+                            }
+                        }
+                        if ($sensitiveHits.Count -lt 100 -and $line -match $rxSens) {
                             $trim = $line.Substring(0, [Math]::Min(240, $line.Length))
                             if (-not $hitSeen.ContainsKey($trim)) {
                                 $hitSeen[$trim] = 1
