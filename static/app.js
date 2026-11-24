@@ -666,7 +666,8 @@ function renderStatic(st) {
       ${viBits ? `<div class="text-[11px] text-slate-400 flex flex-wrap gap-x-3 gap-y-1">${viBits}</div>` : ''}
       ${secRows ? `<details class="text-[11px]"><summary class="cursor-pointer text-slate-400">PE bölümleri (${asArr(pe.sections).length})</summary><div class="overflow-x-auto mt-1"><table class="tbl w-full"><tr><th>Bölüm</th><th>Entropi</th><th>VSize</th><th>RSize</th><th>Bayrak</th></tr>${secRows}</table></div></details>` : ''}`;
     }
-    return `<div class="glass-card rounded-2xl p-5 space-y-3">
+    const vtMal = vt && vt.result && vt.result.stats ? asNum(vt.result.stats.malicious) : 0;
+    return `<div class="glass-card rounded-2xl p-5 space-y-3" data-risk="${asNum(f.risk_score)}" data-vtmal="${vtMal}">
       <div class="flex flex-wrap items-start justify-between gap-3 border-b border-slate-800/80 pb-3">
         <div class="space-y-1 min-w-0">
           <div class="flex flex-wrap items-center gap-2"><span class="text-sm font-bold text-white mono break-all">${esc(f.rel)}</span>${sigBadge(f.signature)}
@@ -690,7 +691,38 @@ function renderStatic(st) {
       <div id="vtBox_${idx}" class="hidden p-3 rounded-xl bg-slate-900 border border-slate-700 text-xs"></div>
     </div>`;
   }).join('');
+  applyStaticFilter();
 }
+
+// Static list filter: show only the files in one risk band (kept while switching between analyses).
+const STATIC_FILTERS = [
+  ['all', 'Tümü', () => true, 'bg-slate-800 text-slate-200 border-slate-700'],
+  ['high', '🔴 Yüksek (65+)', (r) => r >= 65, 'bg-rose-500/20 text-rose-300 border-rose-500/40'],
+  ['50', '50+', (r) => r >= 50, 'bg-rose-500/20 text-rose-300 border-rose-500/40'],
+  ['mid', '🟠 Orta (35–64)', (r) => r >= 35 && r < 65, 'bg-amber-500/20 text-amber-300 border-amber-500/40'],
+  ['low', '🟢 Düşük (0–34)', (r) => r < 35, 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'],
+  ['vt', "🛡️ VT'de işaretli", (r, vt) => vt > 0, 'bg-rose-500/20 text-rose-300 border-rose-500/40'],
+];
+let staticFilter = 'all';
+function applyStaticFilter() {
+  const cards = Array.from($('filesContainer').children);
+  const val = c => [asNum(c.dataset.risk), asNum(c.dataset.vtmal)];
+  const active = STATIC_FILTERS.find(x => x[0] === staticFilter) || STATIC_FILTERS[0];
+  let shown = 0;
+  cards.forEach(c => { const ok = active[2](...val(c)); c.classList.toggle('hidden', !ok); if (ok) shown++; });
+  $('staticFilter').innerHTML = STATIC_FILTERS.map(([id, label, fn, cls]) => {
+    const n = cards.filter(c => fn(...val(c))).length;
+    const on = id === active[0];
+    return `<button data-static-filter="${id}" class="px-2.5 py-1 rounded-lg border ${cls} ${on ? 'font-bold' : 'opacity-60 hover:opacity-100'}">${label} <span class="mono">${n}</span></button>`;
+  }).join('');
+  $('staticFilterEmpty').classList.toggle('hidden', shown > 0 || !cards.length);
+}
+$('staticFilter').addEventListener('click', e => {
+  const b = e.target.closest('[data-static-filter]');
+  if (!b) return;
+  staticFilter = b.dataset.staticFilter;
+  applyStaticFilter();
+});
 
 async function manualVtQuery(idx) {
   const f = activeJob.static[idx], box = $('vtBox_' + idx);

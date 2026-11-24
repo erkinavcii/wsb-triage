@@ -209,8 +209,12 @@
       </div>
 
       <div id="staticSection" class="space-y-4 hidden">
-        <h3 class="text-base font-bold text-white">🔍 Statik analiz — en riskliden sıralı</h3>
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <h3 class="text-base font-bold text-white">🔍 Statik analiz — en riskliden sıralı</h3>
+          <div id="staticFilter" class="flex flex-wrap items-center gap-2 text-xs"></div>
+        </div>
         <div id="filesContainer" class="space-y-4"></div>
+        <div id="staticFilterEmpty" class="hidden text-xs text-slate-400">Bu filtreye uyan dosya yok.</div>
       </div>
 
       <details class="glass-card rounded-2xl p-4">
