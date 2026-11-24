@@ -129,6 +129,9 @@ class Job:
         self.case_dir = case_dir
         self.state = state
         self.lock = threading.RLock()
+        # Set by request_cancel and never cleared: stops the VirusTotal thread that runs next to the sandbox
+        # (the sandbox stage consumes state["cancel_requested"] to finish early with partial results).
+        self.cancel_event = threading.Event()
         # Passwords live only in memory: never in state.json, never in API responses.
         self.password = password
         self.vbox_password = vbox_password
@@ -318,29 +321,71 @@ def _mark_cancelled(job: Job, current: Optional[str]) -> None:
     job.state.pop("cancel_requested", None)
 
 
+def _start_vt_thread(job: Job) -> threading.Thread:
+    """VirusTotal lookups next to the sandbox. The sandbox does not use their results, and the free API allows only
+    4 requests a minute, so 16 files used to delay the sandbox by ~4 minutes. Errors stay in the VT stage."""
+    def worker():
+        try:
+            stage_vt(job, stop=job.cancel_event)
+        except Cancelled:
+            job.stage("vt", "skipped", "İptal edildi.")
+        except Exception as e:  # noqa: BLE001 - reported on the stage; the sandbox result is still worth keeping
+            job.log(f"HATA (vt): {e}")
+            job.stage("vt", "error", str(e))
+            traceback.print_exc()
+        finally:
+            compute_verdict(job)
+    th = threading.Thread(target=worker, name=f"vt-{job.id}", daemon=True)
+    th.start()
+    return th
+
+
+def _join_vt_thread(job: Job, th: threading.Thread) -> None:
+    if th.is_alive():
+        job.stage("report", "running", "VirusTotal sonuçları bekleniyor (sandbox bitti)...")
+        job.log("Sandbox bitti; rapor için VirusTotal sorgularının bitmesi bekleniyor.")
+    while th.is_alive():
+        th.join(1)
+
+
 def run_job(job: Job) -> None:
     current = None
+    vt_thread: Optional[threading.Thread] = None
     try:
-        for key, fn in (("extract", stage_extract), ("inventory", stage_inventory), ("static", stage_static), ("vt", stage_vt)):
+        for key, fn in (("extract", stage_extract), ("inventory", stage_inventory), ("static", stage_static)):
             job.check_cancel()
             current = key
             fn(job)
             compute_verdict(job)
         job.check_cancel()
-        current = "sandbox"
         if job.opt("run_sandbox"):
+            vt_thread = _start_vt_thread(job)
+            current = "sandbox"
             stage_sandbox(job)
+            _join_vt_thread(job, vt_thread)
         else:
+            current = "vt"
+            stage_vt(job)
+            compute_verdict(job)
+            job.check_cancel()
+            current = "sandbox"
             job.stage("sandbox", "waiting", "Hazır. Örneği izole ortamda çalıştırmak için 'Sandbox'ta Çalıştır' butonuna basın.")
         current = "report"
         stage_report(job)
         job.state["status"] = "waiting_sandbox" if job.state["stages"]["sandbox"]["status"] == "waiting" else "done"
     except Cancelled:
+        if vt_thread is not None:
+            job.cancel_event.set()
+            vt_thread.join(30)
         _mark_cancelled(job, current)
     except Exception as e:
         job.log(f"HATA ({current}): {e}")
         if current:
             job.stage(current, "error", str(e))
+        if vt_thread is not None:
+            _join_vt_thread(job, vt_thread)          # VirusTotal results are still useful after a sandbox error
+            if job.state["stages"]["report"]["status"] == "running":
+                job.stage("report", "pending", "")
         job.state["status"] = "error"
         traceback.print_exc()
     finally:
@@ -415,6 +460,7 @@ def request_cancel(job: Job) -> None:
         if job.state["status"] != "running":
             raise PipelineError("Bu analiz çalışmıyor.")
         job.state["cancel_requested"] = True
+        job.cancel_event.set()
     if job.state["stages"]["sandbox"]["status"] == "running":
         request_stop(job)
     job.log("İptal isteği alındı.")
@@ -1538,7 +1584,13 @@ def _query_extra_intel_for_entries(job: Job, picks: List[Dict[str, Any]], entrie
     return hits
 
 
-def stage_vt(job: Job) -> None:
+def _vt_check_cancel(job: Job, stop: Optional[threading.Event]) -> None:
+    job.check_cancel()
+    if stop is not None and stop.is_set():
+        raise Cancelled()
+
+
+def stage_vt(job: Job, stop: Optional[threading.Event] = None) -> None:
     key = vt_client.get_api_key()
     intel_backup = _has_intel_sources()
     if not key and not intel_backup:
@@ -1560,7 +1612,7 @@ def stage_vt(job: Job) -> None:
     quota = False                       # once the quota is used up, every further call is pointless
     fallback_indices: List[int] = []
     for i, (r, e) in enumerate(zip(picks, entries)):
-        job.check_cancel()
+        _vt_check_cancel(job, stop)
         if quota:
             e["status"] = "Sorgulanmadı (VirusTotal kotası doldu)"
             fallback_indices.append(i)
@@ -1593,7 +1645,7 @@ def stage_vt(job: Job) -> None:
 
     pending: Dict[int, str] = {}
     for n, i in enumerate(unknown, 1):
-        job.check_cancel()
+        _vt_check_cancel(job, stop)
         r, e = picks[i], entries[i]
         if quota:
             e["status"] = "VT'de yok — yüklenmedi (kota doldu)"
@@ -1615,7 +1667,7 @@ def stage_vt(job: Job) -> None:
     deadline = time.time() + 10 * 60
     while pending and time.time() < deadline and not quota:
         for i, aid in list(pending.items()):
-            job.check_cancel()
+            _vt_check_cancel(job, stop)
             job.stage("vt", "running", f"3/3 VirusTotal taramaları bekleniyor ({len(pending)} dosya kaldı): {picks[i]['rel']}")
             try:
                 if vt_client.analysis_done(aid, key):
@@ -2661,6 +2713,11 @@ def _installer_never_started(b: Dict[str, Any]) -> str:
 
 
 def compute_verdict(job: Job) -> None:
+    with job.lock:
+        _compute_verdict(job)
+
+
+def _compute_verdict(job: Job) -> None:
     s = job.state
     red: List[str] = []
     notes: List[str] = []

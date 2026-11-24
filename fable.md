@@ -394,3 +394,14 @@ Photoshop analizinden sonra iki şikâyet: analizin bittiği anlaşılmıyordu, 
 - **I6. Statik analiz listesinde risk filtresi — ✅ EKLENDİ.** Liste başlığının yanında: Tümü, 🔴 Yüksek (65+), 50+, 🟠 Orta (35–64), 🟢 Düşük (0–34), 🛡️ VT'de işaretli. Her butonda o gruptaki dosya sayısı yazıyor; seçilen filtre analizler arasında geçişte korunuyor.
 - **Gerçek sandbox doğrulaması:** `autoplay.bat` + `Adobe 2026\Set-up.bat` içeren klasörde `Set-up.bat` seçildi ve çalıştı (cmd.exe → PING.EXE), pencere arka plana alındı, kırmızı bulgu yok, uyarı yanlışlıkla çıkmadı.
 - **Test:** 202 test geçiyor (9 yeni test).
+
+## J. VirusTotal sandbox'ı bekletmiyor (25 Kasım 2026)
+
+- **J1. VirusTotal ve sandbox aynı anda — ✅ DEĞİŞTİ.** Önceden adımlar sırayla çalışıyordu (statik → VirusTotal → sandbox). Ücretsiz VirusTotal API dakikada 4 istek kabul ettiği için 16 dosya sandbox'ı ~4 dakika bekletiyordu, oysa sandbox VirusTotal sonuçlarını kullanmıyor. Artık statik analiz biter bitmez VirusTotal arka planda başlıyor ve sandbox hemen açılıyor; rapor ikisi de bitince yazılıyor (sandbox önce biterse rapor adımında "VirusTotal sonuçları bekleniyor" yazar).
+  - *Bellek:* VirusTotal sorguları küçük internet istekleri; ek bellek birkaç MB. Asıl yük her zamanki gibi sandbox'ın kendisi.
+  - *Kota:* VirusTotal istemcisinin dakikada 4 istek sınırı tüm iş parçacıkları için ortak; sandbox'ın bıraktığı dosyalar için yaptığı sorgular da aynı sıraya giriyor, kota aşılmıyor.
+  - *İptal:* İptal ikisini birden durduruyor (sandbox erken bitip o ana kadarki sonuçlar raporlanıyor, VirusTotal "iptal edildi" oluyor).
+  - *Hata:* Sandbox hata verirse VirusTotal yine bitiriliyor, sonuçları kayboluyor.
+  - Sonuç hesaplama artık analiz kilidi altında yapılıyor (iki iş parçacığı aynı anda hesaplayabiliyor). Panel bandı aynı anda çalışan adımları birlikte gösteriyor ("VirusTotal + Windows Sandbox").
+  - "Sandbox'ı otomatik çalıştır" kapalıyken eski sıra korunuyor.
+- **Test:** 205 test geçiyor (3 yeni test: sandbox VirusTotal'ı beklemeden başlar, iptal ikisini durdurur, sandbox hatasında VirusTotal sonuçları korunur).

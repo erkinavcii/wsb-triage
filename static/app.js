@@ -466,9 +466,12 @@ function renderBanner(st) {
       <div class="font-semibold text-sm text-${color}-200">${title}</div>${lines.map(l => `<div class="text-xs text-slate-300">${l}</div>`).join('')}</div>`;
   let html = '', tab = 'SafeBox Analiz Merkezi';
   if (st.status === 'running') {
-    const cur = Object.values(stages).find(x => ['running', 'queued'].includes(x.status));
-    html = box('indigo', `⏳ Analiz sürüyor — ${esc(cur ? cur.label : 'hazırlanıyor')}`, cur && cur.msg ? [esc(cur.msg)] : []);
-    tab = '⏳ ' + (cur ? cur.label : 'Analiz sürüyor') + ' — SafeBox';
+    // VirusTotal runs next to the sandbox, so more than one stage can be running at once
+    const curs = Object.values(stages).filter(x => ['running', 'queued'].includes(x.status));
+    const names = curs.map(x => x.label).join(' + ');
+    html = box('indigo', `⏳ Analiz sürüyor — ${esc(names || 'hazırlanıyor')}`,
+      curs.filter(x => x.msg).map(x => curs.length > 1 ? `<b>${esc(x.label)}:</b> ${esc(x.msg)}` : esc(x.msg)));
+    tab = '⏳ ' + (names || 'Analiz sürüyor') + ' — SafeBox';
   } else {
     const ends = Object.values(stages).map(x => parseTs(x.ended)).filter(Boolean);
     const start = parseTs(st.created), end = ends.length ? new Date(Math.max(...ends)) : null;

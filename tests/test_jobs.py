@@ -225,3 +225,69 @@ def test_watcher_auto_start_skips_later_volumes_and_never_uploads(watcher, monke
     _poll(w)
     assert calls == [("a.part1.rar", {"run_sandbox": False, "vt_upload": False})]
     assert {x["name"]: x["later_part"] for x in w.found} == {"a.part1.rar": False, "a.part2.rar": True}
+
+
+# ---------------------------------------------------------------- VirusTotal next to the sandbox
+def _pkg(tmp_path, n=4):
+    d = tmp_path / "pkg"
+    d.mkdir()
+    for i in range(n):
+        (d / f"t{i}.bat").write_text(f"@echo {i}")
+    return d
+
+
+def test_sandbox_starts_without_waiting_for_virustotal(tmp_path, monkeypatch, fake_vt):
+    fake_vt.lookup_delay = 0.5
+    seen = {}
+
+    def fake_sandbox(job):
+        seen["vt_at_sandbox_start"] = job.state["stages"]["vt"]["status"]
+        job.stage("sandbox", "running", "izleniyor")
+        time.sleep(0.2)
+        job.stage("sandbox", "done", "ok")
+    monkeypatch.setattr(pipeline, "stage_sandbox", fake_sandbox)
+    job = pipeline.create_job(str(_pkg(tmp_path)), {"run_sandbox": True, "vt_upload": False, "notify": False})
+    wait_job(job, 60)
+    assert seen["vt_at_sandbox_start"] in ("pending", "running")       # sandbox did not wait for VT
+    assert job.state["status"] == "done"
+    assert job.state["stages"]["vt"]["status"] == "done"                # report waited for VT
+    assert job.state["stages"]["report"]["status"] == "done"
+    assert len(fake_vt.lookups) == 4
+    assert "VirusTotal" not in job.state["verdict"]["not_run"]
+
+
+def test_cancel_during_sandbox_also_stops_virustotal(tmp_path, monkeypatch, fake_vt):
+    fake_vt.lookup_delay = 1.0
+
+    def fake_sandbox(job):
+        job.stage("sandbox", "running", "izleniyor")
+        while not job.state.get("cancel_requested"):
+            time.sleep(0.05)
+        job.state.pop("cancel_requested", None)                       # like the real stage: finish early
+        job.stage("sandbox", "done", "erken bitti")
+    monkeypatch.setattr(pipeline, "stage_sandbox", fake_sandbox)
+    job = pipeline.create_job(str(_pkg(tmp_path, 8)), {"run_sandbox": True, "vt_upload": False, "notify": False})
+    t0 = time.time()
+    while job.state["stages"]["sandbox"]["status"] != "running":
+        assert time.time() - t0 < 30
+        time.sleep(0.05)
+    pipeline.request_cancel(job)
+    t1 = time.time()
+    wait_job(job, 30)
+    assert time.time() - t1 < 5
+    assert job.state["stages"]["vt"]["status"] == "skipped"
+    assert len(fake_vt.lookups) < 8
+
+
+def test_sandbox_error_keeps_virustotal_results(tmp_path, monkeypatch, fake_vt):
+    fake_vt.lookup_delay = 0.3
+
+    def broken_sandbox(job):
+        raise pipeline.PipelineError("sandbox açılamadı")
+    monkeypatch.setattr(pipeline, "stage_sandbox", broken_sandbox)
+    job = pipeline.create_job(str(_pkg(tmp_path)), {"run_sandbox": True, "vt_upload": False, "notify": False})
+    wait_job(job, 60)
+    assert job.state["status"] == "error"
+    assert job.state["stages"]["sandbox"]["status"] == "error"
+    assert job.state["stages"]["vt"]["status"] == "done"
+    assert job.state["stages"]["report"]["status"] == "pending"
