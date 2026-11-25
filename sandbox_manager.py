@@ -584,13 +584,18 @@ def _process_name(pid: int) -> str:
 
 
 def find_windows_of(process_names) -> List[int]:
-    """Visible, titled top-level windows owned by the given process names (lower-case exe names)."""
+    """Visible, titled top-level windows owned by the given process names (lower-case exe names),
+    filtering out tiny helper/splash windows and sorting the main desktop window first."""
     if os.name != "nt":
         return []
     import ctypes
     from ctypes import wintypes
     u32 = ctypes.WinDLL("user32", use_last_error=True)
-    found: List[int] = []
+
+    class RECT(ctypes.Structure):
+        _fields_ = [("left", wintypes.LONG), ("top", wintypes.LONG), ("right", wintypes.LONG), ("bottom", wintypes.LONG)]
+
+    found: List[tuple] = []
     proto = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
     def cb(hwnd, _):
@@ -598,26 +603,78 @@ def find_windows_of(process_names) -> List[int]:
             pid = wintypes.DWORD()
             u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
             if _process_name(pid.value) in process_names:
-                found.append(hwnd)
+                iconic = bool(u32.IsIconic(hwnd))
+                rc = RECT()
+                area = 0
+                if u32.GetWindowRect(hwnd, ctypes.byref(rc)):
+                    w = max(0, rc.right - rc.left)
+                    h = max(0, rc.bottom - rc.top)
+                    if not iconic and (w < 100 or h < 100):
+                        return True
+                    area = w * h
+                found.append((area, 0 if iconic else 1, hwnd))
         return True
 
     u32.EnumWindows(proto(cb), 0)
-    return found
+    found.sort(key=lambda item: (item[1], item[0]), reverse=True)
+    return [hwnd for _, _, hwnd in found]
 
 
 def focus_window(hwnd: int) -> bool:
-    """Restores and brings a window to the front. Windows only lets the foreground process change focus, so a
-    harmless ALT key tap is sent first (the usual way to lift that restriction)."""
+    """Restores and brings a window to the front. Uses AttachThreadInput plus a temporary
+    HWND_TOPMOST -> HWND_NOTOPMOST z-order lift so the window visibly comes to the front even
+    when Windows blocks background SetForegroundWindow focus stealing."""
     import ctypes
+    from ctypes import wintypes
     u32 = ctypes.WinDLL("user32", use_last_error=True)
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    u32.GetForegroundWindow.restype = wintypes.HWND
+    u32.IsIconic.argtypes = [wintypes.HWND]
+    u32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    u32.BringWindowToTop.argtypes = [wintypes.HWND]
+    u32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    u32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
     VK_MENU, KEYUP = 0x12, 0x0002
+    SW_SHOW, SW_RESTORE = 5, 9
+    HWND_TOPMOST, HWND_NOTOPMOST = -1, -2
+    SWP_NOSIZE, SWP_NOMOVE, SWP_SHOWWINDOW = 0x0001, 0x0002, 0x0040
+
     if u32.IsIconic(hwnd):
-        u32.ShowWindow(hwnd, 9)                      # SW_RESTORE
-    u32.keybd_event(VK_MENU, 0, 0, 0)
-    u32.keybd_event(VK_MENU, 0, KEYUP, 0)
-    u32.BringWindowToTop(hwnd)
-    ok = bool(u32.SetForegroundWindow(hwnd))
-    return ok or u32.GetForegroundWindow() == hwnd
+        u32.ShowWindow(hwnd, SW_RESTORE)
+    else:
+        u32.ShowWindow(hwnd, SW_SHOW)
+
+    cur_tid = k32.GetCurrentThreadId()
+    fg_hwnd = u32.GetForegroundWindow()
+    fg_tid = u32.GetWindowThreadProcessId(fg_hwnd, None) if fg_hwnd else 0
+    tgt_tid = u32.GetWindowThreadProcessId(hwnd, None)
+    attached_fg = False
+    attached_tgt = False
+    raised = False
+    ok = False
+    try:
+        if fg_tid and fg_tid != cur_tid:
+            attached_fg = bool(u32.AttachThreadInput(cur_tid, fg_tid, True))
+        if tgt_tid and tgt_tid != cur_tid and tgt_tid != fg_tid:
+            attached_tgt = bool(u32.AttachThreadInput(cur_tid, tgt_tid, True))
+        # Temporarily lift to TOPMOST then immediately drop back to NOTOPMOST so it sits visibly above other windows
+        t1 = bool(u32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW))
+        t2 = bool(u32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW))
+        raised = t1 and t2
+        u32.BringWindowToTop(hwnd)
+        ok = bool(u32.SetForegroundWindow(hwnd))
+        if not ok and u32.GetForegroundWindow() != hwnd:
+            u32.keybd_event(VK_MENU, 0, 0, 0)
+            u32.keybd_event(VK_MENU, 0, KEYUP, 0)
+            u32.BringWindowToTop(hwnd)
+            ok = bool(u32.SetForegroundWindow(hwnd))
+    finally:
+        if attached_tgt:
+            u32.AttachThreadInput(cur_tid, tgt_tid, False)
+        if attached_fg:
+            u32.AttachThreadInput(cur_tid, fg_tid, False)
+    return ok or u32.GetForegroundWindow() == hwnd or raised
 
 
 def send_window_to_back(hwnd: int) -> bool:
@@ -632,8 +689,21 @@ def send_window_to_back(hwnd: int) -> bool:
 
 
 def arrange_sandbox_window(front: bool = True) -> Dict[str, Any]:
-    """front=True: restore and bring the Windows Sandbox window forward; False: send it behind other windows."""
+    """front=True: restore and bring the Windows Sandbox window forward (reconnecting via `wsb connect`
+    if a session is running headless without a client window); False: send it behind other windows."""
     wins = find_windows_of(_SANDBOX_WINDOW_PROCS)
+    if not wins and front:
+        wsb = wsb_cli_path()
+        ids = wsb_list_ids() or []
+        if wsb and ids:
+            try:
+                subprocess.Popen([wsb, "connect", "--id", ids[0]], creationflags=NO_WINDOW)
+                time.sleep(2)
+                wins = find_windows_of(_SANDBOX_WINDOW_PROCS)
+                if not wins:
+                    return {"status": "ok", "message": "Sandbox penceresine yeniden bağlanıldı (wsb connect)."}
+            except Exception:
+                pass
     if not wins:
         return {"status": "not_found", "message": "Açık bir Windows Sandbox penceresi bulunamadı."}
     if not front:
