@@ -621,60 +621,27 @@ def find_windows_of(process_names) -> List[int]:
 
 
 def focus_window(hwnd: int) -> bool:
-    """Restores and brings a window to the front. Uses AttachThreadInput plus a temporary
-    HWND_TOPMOST -> HWND_NOTOPMOST z-order lift so the window visibly comes to the front even
-    when Windows blocks background SetForegroundWindow focus stealing."""
+    """Restores and brings a window to the front. Windows only lets the foreground process change focus, so a
+    harmless ALT key tap is sent first (the usual way to lift that restriction).
+
+    Deliberately simple: the Windows Sandbox window is a remote-desktop viewer, and heavier tricks
+    (AttachThreadInput to its UI thread, forcing it TOPMOST while it is still connecting) were followed by the
+    viewer window disappearing while the sandbox kept running without a window."""
     import ctypes
     from ctypes import wintypes
     u32 = ctypes.WinDLL("user32", use_last_error=True)
-    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     u32.GetForegroundWindow.restype = wintypes.HWND
-    u32.IsIconic.argtypes = [wintypes.HWND]
+    for fn in (u32.IsIconic, u32.BringWindowToTop, u32.SetForegroundWindow):
+        fn.argtypes = [wintypes.HWND]
     u32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
-    u32.BringWindowToTop.argtypes = [wintypes.HWND]
-    u32.SetForegroundWindow.argtypes = [wintypes.HWND]
-    u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
-    u32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
     VK_MENU, KEYUP = 0x12, 0x0002
-    SW_SHOW, SW_RESTORE = 5, 9
-    HWND_TOPMOST, HWND_NOTOPMOST = -1, -2
-    SWP_NOSIZE, SWP_NOMOVE, SWP_SHOWWINDOW = 0x0001, 0x0002, 0x0040
-
     if u32.IsIconic(hwnd):
-        u32.ShowWindow(hwnd, SW_RESTORE)
-    else:
-        u32.ShowWindow(hwnd, SW_SHOW)
-
-    cur_tid = k32.GetCurrentThreadId()
-    fg_hwnd = u32.GetForegroundWindow()
-    fg_tid = u32.GetWindowThreadProcessId(fg_hwnd, None) if fg_hwnd else 0
-    tgt_tid = u32.GetWindowThreadProcessId(hwnd, None)
-    attached_fg = False
-    attached_tgt = False
-    raised = False
-    ok = False
-    try:
-        if fg_tid and fg_tid != cur_tid:
-            attached_fg = bool(u32.AttachThreadInput(cur_tid, fg_tid, True))
-        if tgt_tid and tgt_tid != cur_tid and tgt_tid != fg_tid:
-            attached_tgt = bool(u32.AttachThreadInput(cur_tid, tgt_tid, True))
-        # Temporarily lift to TOPMOST then immediately drop back to NOTOPMOST so it sits visibly above other windows
-        t1 = bool(u32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW))
-        t2 = bool(u32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW))
-        raised = t1 and t2
-        u32.BringWindowToTop(hwnd)
-        ok = bool(u32.SetForegroundWindow(hwnd))
-        if not ok and u32.GetForegroundWindow() != hwnd:
-            u32.keybd_event(VK_MENU, 0, 0, 0)
-            u32.keybd_event(VK_MENU, 0, KEYUP, 0)
-            u32.BringWindowToTop(hwnd)
-            ok = bool(u32.SetForegroundWindow(hwnd))
-    finally:
-        if attached_tgt:
-            u32.AttachThreadInput(cur_tid, tgt_tid, False)
-        if attached_fg:
-            u32.AttachThreadInput(cur_tid, fg_tid, False)
-    return ok or u32.GetForegroundWindow() == hwnd or raised
+        u32.ShowWindow(hwnd, 9)                      # SW_RESTORE
+    u32.keybd_event(VK_MENU, 0, 0, 0)
+    u32.keybd_event(VK_MENU, 0, KEYUP, 0)
+    u32.BringWindowToTop(hwnd)
+    ok = bool(u32.SetForegroundWindow(hwnd))
+    return ok or u32.GetForegroundWindow() == hwnd
 
 
 def send_window_to_back(hwnd: int) -> bool:
@@ -688,22 +655,35 @@ def send_window_to_back(hwnd: int) -> bool:
     return bool(u32.SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE))
 
 
-def arrange_sandbox_window(front: bool = True) -> Dict[str, Any]:
-    """front=True: restore and bring the Windows Sandbox window forward (reconnecting via `wsb connect`
-    if a session is running headless without a client window); False: send it behind other windows."""
+def reconnect_sandbox_window(wait_sec: float = 20.0) -> Optional[int]:
+    """The sandbox can keep running without its viewer window (closed, or lost while connecting). `wsb connect`
+    opens a new viewer to the running sandbox; the window takes a few seconds to appear. Returns its handle."""
+    wsb = wsb_cli_path()
+    ids = wsb_list_ids() or []
+    if not wsb or not ids:
+        return None
+    try:
+        subprocess.Popen([wsb, "connect", "--id", ids[0]], creationflags=NO_WINDOW)
+    except OSError:
+        return None
+    deadline = time.time() + wait_sec
+    while time.time() < deadline:
+        wins = find_windows_of(_SANDBOX_WINDOW_PROCS)
+        if wins:
+            return wins[0]
+        time.sleep(0.5)
+    return None
+
+
+def arrange_sandbox_window(front: bool = True, reconnect: bool = True) -> Dict[str, Any]:
+    """front=True: restore and bring the Windows Sandbox window forward, opening a new viewer with `wsb connect`
+    first if the sandbox is running without one (reconnect=True). front=False: send it behind other windows."""
     wins = find_windows_of(_SANDBOX_WINDOW_PROCS)
-    if not wins and front:
-        wsb = wsb_cli_path()
-        ids = wsb_list_ids() or []
-        if wsb and ids:
-            try:
-                subprocess.Popen([wsb, "connect", "--id", ids[0]], creationflags=NO_WINDOW)
-                time.sleep(2)
-                wins = find_windows_of(_SANDBOX_WINDOW_PROCS)
-                if not wins:
-                    return {"status": "ok", "message": "Sandbox penceresine yeniden bağlanıldı (wsb connect)."}
-            except Exception:
-                pass
+    reconnected = False
+    if not wins and front and reconnect:
+        hwnd = reconnect_sandbox_window()
+        if hwnd:
+            wins, reconnected = [hwnd], True
     if not wins:
         return {"status": "not_found", "message": "Açık bir Windows Sandbox penceresi bulunamadı."}
     if not front:
@@ -712,9 +692,10 @@ def arrange_sandbox_window(front: bool = True) -> Dict[str, Any]:
                 "message": "Sandbox penceresi arka plana alındı (çalışmaya devam ediyor)." if ok else
                            "Pencere bulundu ama arka plana alınamadı."}
     ok = focus_window(wins[0])
-    return {"status": "ok" if ok else "partial",
-            "message": "Sandbox penceresi öne getirildi." if ok else
-                       "Pencere bulundu ama Windows öne almaya izin vermedi; görev çubuğunda yanıp sönüyor olmalı."}
+    pre = "Sandbox penceresi kapalıydı, yeniden açıldı ve " if reconnected else "Sandbox penceresi "
+    return {"status": "ok" if ok else "partial", "reconnected": reconnected,
+            "message": pre + "öne getirildi." if ok else
+                       pre.rstrip(" ve") + "; Windows öne almaya izin vermedi, görev çubuğunda yanıp sönüyor olmalı."}
 
 
 def focus_sandbox_window() -> Dict[str, Any]:

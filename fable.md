@@ -415,3 +415,10 @@ Photoshop analizinden sonra iki şikâyet: analizin bittiği anlaşılmıyordu, 
 - **K2. "Sandbox'a ekran kartı ver (GPU)" seçeneği — ✅ EKLENDİ.** Başlatma formunda ve "tekrar çalıştır" penceresinde, varsayılan kapalı. Açıkken `.wsb` dosyasında `VGpu=Enable`; GPU isteyen programlar (Photoshop vb.) çalışabilir ama ana bilgisayarın ekran kartı sürücüsü sandbox'a açıldığı için yalıtım daha zayıf. Panelde "🎮 Ekran kartı (vGPU) açık" uyarısı ve analiz günlüğünde not.
 - **Sandbox'a metin/betik vermek:** pano paylaşımı bilerek kapalı. En rahat yol, analizin `output` klasörü: sandbox içinde `C:\Analysis\output` olarak görünüyor, oraya konan bir `.cmd` dosyası sandbox içinde çift tıklanarak çalıştırılabilir, yazdığı sonuç da ana bilgisayardan okunabilir.
 - **Test:** 207 test geçiyor (2 yeni test).
+
+## L. Sandbox penceresi kayboluyordu (25 Kasım 2026)
+
+- **L1. "Ekranda göster" açıkken pencere kayboluyordu — ✅ DÜZELTİLDİ.** Sandbox çalışmaya devam ediyor ama ona ait hiçbir pencere kalmıyordu, bu yüzden "öne getir" de bir şey bulamıyordu. Pencere, sandbox açıldıktan 2 saniye sonra (masaüstü daha hazır değilken, uzak masaüstü görüntüleyicisi bağlanırken) yakalanıp öne getiriliyordu; araya giren bir commit (`e73aa36`) bunu `AttachThreadInput` ve geçici "her zaman üstte" ile yapıyordu.
+  - *Düzeltme:* Öne getirme eski basit yönteme döndü (ALT tuşu + `SetForegroundWindow`). Pencereye ancak sandbox masaüstü hazır olunca (izleyici `status.txt`/`live.json` yazınca) dokunuluyor. "Ekranda göster" açıkken pencere izleniyor; sandbox çalışırken kaybolursa `wsb connect` ile yeni bir görüntüleyici açılıyor (en fazla 3 kez). "Öne getir" butonu da pencere yoksa önce yeniden bağlanıp pencerenin gelmesini 20 saniyeye kadar bekliyor. Arka plan modunda yeni pencere açılmıyor.
+  - *Gerçek doğrulama:* Çalışan bir sandbox'a `wsb connect` ile elle yeni pencere bağlandı. Ardından 04:15'teki 34 dakikalık Photoshop analizinde pencere masaüstü hazır olunca öne geldi, hiç kaybolmadı; kurulum elle ilerletildi, Photoshop açılıp resim yüklendi, çökme olmadı (GPU kapalı).
+- **Test:** 209 test geçiyor (2 yeni test).

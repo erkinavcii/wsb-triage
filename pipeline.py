@@ -1798,20 +1798,48 @@ def _check_dropped_files_vt(job: Job, beh: Dict[str, Any]) -> None:
 
 
 # ======================================================================== 5. sandbox
-def _arrange_sandbox_window_when_ready(job: Job, front: bool, wait_sec: int = 180) -> None:
-    """Once the Windows Sandbox window appears: bring it forward ("show the sandbox on screen") or send it behind
-    the other windows so it does not take over the desktop. Never minimized: the live view and screenshots come
-    from inside the sandbox and the window keeps running either way. Runs in the background; best effort."""
+_WINDOW_SETTLE_SEC = 3.0      # after the sandbox desktop is up, before touching its viewer window
+_WINDOW_WATCH_SEC = 10.0      # how often "show the sandbox window" checks that the viewer is still there
+
+
+def _arrange_sandbox_window_when_ready(job: Job, front: bool, wait_sec: int = 300) -> None:
+    """Shows the sandbox on screen ("show the sandbox window") or keeps it behind the other windows.
+
+    Waits until the sandbox desktop is up (the monitor inside writes status.txt / live.json) instead of grabbing
+    the first window that appears: that one is the viewer still connecting. In "show" mode the window is also
+    watched during the run: if the viewer is gone while the sandbox keeps running, a new one is opened with
+    `wsb connect` (at most 3 times). Never minimized; runs in the background; best effort."""
+    out = job.output_dir
+
+    def running() -> bool:
+        return job.state.get("status") == "running" and job.state["stages"]["sandbox"]["status"] == "running"
+
     def worker():
         deadline = time.time() + wait_sec
-        done_for = None
-        while time.time() < deadline and job.state.get("status") == "running":
-            wins = sbm.find_windows_of(sbm._SANDBOX_WINDOW_PROCS)
-            if wins and wins[0] != done_for:
-                res = sbm.arrange_sandbox_window(front)
-                job.log("Sandbox penceresi: " + str(res.get("message") or ""))
-                done_for = wins[0]   # the window can be re-created once while the sandbox boots: handle it again
-            time.sleep(2)
+        while running() and time.time() < deadline:
+            if (out / "status.txt").exists() or (out / "live.json").exists():
+                break
+            time.sleep(min(2.0, _WINDOW_WATCH_SEC))
+        if not running():
+            return
+        time.sleep(_WINDOW_SETTLE_SEC)                 # let the viewer finish resizing to the sandbox desktop
+        res = sbm.arrange_sandbox_window(front, reconnect=front)
+        job.log("Sandbox penceresi: " + str(res.get("message") or ""))
+        if not front:
+            return
+        reconnects, missing_since = 0, None
+        while running() and reconnects < 3:
+            time.sleep(_WINDOW_WATCH_SEC)
+            if sbm.find_windows_of(sbm._SANDBOX_WINDOW_PROCS) or sbm.sandbox_state() is not True:
+                missing_since = None
+                continue
+            missing_since = missing_since or time.time()
+            if time.time() - missing_since < _WINDOW_WATCH_SEC:   # missing on two checks in a row, not a blip
+                continue
+            reconnects += 1
+            res = sbm.arrange_sandbox_window(True)
+            job.log(f"Sandbox penceresi kaybolmuştu ({reconnects}/3): " + str(res.get("message") or ""))
+            missing_since = None
     if os.name == "nt":
         threading.Thread(target=worker, name=f"wsb-window-{job.id}", daemon=True).start()
 

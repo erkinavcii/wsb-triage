@@ -291,3 +291,26 @@ def test_sandbox_error_keeps_virustotal_results(tmp_path, monkeypatch, fake_vt):
     assert job.state["stages"]["sandbox"]["status"] == "error"
     assert job.state["stages"]["vt"]["status"] == "done"
     assert job.state["stages"]["report"]["status"] == "pending"
+
+
+def test_show_window_waits_for_desktop_and_reopens_lost_viewer(tmp_path, monkeypatch):
+    job = bare_job(tmp_path)
+    job.state["status"] = "running"
+    job.state["stages"]["sandbox"]["status"] = "running"
+    monkeypatch.setattr(pipeline, "_WINDOW_SETTLE_SEC", 0.0)
+    monkeypatch.setattr(pipeline, "_WINDOW_WATCH_SEC", 0.1)
+    arranged = []
+    monkeypatch.setattr(pipeline.sbm, "arrange_sandbox_window",
+                        lambda front=True, reconnect=True: arranged.append((front, reconnect)) or {"message": "ok"})
+    monkeypatch.setattr(pipeline.sbm, "find_windows_of", lambda names: [])        # viewer gone
+    monkeypatch.setattr(pipeline.sbm, "sandbox_state", lambda: True)               # sandbox still running
+    pipeline._arrange_sandbox_window_when_ready(job, True)
+    time.sleep(0.5)
+    assert arranged == []                                   # desktop not up yet: the connecting window is left alone
+    (job.output_dir / "status.txt").write_text("Izleniyor", encoding="utf-8")
+    t0 = time.time()
+    while len(arranged) < 4 and time.time() - t0 < 10:
+        time.sleep(0.05)
+    job.state["status"] = "done"
+    assert arranged[0] == (True, True)
+    assert len(arranged) == 4                               # first arrange + at most 3 reconnects

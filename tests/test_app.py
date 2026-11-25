@@ -555,3 +555,26 @@ def test_sandbox_window_front_and_back(client, monkeypatch):
     assert calls == [("back", 1234), ("front", 1234)]
     assert "show_sandbox_window" in pipeline._SANDBOX_OVERRIDE_KEYS
     assert pipeline.DEFAULT_OPTIONS["show_sandbox_window"] is False
+
+
+def test_bring_to_front_reconnects_a_sandbox_without_window(monkeypatch):
+    """Seen live: the sandbox kept running but its viewer window was gone, so "bring to front" had nothing
+    to raise. Now `wsb connect` opens a new viewer and that one is focused."""
+    import sandbox_manager as sbm
+    calls = {"popen": [], "focus": []}
+    windows = iter([[], [], [77]])                  # none, none, then the reconnected viewer
+    monkeypatch.setattr(sbm, "find_windows_of", lambda names: next(windows, [77]))
+    monkeypatch.setattr(sbm, "wsb_cli_path", lambda: "wsb.exe")
+    monkeypatch.setattr(sbm, "wsb_list_ids", lambda: ["58cd03fe-4b51-4c19-8ff4-3b5335b5fa48"])
+    monkeypatch.setattr(sbm.subprocess, "Popen", lambda args, **k: calls["popen"].append(args))
+    monkeypatch.setattr(sbm, "focus_window", lambda h: calls["focus"].append(h) or True)
+    monkeypatch.setattr(sbm.time, "sleep", lambda s: None)
+    res = sbm.arrange_sandbox_window(True)
+    assert res["status"] == "ok" and res["reconnected"] is True and "yeniden açıldı" in res["message"]
+    assert calls["popen"] == [["wsb.exe", "connect", "--id", "58cd03fe-4b51-4c19-8ff4-3b5335b5fa48"]]
+    assert calls["focus"] == [77]
+
+    calls["popen"].clear()
+    monkeypatch.setattr(sbm, "find_windows_of", lambda names: [])
+    assert sbm.arrange_sandbox_window(False)["status"] == "not_found"      # background mode never reconnects
+    assert calls["popen"] == []
