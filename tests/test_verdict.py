@@ -967,3 +967,80 @@ def test_crashes_become_a_plain_note(tmp_path):
     job2.state["behavior"] = pipeline.sanitize_sandbox_json({"Target": "Set-up.exe", "Crashes": []})
     pipeline.compute_verdict(job2)
     assert not any("çöktü" in x for x in job2.state["verdict"]["notes"])
+
+
+# ---------------------------------------------------------------- memory dumps, score, ATT&CK
+def _write_dump(out, name, payload, pad=0):
+    d = out / pipeline.MEMDUMP_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    data = b"\x00" * pad + payload
+    key = pipeline.MEMDUMP_KEY
+    (d / name).write_bytes(bytes(b ^ key[i % len(key)] for i, b in enumerate(data)))
+
+
+def test_memory_dump_yara_red_for_sample_note_for_browser_and_dumps_deleted(tmp_path, monkeypatch):
+    out = tmp_path / "output"
+    stealer = b"..Login Data..Local State..wallet.dat..logins.json.."
+    _write_dump(out, "payload_4242.xbin", stealer, pad=300)
+    _write_dump(out, "msedge_77.xbin", stealer)
+    _write_dump(out, "..evil_1.xbin", stealer)                     # bad name: ignored
+    monkeypatch.setattr(pipeline, "_MEMDUMP_CHUNK", 128)          # force several chunks + overlap
+    monkeypatch.setattr(pipeline, "_MEMDUMP_OVERLAP", 64)
+    hits = pipeline.scan_memory_dumps(out)
+    assert not (out / pipeline.MEMDUMP_DIR).exists()               # decoded only in RAM, then deleted
+    rules = {(h["proc"], h["rule"]) for h in hits}
+    assert ("payload.exe", "SafeBox_Credential_Stealer_Browser_Targets") in rules
+    assert ("msedge.exe", "SafeBox_Credential_Stealer_Browser_Targets") in rules
+    assert all(h["proc"] != "..evil.exe" for h in hits)
+
+    job = bare_job(tmp_path, "mem")
+    job.state["status"] = "done"
+    job.state["behavior"] = pipeline.sanitize_sandbox_json({"Target": "payload.exe"})
+    job.state["behavior"]["MemoryYara"] = hits
+    pipeline.compute_verdict(job)
+    v = job.state["verdict"]
+    assert any("payload.exe" in x and "Bellek dökümünde" in x for x in v["red"])
+    assert any("msedge.exe" in x for x in v["notes"]) and not any("msedge.exe" in x for x in v["red"])
+    assert v["score"] == 10 and v["label"] == "Bilinen zararlı"
+    assert any(t["id"] == "T1555.003" and t["level"] == "red" for t in v["attack"])
+
+
+@pytest.mark.parametrize("red,crack,notes,missing,score", [
+    ([], [], [], [], 1),
+    ([], [], ["1 otomatik başlatma kaydı eklendi/değişti."], [], 3),
+    ([], ["Lisans Müdahale"], [], [], 5),
+    ([], ["Lisans Müdahale"], ["x"], [], 6),
+    (["5 yeni servis kuruldu."], [], [], [], 8),
+    (["a", "b", "c"], [], [], ["Sandbox"], 9),
+    (["MalwareBazaar: 'x.exe' bilinen zararlı örnektir (Lumma)."], [], [], [], 10),
+])
+def test_score_bands(red, crack, notes, missing, score):
+    s = pipeline._score(red, crack, notes, missing, True)
+    assert s["score"] == score and s["incomplete"] is bool(missing)
+    assert pipeline._score([], [], [], [], False)["score"] is None
+
+
+def test_attack_mapping_uses_first_matching_finding():
+    t = {x["id"]: x for x in pipeline._attack_techniques(
+        ["Defender ayarları değiştirildi (istisna eklendi / koruma kapatıldı).", "2 yeni servis kuruldu."],
+        ["YARA [SafeBox_License_Service_Tamper]: 'RunOnce.cmd'"],
+        ["3 yeni zamanlanmış görev — ürüne mi ait kontrol edin."])}
+    assert t["T1562.001"]["level"] == "red" and t["T1543.003"]["level"] == "red"
+    assert t["T1489"]["level"] == "crack" and t["T1053.005"]["level"] == "note"
+    assert t["T1053.005"]["url"] == "https://attack.mitre.org/techniques/T1053/005/"
+
+
+def test_script_engine_memory_hits_are_notes(tmp_path):
+    """Measured: a clean idle powershell.exe matches LSASS/AMSI/download rules in its own memory."""
+    job = bare_job(tmp_path)
+    job.state["behavior"] = pipeline.sanitize_sandbox_json({"Target": "setup.bat", "MemoryFindings": [
+        "[powershell.exe:7556] AmsiScanBuffer", "[cmd.exe:1616] NtUnmapViewOfSection", "[payload.exe:99] AmsiScanBuffer"]})
+    job.state["behavior"]["MemoryYara"] = [
+        {"proc": "powershell.exe", "pid": 7556, "rule": "SafeBox_LSASS_Credential_Dump", "severity": "critical", "description": "lsass"},
+        {"proc": "payload.exe", "pid": 99, "rule": "SafeBox_LSASS_Credential_Dump", "severity": "critical", "description": "lsass"}]
+    pipeline.compute_verdict(job)
+    v = job.state["verdict"]
+    red, notes = " ".join(v["red"]), " ".join(v["notes"])
+    assert "payload.exe" in red and "powershell.exe" not in red and "cmd.exe" not in red
+    assert "powershell.exe (pid 7556)" in notes and "[cmd.exe:1616] NtUnmapViewOfSection" in notes
+    assert "betik motorunun kendi belleğinde" in notes

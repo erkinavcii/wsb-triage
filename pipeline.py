@@ -34,6 +34,7 @@ import analyzer
 import intel_client
 import sandbox_manager as sbm
 import vt_client
+import yara_scanner
 
 BASE_DIR = Path(__file__).parent.resolve()
 CASES_DIR = BASE_DIR / "cases"
@@ -2052,6 +2053,16 @@ def stage_sandbox(job: Job) -> None:
         elif job.state["sandbox"].get("monitor_lost"):
             job.log("İzleyici durdu; 'kapatma' seçili olmadığı için ortam açık bırakıldı. İçindekileri ana bilgisayara kopyalamayın.")
 
+        mem_yara: List[Dict[str, Any]] = []
+        if (out / MEMDUMP_DIR).is_dir():
+            job.stage("sandbox", "running", "Bellek dökümleri YARA ile taranıyor...")
+            try:
+                mem_yara = scan_memory_dumps(out)
+                job.log(f"Bellek dökümü taraması: {len(mem_yara)} YARA eşleşmesi"
+                        + (": " + ", ".join(f"{h['rule']} ({h['proc']})" for h in mem_yara[:6]) if mem_yara else "."))
+            except Exception as e:  # noqa: BLE001 - a failed scan must not lose the sandbox results
+                job.log(f"Bellek dökümü taranamadı: {e}")
+                shutil.rmtree(out / MEMDUMP_DIR, ignore_errors=True)
         quarantined = quarantine_output(out)
         job.state["sandbox"]["quarantined"] = quarantined
         job.state["sandbox"]["screenshots"] = list_screenshots(job)
@@ -2060,6 +2071,7 @@ def stage_sandbox(job: Job) -> None:
         beh = sanitize_sandbox_json(_read_json(out / "behavior.json"))
         if beh:
             beh.get("Files", {}).pop("NewFilesSample", None)
+            beh["MemoryYara"] = mem_yara
             job.state["behavior"] = beh
             _check_dropped_files_vt(job, beh)
             job.stage("sandbox", "done", f"Tamamlandı. Ağ kaydı: {beh.get('CaptureStatus')}")
@@ -2122,6 +2134,77 @@ def live_screen_path(job: Job) -> Optional[Path]:
     scr_dir = job.output_dir / "screenshots"
     p = scr_dir / LIVE_SCREEN_NAME
     return p if is_valid_screenshot_file(p, scr_dir) else None
+
+
+# ---------------------------------------------------------------- memory dumps (YARA on unpacked code)
+MEMDUMP_DIR = "memdumps"
+MEMDUMP_KEY = b"SafeBoxMemDump!7"            # same as $MemDumpKey in Inside-Sandbox.ps1
+_MEMDUMP_RX = re.compile(r"^(?P<proc>[A-Za-z0-9_][A-Za-z0-9_.-]{0,59})_(?P<pid>\d{1,7})\.xbin$")
+_MEMDUMP_MAX_FILE = 64 * 1024 * 1024 + 4096
+_MEMDUMP_CHUNK = 16 * 1024 * 1024
+_MEMDUMP_OVERLAP = 64 * 1024
+# Browser / embedded-browser engines keep credential-store paths and similar strings in memory by design.
+_BROWSER_ENGINE_RX = re.compile(r"^(msedge|chrome|firefox|brave|opera|msedgewebview2|cefsharp\.browsersubprocess|"
+                                r"cephtmlengine|cef.*|.*helper|electron|code)$", re.I)
+
+
+# Script engines hold these patterns in their own memory: a clean, idle powershell.exe matched 6 of our rules
+# (LSASS dump, AMSI bypass, hidden download, Defender exclusion, .NET loader, patch artifacts) when dumped.
+# Memory hits inside them are notes; what the script itself does is judged from the script and its command lines.
+_SCRIPT_ENGINE_RX = re.compile(r"^(powershell|pwsh|powershell_ise|cmd|wscript|cscript|mshta|python|pythonw|node|java|javaw)$",
+                               re.I)
+_ENGINE_NOTE = "betik motorunun kendi belleğinde bu kalıplar normalde de bulunur; tek başına kanıt değil"
+
+
+def _xor_decode(data: bytes, key: bytes, offset: int = 0) -> bytes:
+    """Undo the monitor's XOR. Done with one big-integer XOR (C speed); the key position continues at `offset`."""
+    if not data:
+        return b""
+    k = len(key)
+    start = offset % k
+    stream = (key[start:] + key * (len(data) // k + 2))[:len(data)]
+    return (int.from_bytes(data, "little") ^ int.from_bytes(stream, "little")).to_bytes(len(data), "little")
+
+
+def scan_memory_dumps(out: Path, keep: bool = False) -> List[Dict[str, Any]]:
+    """YARA over the memory dumps the monitor wrote (output/memdumps/*.xbin). Packed or encrypted samples show
+    their real code and strings only in memory. The dumps are decoded only in RAM and deleted afterwards (they
+    contain the sample's unpacked code and are large). Returns one entry per (process, rule)."""
+    d = out / MEMDUMP_DIR
+    results: List[Dict[str, Any]] = []
+    if not d.is_dir():
+        return results
+    seen: set = set()
+    try:
+        for p in sorted(d.iterdir()):
+            m = _MEMDUMP_RX.match(p.name)
+            if not m or not p.is_file() or p.stat().st_size > _MEMDUMP_MAX_FILE:
+                continue
+            proc = m.group("proc") + ".exe"
+            pid = int(m.group("pid"))
+            with open(p, "rb") as fh:
+                pos = 0
+                prev_tail = b""
+                while True:
+                    raw = fh.read(_MEMDUMP_CHUNK)
+                    if not raw:
+                        break
+                    data = prev_tail + _xor_decode(raw, MEMDUMP_KEY, pos)
+                    pos += len(raw)
+                    prev_tail = data[-_MEMDUMP_OVERLAP:]
+                    for hit in yara_scanner.scan_bytes(data, proc):
+                        key = (proc.lower(), pid, hit["rule"])
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        results.append({"proc": proc, "pid": pid, "rule": hit["rule"],
+                                        "severity": str(hit.get("severity") or "medium").lower(),
+                                        "description": hit.get("description") or hit["rule"],
+                                        "strings": hit.get("strings") or []})
+    finally:
+        if not keep:
+            shutil.rmtree(d, ignore_errors=True)
+    return results
 
 
 def quarantine_output(out: Path) -> List[str]:
@@ -2192,7 +2275,7 @@ _BOOLS = [("LanBlock", "Requested"), ("LanBlock", "Applied"), ("LanBlock", "Tamp
 _STRS = [("RunMode",), ("Target",), ("Started",), ("Ended",), ("CaptureStatus",), ("LanBlock", "Status")]
 
 
-_CAPPED_STR_LISTS = ("MemoryFindings", "FakeNetRequests", "AutoClicks", "Crashes")
+_CAPPED_STR_LISTS = ("MemoryFindings", "FakeNetRequests", "AutoClicks", "Crashes", "MemoryDumps")
 
 
 def sanitize_sandbox_json(d: Any) -> Optional[Dict[str, Any]]:
@@ -2701,24 +2784,31 @@ _MEM_URL_RX = re.compile(r"https?://([A-Za-z0-9][A-Za-z0-9.-]*)", re.I)
 _MEM_SKIP_CLASSES = {"Windows/Microsoft (gürültü)", "Yerel (gürültü)", "Adobe"}
 
 
-def _split_memory_findings(items: List[Any]) -> Tuple[List[str], List[str]]:
-    """Memory scan hits -> (red, note). Indicator strings (Telegram bot API, Discord webhook, mimikatz, AMSI ...) and
-    URLs on abused services are red. Windows/Adobe URLs are dropped: Windows 11 keeps Spotlight/Bing wallpaper links in
-    every console process, so cmd.exe running a harmless .bat 'had' bing.com in memory. Other URLs are only a note."""
+def _split_memory_findings(items: List[Any]) -> Tuple[List[str], List[str], List[str]]:
+    """Memory scan hits -> (red, url notes, script-engine notes). Indicator strings (Telegram bot API, Discord webhook,
+    mimikatz, AMSI ...) and URLs on abused services are red. Windows/Adobe URLs are dropped: Windows 11 keeps
+    Spotlight/Bing wallpaper links in every console process, so cmd.exe running a harmless .bat 'had' bing.com in
+    memory. Other URLs are only a note. Indicator strings inside script engines (powershell.exe, cmd.exe ...) are
+    notes: the engines contain names like AmsiScanBuffer / NtUnmapViewOfSection themselves."""
     red_items: List[str] = []
     url_items: List[str] = []
+    engine_items: List[str] = []
     for x in items:
         text = str(x)
+        tag = re.match(r"^\[([^:\]]+)", text)
         body = re.sub(r"^\[[^\]]*\]\s*", "", text)
         m = _MEM_URL_RX.match(body)
         if not m:
-            red_items.append(text)
+            if tag and _SCRIPT_ENGINE_RX.match(tag.group(1).rsplit(".", 1)[0]):
+                engine_items.append(text)
+            else:
+                red_items.append(text)
             continue
         cls = domain_class(m.group(1))
         if cls in _MEM_SKIP_CLASSES:
             continue
         (red_items if cls == CLASS_ABUSED else url_items).append(text)
-    return red_items, url_items
+    return red_items, url_items, engine_items
 
 
 # Windows exception codes and fast-fail codes (0xc0000409 + P9) seen in crash records, in plain words.
@@ -2768,6 +2858,71 @@ def _crash_note(crashes: List[Any], has_crack: bool) -> str:
         text += (" Control Flow Guard ihlali genelde bellekte ya da dosyada yamalanmış/kancalanmış kodda görülür"
                  + ("; bu pakette crack bulguları da var, yama bu sürümle uyumsuz olabilir." if has_crack else "."))
     return text
+
+
+# Verdict message -> MITRE ATT&CK technique. Matched on the finding texts this module writes (Turkish) and on
+# YARA rule names. Order matters only for the evidence shown (first matching finding).
+_ATTACK_MAP: List[Tuple[str, str, str, str]] = [
+    (r"Defender|AMSI_ETW|Defender_Exclusion", "T1562.001", "Impair Defenses: Disable or Modify Tools", "Defense Evasion"),
+    (r"güvenlik duvarı kuralı|Yerel ağ engeli sandbox içinde kaldırıldı", "T1562.004", "Impair Defenses: Disable or Modify System Firewall", "Defense Evasion"),
+    (r"Uzantı/Biçim kandırmacası|Sahte üretici", "T1036", "Masquerading", "Defense Evasion"),
+    (r"HashMismatch|imzası bozuk|çalıştırılabilir dosya değiştirildi", "T1554", "Compromise Host Software Binary", "Persistence"),
+    (r"yeni servis|servis ele geçirme|yeni sürücü", "T1543.003", "Create or Modify System Process: Windows Service", "Persistence"),
+    (r"zamanlanmış görev", "T1053.005", "Scheduled Task/Job: Scheduled Task", "Persistence"),
+    (r"otomatik başlatma kaydı|Başlangıç klasörüne", "T1547.001", "Boot or Logon Autostart: Registry Run Keys / Startup Folder", "Persistence"),
+    (r"Active Setup", "T1547.014", "Boot or Logon Autostart: Active Setup", "Persistence"),
+    (r"WMI olay aboneliği|Persistence_WMI", "T1546.003", "Event Triggered Execution: WMI Event Subscription", "Persistence"),
+    (r"AppInit_DLLs", "T1546.010", "Event Triggered Execution: AppInit DLLs", "Persistence"),
+    (r"PowerShell profil", "T1546.013", "Event Triggered Execution: PowerShell Profile", "Persistence"),
+    (r"COM sınıfı", "T1546.015", "Event Triggered Execution: Component Object Model Hijacking", "Persistence"),
+    (r"BITS arka plan", "T1197", "BITS Jobs", "Defense Evasion"),
+    (r"UAC_Bypass", "T1548.002", "Abuse Elevation Control: Bypass User Account Control", "Privilege Escalation"),
+    (r"Process_Hollowing", "T1055.012", "Process Injection: Process Hollowing", "Defense Evasion"),
+    (r"DotNet_Memory_Loader", "T1620", "Reflective Code Loading", "Defense Evasion"),
+    (r"şüpheli komut satırı|PowerShell_Hidden_Download|Reverse_Shell", "T1059.001", "Command and Scripting Interpreter: PowerShell", "Execution"),
+    (r"Yem dosya|honeyfile|Credential_Stealer|hassas sistem/kimlik", "T1555.003", "Credentials from Password Stores: Web Browsers", "Credential Access"),
+    (r"LSASS", "T1003.001", "OS Credential Dumping: LSASS Memory", "Credential Access"),
+    (r"Clipboard_Hijacker", "T1115", "Clipboard Data", "Collection"),
+    (r"sohbet API|Chat_Webhook|kötüye kullanılan servise", "T1102", "Web Service", "Command and Control"),
+    (r"DNS-over-HTTPS", "T1572", "Protocol Tunneling", "Command and Control"),
+    (r"Ransomware_Shadow", "T1490", "Inhibit System Recovery", "Impact"),
+    (r"Crypto_Miner", "T1496", "Resource Hijacking", "Impact"),
+    (r"License_Service_Tamper|Lisans Müdahale", "T1489", "Service Stop", "Impact"),
+]
+_KNOWN_BAD_RX = re.compile(r"^(MalwareBazaar|ThreatFox):|zararlı yazılım ailesi|^CIRCL Hashlookup: .* zararlı|"
+                           r"^Bellek dökümünde YARA")
+
+
+def _attack_techniques(red: List[str], crack: List[str], notes: List[str]) -> List[Dict[str, str]]:
+    """MITRE ATT&CK techniques behind the findings, each with the first finding that shows it."""
+    out: List[Dict[str, str]] = []
+    for rx, tid, name, tactic in _ATTACK_MAP:
+        for level, items in (("red", red), ("crack", crack), ("note", notes)):
+            hit = next((x for x in items if re.search(rx, x)), None)
+            if hit:
+                out.append({"id": tid, "name": name, "tactic": tactic, "level": level, "evidence": hit[:200],
+                            "url": "https://attack.mitre.org/techniques/" + tid.replace(".", "/") + "/"})
+                break
+    return out
+
+
+def _score(red: List[str], crack: List[str], notes: List[str], missing: List[str], finished: bool) -> Dict[str, Any]:
+    """1-10 like public sandboxes (10 known malware ... 1 nothing malicious) on top of the red/yellow/green level.
+    10: a malware database / family / memory-dump rule says so; 8-9: red findings; 5-7: crack/license tampering;
+    2-4: only notes; 1: nothing found. 'incomplete' when a check did not run (the score may be too low)."""
+    if not finished:
+        return {"score": None, "label": "Analiz sürüyor", "incomplete": True}
+    if any(_KNOWN_BAD_RX.search(x) for x in red):
+        sc, label = 10, "Bilinen zararlı"
+    elif red:
+        sc, label = (9 if len(red) >= 3 else 8), "Büyük olasılıkla zararlı"
+    elif crack:
+        sc, label = (6 if notes else 5), "Şüpheli (crack / lisans müdahalesi)"
+    elif notes:
+        sc, label = (4 if len(notes) >= 4 else 3), "Büyük olasılıkla zararsız, notlara bakın"
+    else:
+        sc, label = 1, "Zararlı davranış görülmedi"
+    return {"score": sc, "label": label, "incomplete": bool(missing)}
 
 
 def _installer_never_started(b: Dict[str, Any]) -> str:
@@ -3001,10 +3156,26 @@ def _compute_verdict(job: Job) -> None:
         conns = [c for c in (b.get("Network") or {}).get("Connections") or [] if c.get("FromSample")]
         if conns:
             notes.append(f"Örneğin başlattığı işlemler {len(conns)} ağ bağlantısı açtı.")
+        for h in b.get("MemoryYara") or []:
+            if not isinstance(h, dict):
+                continue
+            proc = str(h.get("proc") or "?")
+            msg_m = f"Bellek dökümünde YARA [{h.get('rule')}]: {proc} (pid {h.get('pid')}) — {h.get('description')}"
+            sev = str(h.get("severity") or "medium").lower()
+            if h.get("rule") in CRACK_YARA_RULES:
+                crack.append(msg_m)
+            elif _SCRIPT_ENGINE_RX.match(proc.rsplit(".", 1)[0]):
+                notes.append(f"{msg_m} ({_ENGINE_NOTE})")
+            elif sev == "critical" and not _BROWSER_ENGINE_RX.match(proc.rsplit(".", 1)[0]):
+                red.append(msg_m)
+            else:
+                notes.append(msg_m + " (bellekte görüldü; tek başına kesin kanıt değil)")
         crash_note = _crash_note(b.get("Crashes") or [], bool(crack))
         if crash_note:
             notes.append(crash_note)
-        mem_red, mem_urls = _split_memory_findings(b.get("MemoryFindings") or [])
+        mem_red, mem_urls, mem_engine = _split_memory_findings(b.get("MemoryFindings") or [])
+        if mem_engine:
+            notes.append(f"Betik motoru belleğinde {len(mem_engine)} gösterge ({_ENGINE_NOTE}): " + "; ".join(mem_engine[:5]))
         if mem_red:
             red.append(f"Canlı işlem belleğinde zararlı/şüpheli izler tespit edildi ({len(mem_red)}): "
                        + "; ".join(mem_red[:5]))
@@ -3073,6 +3244,8 @@ def _compute_verdict(job: Job) -> None:
                 notes.append(stalled)
     level = "red" if red else ("yellow" if (notes or crack) else ("green" if finished else "pending"))
     verdict_obj: Dict[str, Any] = {"level": level, "red": red, "notes": notes, "crack": crack, "not_run": missing}
+    verdict_obj.update(_score(red, crack, notes, missing, finished))
+    verdict_obj["attack"] = _attack_techniques(red, crack, notes)
     if "Kurulum" in missing:
         verdict_obj["install_not_started"] = True
     if known_good:
@@ -3100,13 +3273,19 @@ def write_report(job: Job) -> None:
     s = job.state
     v = s["verdict"]
     L: List[str] = [f"# SafeBox analiz raporu", "", f"- **Örnek:** {s['sample']}", f"- **Tarih:** {s['created']}",
-                    f"- **Sonuç seviyesi:** {v['level']}", ""]
+                    f"- **Sonuç seviyesi:** {v['level']}"]
+    if v.get("score"):
+        L.append(f"- **Puan:** {v['score']}/10 — {v.get('label', '')}" + (" (eksik analiz: " + ", ".join(v.get("not_run") or []) + ")" if v.get("incomplete") else ""))
+    L.append("")
     L += ["## Bulgular", ""]
     L += [f"- **KIRMIZI:** {x}" for x in v["red"]] + [f"- CRACK/LİSANS: {x}" for x in v.get("crack") or []] + [f"- NOT: {x}" for x in v["notes"]]
     if v.get("known_good"):
         L.append(f"- BİLGİ (CIRCL NSRL bilinen temiz): {', '.join(v['known_good'][:10])}")
     if not v["red"] and not v["notes"] and not v.get("crack"):
         L.append("- Otomatik kontroller kırmızı bayrak bulmadı. Bu dosyanın temiz olduğunu **kanıtlamaz**.")
+    if v.get("attack"):
+        L += ["", "## MITRE ATT&CK teknikleri", ""]
+        L += [f"- [{t['id']}]({t['url']}) {t['name']} ({t['tactic']}) — {t['evidence']}" for t in v["attack"]]
     inv = s.get("inventory") or {}
     L += ["", "## Envanter", "", f"{inv.get('files', 0)} dosya, {inv.get('pe', 0)} çalıştırılabilir, {inv.get('unsigned', 0)} imzasız, "
           f"{inv.get('hash_mismatch', 0)} imzası bozuk, {inv.get('missing', 0)} kayıp.", ""]
@@ -3150,6 +3329,7 @@ def write_report(job: Job) -> None:
                     ("Defender değişiklikleri", (b.get("Defender") or {}).get("Added")), ("Defender tespitleri", (b.get("Defender") or {}).get("ThreatsDetected")),
                     ("Yeni servisler", (b.get("Persistence") or {}).get("Services")), ("Yeni sürücüler", (b.get("Persistence") or {}).get("Drivers")),
                     ("Çöken programlar (Windows hata kayıtları)", b.get("Crashes")),
+                    ("Bellek dökümü YARA eşleşmeleri", [f"{h.get('rule')} — {h.get('proc')} (pid {h.get('pid')})" for h in b.get("MemoryYara") or [] if isinstance(h, dict)]),
                     ("Yeni zamanlanmış görevler", (b.get("Persistence") or {}).get("Tasks")), ("Otomatik başlatma kayıtları", (b.get("Persistence") or {}).get("RunKeys")),
                     ("Başlangıç klasörü", (b.get("Persistence") or {}).get("Startup")),
                     ("WMI kalıcılık abonelikleri", (b.get("Persistence") or {}).get("WmiSubscriptions")),

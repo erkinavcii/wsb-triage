@@ -1152,6 +1152,58 @@ public static class SafeBoxMem {
         }
     }
 
+    // Writes the process's private and executable memory (where unpacked / injected code lives) to a file,
+    // XOR-encoded with key so the host's antivirus does not flag or delete the dump before it is scanned.
+    // Mapped data files are skipped. Returns the number of bytes written.
+    public static long DumpProcess(int pid, string path, long maxBytes, byte[] key) {
+        IntPtr hProc = OpenProcess(0x0410, false, pid);
+        if (hProc == IntPtr.Zero) return 0;
+        long written = 0;
+        try {
+            using (System.IO.FileStream fs = new System.IO.FileStream(path, System.IO.FileMode.Create, System.IO.FileAccess.Write)) {
+                long addr = 0;
+                long maxAddr = IntPtr.Size == 8 ? 0x7FFFFFFEFFFFL : 0x7FFEFFFFL;
+                uint mbiSize = (uint)Marshal.SizeOf(typeof(MEMORY_BASIC_INFORMATION));
+                byte[] buf = new byte[1048576];
+                while (addr < maxAddr && written < maxBytes) {
+                    MEMORY_BASIC_INFORMATION mbi;
+                    UIntPtr q = VirtualQueryEx(hProc, new IntPtr(addr), out mbi, mbiSize);
+                    if (q == UIntPtr.Zero) break;
+                    long regionSize = mbi.RegionSize.ToInt64();
+                    if (regionSize <= 0) break;
+                    long baseAddr = mbi.BaseAddress.ToInt64();
+                    long nextAddr = baseAddr + regionSize;
+                    if (nextAddr <= addr) break;
+                    bool committed = mbi.State == 0x1000;
+                    bool noAccess = (mbi.Protect & 0x01) != 0;
+                    bool guard = (mbi.Protect & 0x100) != 0;
+                    bool readable = (mbi.Protect & 0xEE) != 0;
+                    bool executable = (mbi.Protect & 0xF0) != 0;
+                    bool isPrivate = mbi.Type == 0x20000;
+                    if (committed && !noAccess && !guard && readable && (isPrivate || executable)) {
+                        long offset = 0;
+                        while (offset < regionSize && written < maxBytes) {
+                            int toRead = (int)Math.Min(buf.Length, Math.Min(regionSize - offset, maxBytes - written));
+                            if (toRead <= 0) break;
+                            IntPtr bytesRead;
+                            if (ReadProcessMemory(hProc, new IntPtr(baseAddr + offset), buf, toRead, out bytesRead)) {
+                                int n = bytesRead.ToInt32();
+                                for (int i = 0; i < n; i++) { buf[i] = (byte)(buf[i] ^ key[(written + i) % key.Length]); }
+                                if (n > 0) { fs.Write(buf, 0, n); written += n; }
+                            }
+                            offset += toRead;
+                        }
+                    }
+                    addr = nextAddr;
+                }
+            }
+        } catch {
+        } finally {
+            CloseHandle(hProc);
+        }
+        return written;
+    }
+
     public static string[] ScanProcess(int pid, string procName, int maxBytes) {
         List<string> findings = new List<string>();
         HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1208,6 +1260,36 @@ public static class SafeBoxMem {
 }
 "@ -ErrorAction SilentlyContinue
     } catch {}
+}
+
+# Memory dumps of the sample's processes for YARA on the host (unpacked / decrypted code is only in memory).
+# Same XOR key as pipeline.MEMDUMP_KEY. Caps: 64 MB per process, 192 MB in total, 6 processes.
+$MemDumpKey = [Text.Encoding]::ASCII.GetBytes('SafeBoxMemDump!7')
+function Dump-ProcessMemory {
+    if ($TestMode) { return @() }
+    $dir = Join-Path $OutputDir 'memdumps'
+    $out = @()
+    try { New-Item -ItemType Directory -Force -Path $dir | Out-Null } catch { return @() }
+    $total = [long]0
+    $pids = @($TreePids.Keys | ForEach-Object { [int]$_ } | Where-Object { $_ -gt 0 -and $_ -ne $PID } | Select-Object -Unique)
+    foreach ($tpid in $pids) {
+        if ($out.Count -ge 6 -or $total -ge 201326592) { break }
+        $p = Get-Process -Id $tpid -ErrorAction SilentlyContinue
+        if (-not $p) { continue }
+        $pname = [string]$p.ProcessName
+        if ($MonitorNames -contains ($pname.ToLower() + '.exe')) { continue }
+        $safe = ($pname -replace '[^A-Za-z0-9_.-]', '_')
+        if ($safe.Length -gt 60) { $safe = $safe.Substring(0, 60) }
+        $file = Join-Path $dir ("{0}_{1}.xbin" -f $safe, $tpid)
+        try {
+            $cap = [Math]::Min([long]67108864, [long]201326592 - $total)
+            $n = [SafeBoxMem]::DumpProcess($tpid, $file, $cap, $MemDumpKey)
+            if ($n -gt 0) { $total += $n; $out += "$safe.exe pid=$tpid $([Math]::Round($n / 1MB, 1)) MB" }
+            else { Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue }
+        } catch {}
+    }
+    if ($out.Count) { Log ("Memory dumps: " + ($out -join '; ')) }
+    return $out
 }
 
 function Scan-ProcessMemory {
@@ -1514,6 +1596,8 @@ Update-Watch $watchStart
 Import-AuditProcesses $startedAt
 Update-HoneyReads $startedAt
 $memFindings = @(Scan-ProcessMemory)
+Set-Status 'Bellek dokumu aliniyor (ornek islemleri)'
+$memDumps = @(Dump-ProcessMemory)
 $crashes = @(Get-CrashEvents $startedAt)
 Test-LanBlock
 Capture-Screen
@@ -1656,6 +1740,7 @@ $result = [ordered]@{
     HoneyfileAlerts = @($honeyAlerts)
     MemoryFindings  = @($memFindings)
     Crashes         = @($crashes)
+    MemoryDumps     = @($memDumps)
     FakeNetRequests = @($fakeNetReqs)
     AutoClicks      = @($script:ClickedActions)
     Processes       = @($Procs.Values | Where-Object { $MonitorNames -notcontains ([string]$_.Name).ToLower() } | Sort-Object FirstSeen)

@@ -196,6 +196,9 @@ def build_wsb(case_dir: Path, network: bool, memory_mb: int = 4096, input_dir: O
 
 
 _SANDBOX_IDLE_BROKERS = {"windowssandboxserver.exe"}
+# Viewer (remote-desktop client) processes. One can outlive its sandbox (seen: a windowless
+# WindowsSandboxRemoteSession.exe left over after the run), so on its own it does not mean a sandbox exists.
+_SANDBOX_VIEWER_PROCS = {"windowssandboxremotesession.exe", "windowssandboxclient.exe"}
 
 
 def _sandbox_processes() -> Optional[List[str]]:
@@ -211,8 +214,8 @@ def _sandbox_processes() -> Optional[List[str]]:
     for line in p.stdout.splitlines():
         name = line.split('","')[0].strip('"')
         low = name.lower()
-        if low.startswith("windowssandbox") and low not in _SANDBOX_IDLE_BROKERS:
-            names.append(name)
+        if (low.startswith("windowssandbox") and low not in _SANDBOX_IDLE_BROKERS) or low.startswith("vmmemwindowssandbox"):
+            names.append(name)           # vmmemWindowsSandbox = the sandbox VM's memory process
     return names
 
 
@@ -265,7 +268,11 @@ def sandbox_state() -> Optional[bool]:
     """True = running, False = not running, None = unknown (check failed; do NOT treat as closed)."""
     names = _sandbox_processes()
     wsb_ids = wsb_list_ids()
-    if names or wsb_ids:
+    if wsb_ids:
+        return True
+    if names and wsb_ids == [] and all(n.lower() in _SANDBOX_VIEWER_PROCS for n in names):
+        return False                     # wsb lists no sandbox and there is no VM: only a leftover viewer
+    if names:
         return True
     if names is None and wsb_ids is None:
         return None

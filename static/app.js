@@ -393,11 +393,16 @@ function renderJob(st) {
         <div class="text-xs font-semibold text-orange-200">🔧 Crack / lisans müdahalesine özgü bulgular (${vCrack.length}) — crack'li yazılımda beklenen davranış; aynı dosyada zararlı sinyali olmadığı için kırmızı sayılmadı</div>
         ${vCrack.map(x => `<div class="text-xs text-orange-300">• ${esc(x)}</div>`).join('')}
       </div>` : '';
+  const scoreBadge = v.score ? `<span class="px-2.5 py-1 rounded-lg border font-bold text-xs ${v.score >= 8 ? 'bg-rose-500/20 text-rose-300 border-rose-500/40' : v.score >= 5 ? 'bg-amber-500/20 text-amber-300 border-amber-500/40' : 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'}" title="10 bilinen zararlı · 8-9 büyük olasılıkla zararlı · 5-7 şüpheli · 2-4 büyük olasılıkla zararsız · 1 zararlı davranış yok">Puan ${v.score}/10 · ${esc(v.label || '')}${v.incomplete ? ' · eksik analiz' : ''}</span>` : '';
+  const attack = asArr(v.attack);
+  const attackBlock = attack.length ? `<div class="mt-2 flex flex-wrap items-center gap-1.5 text-[11px]"><span class="text-slate-400">MITRE ATT&amp;CK:</span>
+      ${attack.map(t => `<a href="${esc(t.url)}" target="_blank" rel="noopener noreferrer" title="${esc(t.tactic + ' — ' + t.evidence)}" class="px-2 py-1 rounded-lg border ${t.level === 'red' ? 'bg-rose-500/20 text-rose-300 border-rose-500/40' : t.level === 'crack' ? 'bg-orange-950/40 text-orange-300 border-orange-500/50' : 'bg-slate-800 text-slate-300 border-slate-700'}">${esc(t.id)} ${esc(t.name)}</a>`).join('')}</div>` : '';
   $('verdictBox').innerHTML = `<div class="p-4 rounded-xl bg-${vColor}-950/40 border border-${vColor}-500/50 space-y-1.5">
-      <div class="font-semibold text-sm text-${vColor}-200">${vTitle}</div>
+      <div class="flex flex-wrap items-center justify-between gap-2"><div class="font-semibold text-sm text-${vColor}-200">${vTitle}</div>${scoreBadge}</div>
       ${vRed.map(x => `<div class="text-xs text-rose-200">• <b>KIRMIZI:</b> ${esc(x)}</div>`).join('')}
       ${vNotes.map(x => `<div class="text-xs text-amber-200">• ${esc(x)}</div>`).join('')}
       ${crackBlock}
+      ${attackBlock}
     </div>`;
 
   // stages
@@ -537,6 +542,7 @@ function renderSandbox(st) {
       + listBox('⚙️ Yeni servisler', P.Services, 'rose') + listBox('🧩 Yeni sürücüler', P.Drivers, 'rose')
       + listBox('🔁 Ayarı değişen mevcut servisler', P.ServicesChanged, 'amber')
       + listBox('💥 Çöken programlar (Windows hata kayıtları)', b.Crashes, 'amber')
+      + listBox('🧠 Bellek dökümü YARA eşleşmeleri', asArr(b.MemoryYara).filter(h => h && typeof h === 'object').map(h => `${h.rule} — ${h.proc} (pid ${h.pid}): ${h.description}`), 'rose')
       + listBox('⏰ Zamanlanmış görevler', P.Tasks, 'amber') + listBox('📌 Otomatik başlatma (Run/IFEO)', asArr(P.RunKeys).concat(asArr(P.Startup)), 'amber')
       + listBox('🕵️ Gelişmiş kalıcılık (WMI/COM/AppInit/BITS/PS)', advPers, advPers.length ? 'rose' : 'slate')
       + listBox('📝 hosts (eklenen / silinen)', asArr((b.Hosts || {}).Added).concat(asArr((b.Hosts || {}).Removed).map(x => `[-] ${x}`)), 'amber')

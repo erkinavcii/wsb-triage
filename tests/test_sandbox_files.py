@@ -262,12 +262,24 @@ def test_win11_idle_sandbox_server_daemon_does_not_block_new_sandbox(monkeypatch
         lambda args, timeout=30: subprocess.CompletedProcess(
             args,
             0,
-            stdout='"WindowsSandboxServer.exe","18712","Console","1","12,000 K"\n"WindowsSandboxClient.exe","9999","Console","1","80,000 K"\n',
+            stdout='"WindowsSandboxServer.exe","18712","Console","1","12,000 K"\n"WindowsSandboxClient.exe","9999","Console","1","80,000 K"\n"vmmemWindowsSandbox","4242","Services","0","2,000,000 K"\n',
             stderr="",
         ),
     )
-    assert sbm._sandbox_processes() == ["WindowsSandboxClient.exe"]
+    assert sbm._sandbox_processes() == ["WindowsSandboxClient.exe", "vmmemWindowsSandbox"]
     assert sbm.sandbox_running() is True
+
+    # A viewer left over after its sandbox ended (seen live: windowless WindowsSandboxRemoteSession.exe, empty
+    # `wsb list`, no VM process) must not block the next analysis
+    monkeypatch.setattr(
+        sbm,
+        "_run",
+        lambda args, timeout=30: subprocess.CompletedProcess(
+            args, 0, stdout='"WindowsSandboxRemoteSession.exe","26964","Console","1","30,000 K"\n', stderr=""),
+    )
+    assert sbm.sandbox_state() is False
+    monkeypatch.setattr(sbm, "wsb_list_ids", lambda: None)            # no wsb CLI: keep the old, cautious answer
+    assert sbm.sandbox_state() is True
 
 
 
@@ -326,3 +338,11 @@ def test_vgpu_is_off_unless_asked_and_crashes_are_collected(tmp_path):
     ps = (Path(pipeline.__file__).parent / "sandbox" / "Inside-Sandbox.ps1").read_text(encoding="utf-8")
     assert "function Get-CrashEvents" in ps and "Crashes         = @($crashes)" in ps
     assert "ProviderName = 'Application Error'" in ps          # not the localized message text
+
+
+def test_memory_dump_code_and_key_match_the_host():
+    import pipeline
+    ps = (Path(pipeline.__file__).parent / "sandbox" / "Inside-Sandbox.ps1").read_text(encoding="utf-8")
+    assert "public static long DumpProcess(" in ps and "function Dump-ProcessMemory" in ps
+    assert "$MemDumpKey = [Text.Encoding]::ASCII.GetBytes('" + pipeline.MEMDUMP_KEY.decode() + "')" in ps
+    assert "MemoryDumps     = @($memDumps)" in ps
