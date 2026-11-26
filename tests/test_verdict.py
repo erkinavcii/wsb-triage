@@ -1135,7 +1135,7 @@ def test_https_requested_but_failed_is_a_note_and_mitm_is_hash_pinned(tmp_path, 
 
 
 def test_mitmproxy_own_driver_and_unpacked_files_are_not_findings(tmp_path):
-    mei = r"C:\Users\WDAGUtilityAccount\AppData\Local\Temp\_MEI000020182"
+    mei = r"C:\Users\WDAGUtilityAccount\AppData\Local\Temp\_MEI0000239c2"   # seen live: hex, not only digits
     beh = {"Target": "x.exe",
            "Persistence": {"Drivers": [rf"WinDivert | \??\{mei}\mitmproxy_windows\WinDivert64.sys"]},
            "Files": {"NewExecutables": [rf"{mei}\mitmproxy_windows\WinDivert64.sys", rf"{mei}\python315.dll",
@@ -1153,3 +1153,36 @@ def test_mitmproxy_own_driver_and_unpacked_files_are_not_findings(tmp_path):
     job2.state["behavior"] = pipeline.sanitize_sandbox_json(copy.deepcopy(beh))
     pipeline.compute_verdict(job2)
     assert any("1 yeni sürücü kuruldu: WinDivert" in x for x in job2.state["verdict"]["red"])
+
+
+# ---------------------------------------------------------------- fixes from the code review
+def test_config_c2_skips_version_mutex_keys_and_private_ips():
+    cfg = {"version": "1.2.3.4", "mutex": "abc.xyz", "Build ID": "x.y.z", "key": "k.example.com",
+           "C2": ["real.example:443", "45.9.148.12:8080", "10.0.0.5:80"], "Hosts": "a.example.net;b.example.org",
+           "notes": "see http://drop.example/x.exe", "misc": "not.c2.example"}
+    c2 = pipeline._config_c2(cfg)
+    assert c2[:3] == ["real.example:443", "45.9.148.12:8080", "a.example.net"]
+    assert "http://drop.example/x.exe" in c2 and "b.example.org" in c2
+    for wrong in ("1.2.3.4", "abc.xyz", "x.y.z", "k.example.com", "10.0.0.5:80", "not.c2.example"):
+        assert wrong not in c2
+
+
+def test_memory_dump_names_with_early_round():
+    m = pipeline._MEMDUMP_RX.match("Set-up_4321_early.xbin")
+    assert m and m.group("proc") == "Set-up" and m.group("pid") == "4321" and m.group("early")
+    assert pipeline._MEMDUMP_RX.match("payload_99.xbin").group("early") is None
+    ps = (Path(pipeline.__file__).parent / "sandbox" / "Inside-Sandbox.ps1").read_text(encoding="utf-8")
+    assert "function Dump-EarlySample" in ps and "Dump-EarlySample\n" in ps.replace("\r\n", "\n")
+    assert "'SafeBox-BlockQUIC'" in ps and "notlike 'SafeBox-*'" in ps
+    for v in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS"):
+        assert v in ps
+
+
+def test_script_engine_memory_hit_of_a_crack_rule_is_not_crack(tmp_path):
+    """Measured: a clean powershell.exe also matches the patch/keygen rule in its own memory."""
+    job = bare_job(tmp_path)
+    job.state["behavior"] = pipeline.sanitize_sandbox_json({"Target": "setup.bat"})
+    job.state["behavior"]["MemoryYara"] = [{"proc": "powershell.exe", "pid": 1, "rule": "SafeBox_Patch_Keygen_Artifacts",
+                                            "severity": "medium", "description": "patch"}]
+    pipeline.compute_verdict(job)
+    assert not job.state["verdict"]["crack"] and any("betik motorunun" in n for n in job.state["verdict"]["notes"])

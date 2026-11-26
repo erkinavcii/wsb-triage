@@ -1533,7 +1533,7 @@ def _sha256_file(p: Path) -> str:
 
 # mitmproxy's local capture mode loads the WinDivert packet driver from its own unpacked bundle. Only that exact
 # location is ignored (and only when HTTPS decryption was on): malware ships WinDivert too, from elsewhere.
-_MITM_DRIVER_RX = re.compile(r"^WinDivert\s*\|\s*(\\\?\?\\)?[A-Z]:\\Users\\[^\\]+\\AppData\\Local\\Temp\\_MEI\d+\\"
+_MITM_DRIVER_RX = re.compile(r"^WinDivert\s*\|\s*(\\\?\?\\)?[A-Z]:\\Users\\[^\\]+\\AppData\\Local\\Temp\\_MEI[0-9a-z]+\\"
                              r"mitmproxy_windows\\WinDivert64\.sys$", re.I)
 
 
@@ -1648,7 +1648,9 @@ def _memory_family_scan(job: Job, out: Path) -> List[Dict[str, Any]]:
     for p in sorted(d.iterdir()):
         m = _MEMDUMP_RX.match(p.name)
         if m and p.is_file() and p.stat().st_size <= _MEMDUMP_MAX_FILE:
-            files.append({"label": f"{m.group('proc')}.exe (pid {m.group('pid')})", "path": str(p), "xor_key": MEMDUMP_KEY.hex()})
+            when = ", erken döküm" if m.group("early") else ""
+            files.append({"label": f"{m.group('proc')}.exe (pid {m.group('pid')}{when})", "path": str(p),
+                          "xor_key": MEMDUMP_KEY.hex()})
     if not files:
         return []
     res = run_config_extractor(files)
@@ -1658,23 +1660,48 @@ def _memory_family_scan(job: Job, out: Path) -> List[Dict[str, Any]]:
     return [r for r in res.get("results") or [] if r.get("families") or r.get("generic")]
 
 
-_C2_RX = re.compile(r"(?:https?://[^\s'\"<>]{3,200})|(?:\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?\b)|"
-                    r"(?:\b[a-z0-9][a-z0-9.-]{1,200}\.[a-z]{2,24}(?::\d{1,5})?\b)", re.I)
+_C2_URL_RX = re.compile(r"https?://[^\s'\"<>]{3,200}", re.I)
+_C2_HOST_RX = re.compile(r"(?<![\w.-])(?:(?:\d{1,3}\.){3}\d{1,3}|[a-z0-9](?:[a-z0-9-]{0,62}\.)+[a-z]{2,24})(?::\d{1,5})?(?![\w-])", re.I)
+# Keys whose values are network locations in CAPE configs (C2, CNCs, Hosts, Domains, Panel, Gate, Webhook ...).
+_C2_KEY_RX = re.compile(r"c2|cnc|c&c|host|domain|url|uri|server|panel|gate|address|addr|\bip\b|ips|endpoint|webhook|"
+                        r"telegram|discord|smtp|ftp|proxy|dns|onion|callback|beacon|controller|backup|fallback", re.I)
+# Keys that look like addresses but are not: "version": "1.2.3.4", "mutex": "abc.xyz", keys, build ids.
+_C2_SKIP_KEY_RX = re.compile(r"version|ver\b|build|mutex|campaign|botnet|bot_?id|key|crypt|aes|rc4|salt|\biv\b|hash|"
+                             r"family|install|sleep|delay|pass|user|name|path|file|folder|registry|tag", re.I)
+_FILE_EXT_TAIL = (".exe", ".dll", ".dat", ".txt", ".json", ".log", ".bin", ".tmp", ".ini", ".cfg")
 
 
-def _config_c2(cfg: Any, found: Optional[List[str]] = None) -> List[str]:
-    """Network addresses anywhere in an extracted config (C2 servers, panels, download URLs)."""
+def _valid_c2_host(h: str) -> bool:
+    host = h.rsplit(":", 1)[0] if re.search(r":\d{1,5}$", h) else h
+    if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", host):
+        ip = _clean_ip(host)
+        return bool(ip) and not (ip.is_private or ip.is_loopback or ip.is_unspecified or ip.is_multicast)
+    return not host.lower().endswith(_FILE_EXT_TAIL)
+
+
+def _config_c2(cfg: Any, found: Optional[List[str]] = None, key: str = "") -> List[str]:
+    """Network addresses in an extracted malware config. URLs count anywhere (unambiguous); bare IPs and domains only
+    under network-looking keys, never under version/mutex/key/build-like ones, so "version": "1.2.3.4" is not a C2."""
     found = [] if found is None else found
     if isinstance(cfg, dict):
-        for v in cfg.values():
-            _config_c2(v, found)
-    elif isinstance(cfg, list):
+        for k, v in cfg.items():
+            ks = str(k)
+            if _C2_SKIP_KEY_RX.search(ks) and not _C2_KEY_RX.search(ks):
+                _config_c2(v, found, "\x00skip")
+            else:
+                _config_c2(v, found, ks if _C2_KEY_RX.search(ks) else key)
+    elif isinstance(cfg, (list, tuple)):
         for v in cfg:
-            _config_c2(v, found)
+            _config_c2(v, found, key)
     elif isinstance(cfg, str):
-        for m in _C2_RX.findall(cfg):
-            if m not in found and not m.lower().endswith((".exe", ".dll", ".dat", ".txt", ".json", ".log")):
-                found.append(m)
+        for u in _C2_URL_RX.findall(cfg):
+            if u not in found:
+                found.append(u)
+        if key and key != "\x00skip":
+            rest = _C2_URL_RX.sub(" ", cfg)
+            for h in _C2_HOST_RX.findall(rest):
+                if h not in found and _valid_c2_host(h):
+                    found.append(h)
     return found[:30]
 
 
@@ -2280,7 +2307,8 @@ def stage_sandbox(job: Job) -> None:
             if isinstance(beh.get("Https"), dict) or (out / "https_log.jsonl").is_file():
                 hs = beh.get("Https") if isinstance(beh.get("Https"), dict) else {}
                 beh["Https"] = {"Requested": bool(hs.get("Requested")), "Status": str(hs.get("Status") or "")[:300],
-                                "CaTrusted": bool(hs.get("CaTrusted")), **summarize_https_log(out)}
+                                "CaTrusted": bool(hs.get("CaTrusted")), "CaEnv": bool(hs.get("CaEnv")),
+                                "QuicBlocked": bool(hs.get("QuicBlocked")), **summarize_https_log(out)}
             job.state["behavior"] = beh
             _check_dropped_files_vt(job, beh)
             job.stage("sandbox", "done", f"Tamamlandı. Ağ kaydı: {beh.get('CaptureStatus')}")
@@ -2349,7 +2377,7 @@ def live_screen_path(job: Job) -> Optional[Path]:
 # ---------------------------------------------------------------- memory dumps (YARA on unpacked code)
 MEMDUMP_DIR = "memdumps"
 MEMDUMP_KEY = b"SafeBoxMemDump!7"            # same as $MemDumpKey in Inside-Sandbox.ps1
-_MEMDUMP_RX = re.compile(r"^(?P<proc>[A-Za-z0-9_][A-Za-z0-9_.-]{0,59})_(?P<pid>\d{1,7})\.xbin$")
+_MEMDUMP_RX = re.compile(r"^(?P<proc>[A-Za-z0-9_][A-Za-z0-9_.-]{0,59})_(?P<pid>\d{1,7})(?P<early>_early)?\.xbin$")
 _MEMDUMP_MAX_FILE = 64 * 1024 * 1024 + 4096
 _MEMDUMP_CHUNK = 16 * 1024 * 1024
 _MEMDUMP_OVERLAP = 64 * 1024
@@ -3379,12 +3407,12 @@ def _compute_verdict(job: Job) -> None:
             elif dh.get("SigStatus") not in ("Valid", None, "") and float(dh.get("Entropy") or 0) > 7.2:
                 notes.append(f"Bırakılan imzasız dosya '{Path(str(dh.get('Path') or 'dosya')).name}' yüksek entropili ({dh.get('Entropy')}/8).")
         new_exec = [str(f) for f in (b.get("Files") or {}).get("NewExecutables") or []]
-        # mitmdump (HTTPS decryption) unpacks itself into %TEMP%\_MEIxxxx; skip only the _MEI folder holding
+        # mitmdump (HTTPS decryption) unpacks itself into %TEMP%\_MEI<hex>; skip only the _MEI folder holding
         # its "mitmproxy_windows" part (malware built with PyInstaller unpacks into _MEI folders too).
         mitm_mei = set()
         if (b.get("Https") or {}).get("Requested"):
             for f in new_exec:
-                m = re.search(r"^(.*\\_MEI\d+\\)mitmproxy_windows\\", f, re.I)
+                m = re.search(r"^(.*\\_MEI[0-9a-z]+\\)mitmproxy_windows\\", f, re.I)
                 if m:
                     mitm_mei.add(m.group(1).lower())
         dropped = [
@@ -3404,10 +3432,10 @@ def _compute_verdict(job: Job) -> None:
             proc = str(h.get("proc") or "?")
             msg_m = f"Bellek dökümünde YARA [{h.get('rule')}]: {proc} (pid {h.get('pid')}) — {h.get('description')}"
             sev = str(h.get("severity") or "medium").lower()
-            if h.get("rule") in CRACK_YARA_RULES:
-                crack.append(msg_m)
-            elif _SCRIPT_ENGINE_RX.match(proc.rsplit(".", 1)[0]):
+            if _SCRIPT_ENGINE_RX.match(proc.rsplit(".", 1)[0]):        # first: engines match crack rules too
                 notes.append(f"{msg_m} ({_ENGINE_NOTE})")
+            elif h.get("rule") in CRACK_YARA_RULES:
+                crack.append(msg_m)
             elif sev == "critical" and not _BROWSER_ENGINE_RX.match(proc.rsplit(".", 1)[0]):
                 red.append(msg_m)
             else:

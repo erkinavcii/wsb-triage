@@ -1053,6 +1053,17 @@ if ($targetFile) {
 Initialize-Honeyfiles
 
 Set-Status 'Temiz sistem goruntusu (baseline) aliniyor'
+# HTTPS decryption: block QUIC (HTTP/3 over UDP 443) so browsers and Chromium/Go programs fall back to TCP, which
+# the decryptor sees. Created before the baseline, like the LAN block, so it is not reported as a change.
+$script:QuicBlocked = $false
+if ($cfg.DecryptHttps -and -not $TestMode) {
+    try {
+        New-NetFirewallRule -Name 'SafeBox-BlockQUIC' -DisplayName 'SafeBox: block QUIC (UDP 443) for HTTPS decryption' -Direction Outbound -Action Block -Protocol UDP -RemotePort 443 -Profile Any -ErrorAction Stop | Out-Null
+        $script:QuicBlocked = $true
+        Log 'QUIC (UDP 443) blocked so HTTPS goes over TCP to the decryptor'
+    } catch { Log "QUIC block failed: $($_.Exception.Message)" }
+}
+
 Log 'Baseline snapshot...'
 $before = Get-Snapshot
 Log "Baseline: $($before.Files.Count) files, $($before.Services.Count) services, $($before.Tasks.Count) tasks"
@@ -1292,6 +1303,44 @@ function Dump-ProcessMemory {
     return $out
 }
 
+# Early dumps: stealers often take what they want and exit within seconds, long before the end-of-run dump.
+# Every sample process is dumped once, while still alive, as soon as it has run for 6 s (budget: 8 processes,
+# 48 MB each, 128 MB in total; separate from the end-of-run dump).
+$script:EarlyDumped = @{}
+$script:EarlyDumpTotal = [long]0
+$script:EarlyDumpList = New-Object System.Collections.ArrayList
+function Dump-EarlySample {
+    if ($TestMode -or $script:EarlyDumped.Count -ge 8 -or $script:EarlyDumpTotal -ge 134217728) { return }
+    $dir = Join-Path $OutputDir 'memdumps'
+    foreach ($k in @($TreePids.Keys)) {
+        $tpid = [int]$k
+        if ($tpid -le 0 -or $tpid -eq $PID -or $script:EarlyDumped.ContainsKey($tpid)) { continue }
+        if ($script:EarlyDumped.Count -ge 8 -or $script:EarlyDumpTotal -ge 134217728) { break }
+        $p = Get-Process -Id $tpid -ErrorAction SilentlyContinue
+        if (-not $p) { continue }
+        $age = 0
+        try { $age = ((Get-Date) - $p.StartTime).TotalSeconds } catch { $age = 999 }
+        if ($age -lt 6) { continue }
+        $pname = [string]$p.ProcessName
+        $script:EarlyDumped[$tpid] = 1
+        if ($MonitorNames -contains ($pname.ToLower() + '.exe')) { continue }
+        $safe = ($pname -replace '[^A-Za-z0-9_.-]', '_')
+        if ($safe.Length -gt 60) { $safe = $safe.Substring(0, 60) }
+        try {
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            $file = Join-Path $dir ("{0}_{1}_early.xbin" -f $safe, $tpid)
+            $cap = [Math]::Min([long]50331648, [long]134217728 - $script:EarlyDumpTotal)
+            $n = [SafeBoxMem]::DumpProcess($tpid, $file, $cap, $MemDumpKey)
+            if ($n -gt 0) {
+                $script:EarlyDumpTotal += $n
+                $line = "$safe.exe pid=$tpid early $([Math]::Round($n / 1MB, 1)) MB at $([int]$age) s"
+                [void]$script:EarlyDumpList.Add($line)
+                Log "Memory dump: $line"
+            } else { Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue }
+        } catch {}
+    }
+}
+
 function Scan-ProcessMemory {
     $all = New-Object System.Collections.ArrayList
     $seen = @{}
@@ -1510,7 +1559,7 @@ function Stop-FakeNet {
 # mitmproxy in "local" capture mode intercepts every program's traffic (proxy settings are not needed); its CA is
 # trusted in LocalMachine\Root so Windows (Schannel) programs accept the intercepted TLS. Programs that pin their
 # certificate fail instead and are logged as tls_failed by the addon.
-$script:Https = [ordered]@{ Requested = [bool]$cfg.DecryptHttps; Status = 'not requested'; CaTrusted = $false }
+$script:Https = [ordered]@{ Requested = [bool]$cfg.DecryptHttps; Status = 'not requested'; CaTrusted = $false; CaEnv = $false; QuicBlocked = $false }
 $script:MitmProc = $null
 function Start-HttpsDecrypt {
     if (-not $cfg.DecryptHttps -or $TestMode) { return }
@@ -1533,6 +1582,17 @@ function Start-HttpsDecrypt {
         $script:Https.Status = 'CA certificate was not created'
     } else {
         try { Import-Certificate -FilePath $ca -CertStoreLocation 'Cert:\LocalMachine\Root' -ErrorAction Stop | Out-Null; $script:Https.CaTrusted = $true } catch {}
+        # Python (requests/certifi), Node/Electron and programs with their own OpenSSL ignore the Windows store and
+        # read these variables instead. Set for this process (the sample inherits it) and machine-wide (setx
+        # broadcasts the change, so programs started from the desktop get it too).
+        $pem = Join-Path $conf 'mitmproxy-ca-cert.pem'
+        if (Test-Path -LiteralPath $pem) {
+            foreach ($v in 'SSL_CERT_FILE', 'REQUESTS_CA_BUNDLE', 'NODE_EXTRA_CA_CERTS') {
+                Set-Item -Path "Env:$v" -Value $pem
+                try { & setx.exe $v $pem /M | Out-Null } catch {}
+            }
+            $script:Https.CaEnv = $true
+        }
         Start-Sleep -Seconds 3
         if ($script:MitmProc.HasExited) {
             $tail = ''
@@ -1542,7 +1602,8 @@ function Start-HttpsDecrypt {
             $script:Https.Status = 'running'
         }
     }
-    Log "HTTPS decryption: $($script:Https.Status) (CA trusted: $($script:Https.CaTrusted))"
+    $script:Https.QuicBlocked = $script:QuicBlocked
+    Log "HTTPS decryption: $($script:Https.Status) (CA trusted: $($script:Https.CaTrusted), CA env: $($script:Https.CaEnv), QUIC blocked: $($script:QuicBlocked))"
 }
 
 function Stop-HttpsDecrypt {
@@ -1628,6 +1689,7 @@ while ((Get-Date) -lt $end) {
         Update-HoneyReads $startedAt
         Test-LanBlock
         Invoke-FakeUser
+        Dump-EarlySample
         if (($now - $script:LastShot).TotalSeconds -ge $ShotInterval) { Capture-Screen }
         Capture-LiveScreen
         $left = [int]($end - $now).TotalSeconds
@@ -1645,7 +1707,7 @@ Import-AuditProcesses $startedAt
 Update-HoneyReads $startedAt
 $memFindings = @(Scan-ProcessMemory)
 Set-Status 'Bellek dokumu aliniyor (ornek islemleri)'
-$memDumps = @(Dump-ProcessMemory)
+$memDumps = @($script:EarlyDumpList) + @(Dump-ProcessMemory)
 $crashes = @(Get-CrashEvents $startedAt)
 Test-LanBlock
 Capture-Screen
@@ -1768,7 +1830,7 @@ try {
         "$name :: $(@($_.Resources) -join ', ')" })
 } catch {}
 
-$fwAdded = @(Compare-Set $before.Firewall $after.Firewall)
+$fwAdded = @(Compare-Set $before.Firewall $after.Firewall | Where-Object { [string]$_ -notlike 'SafeBox-*' })
 $fwDetail = @(foreach ($r in $fwAdded) {
     $name = $r.Split('|')[0]
     $prog = $null
