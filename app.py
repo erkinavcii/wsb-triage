@@ -180,6 +180,7 @@ class JobRequest(BaseModel):
     keep_sandbox_open: Optional[bool] = False
     show_sandbox_window: Optional[bool] = False
     enable_vgpu: Optional[bool] = False
+    decrypt_https: Optional[bool] = False
     simulate_user: Optional[bool] = True
     notify: Optional[bool] = True
     memory_mb: Optional[int] = 4096
@@ -203,6 +204,7 @@ class SandboxStartRequest(BaseModel):
     keep_sandbox_open: Optional[bool] = None
     show_sandbox_window: Optional[bool] = None
     enable_vgpu: Optional[bool] = None
+    decrypt_https: Optional[bool] = None
     simulate_user: Optional[bool] = None
     run_as_standard_user: Optional[bool] = None
     seed_honeyfiles: Optional[bool] = None
@@ -278,6 +280,8 @@ def system_status():
     caps["vt_api_masked"] = _mask_key(key)
     caps["procmon"] = any((BASE_DIR / "sandbox" / n).exists() for n in ("Procmon64.exe", "Procmon.exe"))
     caps["yara"] = yara_scanner.rules_status()
+    caps["config_extractor"] = pipeline.config_extractor_available()
+    caps["mitmproxy"] = pipeline.mitm_available()
     icfg = pipeline._get_intel_config()
     caps["mb_enabled"] = icfg["mb_enabled"]
     caps["circl_enabled"] = bool(icfg.get("circl_enabled", False))

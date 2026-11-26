@@ -50,6 +50,8 @@ async function loadSystemStatus() {
     h += caps.seven_zip ? badge('✅ 7-Zip', 'emerald') : `<a href="https://www.7-zip.org" target="_blank" rel="noopener">${badge('⚠️ 7-Zip yok (RAR/7z için gerekli) ↗', 'amber')}</a>`;
     h += caps.tshark ? badge('✅ Wireshark / tshark', 'emerald') : `<a href="https://www.wireshark.org/download.html" target="_blank" rel="noopener">${badge('ℹ️ Wireshark yok (ağ özeti için) ↗', 'slate')}</a>`;
     h += caps.procmon ? badge('✅ Procmon', 'emerald') : '';
+    h += caps.config_extractor ? badge('✅ Zararlı ailesi / ayar (CAPE)', 'emerald') : badge('ℹ️ Aile / ayar ayıklayıcı yok', 'slate');
+    h += caps.mitmproxy ? badge('✅ HTTPS çözme (mitmproxy)', 'emerald') : '';
     if (caps.yara) {
       const y = caps.yara, probs = asArr(y.problems);
       const tip = esc([y.hint, ...probs].filter(Boolean).join('\n'));
@@ -116,6 +118,7 @@ function options() {
     keep_sandbox_open: $('optKeepOpen').checked,
     show_sandbox_window: $('optShowWindow') ? $('optShowWindow').checked : false,
     enable_vgpu: $('optVgpu') ? $('optVgpu').checked : false,
+    decrypt_https: $('optHttps') ? $('optHttps').checked : false,
     simulate_user: $('optSimUser').checked,
     run_as_standard_user: $('optStdUser') ? $('optStdUser').checked : false,
     seed_honeyfiles: $('optHoneyfiles') ? $('optHoneyfiles').checked : true,
@@ -394,6 +397,11 @@ function renderJob(st) {
         ${vCrack.map(x => `<div class="text-xs text-orange-300">• ${esc(x)}</div>`).join('')}
       </div>` : '';
   const scoreBadge = v.score ? `<span class="px-2.5 py-1 rounded-lg border font-bold text-xs ${v.score >= 8 ? 'bg-rose-500/20 text-rose-300 border-rose-500/40' : v.score >= 5 ? 'bg-amber-500/20 text-amber-300 border-amber-500/40' : 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'}" title="10 bilinen zararlı · 8-9 büyük olasılıkla zararlı · 5-7 şüpheli · 2-4 büyük olasılıkla zararsız · 1 zararlı davranış yok">Puan ${v.score}/10 · ${esc(v.label || '')}${v.incomplete ? ' · eksik analiz' : ''}</span>` : '';
+  const fams = asArr(v.families);
+  const famBlock = fams.length ? `<div class="mt-2 p-2.5 rounded-lg bg-rose-950/40 border border-rose-500/50 space-y-1">
+        <div class="text-xs font-semibold text-rose-200">💀 Zararlı ailesi (${fams.length})</div>
+        ${fams.map(f => `<div class="text-xs text-rose-200">• <b>${esc(f.family)}</b> — <span class="mono">${esc(f.label)}</span> (${esc(f.source)})${asArr(f.c2).length ? `<div class="mono text-[11px] text-cyan-300 pl-3">C2: ${asArr(f.c2).map(esc).join(' • ')}</div>` : ''}</div>`).join('')}
+      </div>` : '';
   const attack = asArr(v.attack);
   const attackBlock = attack.length ? `<div class="mt-2 flex flex-wrap items-center gap-1.5 text-[11px]"><span class="text-slate-400">MITRE ATT&amp;CK:</span>
       ${attack.map(t => `<a href="${esc(t.url)}" target="_blank" rel="noopener noreferrer" title="${esc(t.tactic + ' — ' + t.evidence)}" class="px-2 py-1 rounded-lg border ${t.level === 'red' ? 'bg-rose-500/20 text-rose-300 border-rose-500/40' : t.level === 'crack' ? 'bg-orange-950/40 text-orange-300 border-orange-500/50' : 'bg-slate-800 text-slate-300 border-slate-700'}">${esc(t.id)} ${esc(t.name)}</a>`).join('')}</div>` : '';
@@ -401,6 +409,7 @@ function renderJob(st) {
       <div class="flex flex-wrap items-center justify-between gap-2"><div class="font-semibold text-sm text-${vColor}-200">${vTitle}</div>${scoreBadge}</div>
       ${vRed.map(x => `<div class="text-xs text-rose-200">• <b>KIRMIZI:</b> ${esc(x)}</div>`).join('')}
       ${vNotes.map(x => `<div class="text-xs text-amber-200">• ${esc(x)}</div>`).join('')}
+      ${famBlock}
       ${crackBlock}
       ${attackBlock}
     </div>`;
@@ -542,6 +551,7 @@ function renderSandbox(st) {
       + listBox('⚙️ Yeni servisler', P.Services, 'rose') + listBox('🧩 Yeni sürücüler', P.Drivers, 'rose')
       + listBox('🔁 Ayarı değişen mevcut servisler', P.ServicesChanged, 'amber')
       + listBox('💥 Çöken programlar (Windows hata kayıtları)', b.Crashes, 'amber')
+      + listBox('🔓 Çözülmüş HTTPS istekleri', asArr((b.Https || {}).flows).filter(f => f && typeof f === 'object').map(f => `${f.method} ${f.url} → ${f.status ?? '-'} · gönderilen ${f.req_bytes} bayt${f.req_preview ? ' · ' + String(f.req_preview).slice(0, 160) : ''}`), 'amber')
       + listBox('🧠 Bellek dökümü YARA eşleşmeleri', asArr(b.MemoryYara).filter(h => h && typeof h === 'object').map(h => `${h.rule} — ${h.proc} (pid ${h.pid}): ${h.description}`), 'rose')
       + listBox('⏰ Zamanlanmış görevler', P.Tasks, 'amber') + listBox('📌 Otomatik başlatma (Run/IFEO)', asArr(P.RunKeys).concat(asArr(P.Startup)), 'amber')
       + listBox('🕵️ Gelişmiş kalıcılık (WMI/COM/AppInit/BITS/PS)', advPers, advPers.length ? 'rose' : 'slate')
@@ -807,6 +817,7 @@ function openSandboxModal(st) {
   $('sbModalKeepOpen').checked = !!o.keep_sandbox_open;
   if ($('sbModalShowWindow')) $('sbModalShowWindow').checked = !!o.show_sandbox_window;
   if ($('sbModalVgpu')) $('sbModalVgpu').checked = !!o.enable_vgpu;
+  if ($('sbModalHttps')) $('sbModalHttps').checked = !!o.decrypt_https;
   $('sbModalSimUser').checked = o.simulate_user !== false;
   $('sbModalStdUser').checked = !!o.run_as_standard_user;
   $('sbModalHoney').checked = o.seed_honeyfiles !== false;
@@ -838,6 +849,7 @@ if ($('btnSbModalStart')) {
       keep_sandbox_open: $('sbModalKeepOpen').checked,
       show_sandbox_window: $('sbModalShowWindow') ? $('sbModalShowWindow').checked : false,
       enable_vgpu: $('sbModalVgpu') ? $('sbModalVgpu').checked : false,
+      decrypt_https: $('sbModalHttps') ? $('sbModalHttps').checked : false,
       simulate_user: $('sbModalSimUser').checked,
       run_as_standard_user: $('sbModalStdUser').checked,
       seed_honeyfiles: $('sbModalHoney').checked,

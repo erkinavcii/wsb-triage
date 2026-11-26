@@ -34,6 +34,8 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(vt_client.requests, "get", no_network)
     monkeypatch.setattr(vt_client.requests, "post", no_network)
     monkeypatch.setattr(pipeline, "_NOTIFY_ALLOW", False)
+    # the CAPE family/config extractor is an optional local install: tests never depend on it
+    monkeypatch.setattr(pipeline, "config_extractor_available", lambda: False)
     with pipeline.JOBS_LOCK:
         pipeline.JOBS.clear()
     yield cases

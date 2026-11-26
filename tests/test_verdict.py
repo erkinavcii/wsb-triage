@@ -1044,3 +1044,112 @@ def test_script_engine_memory_hits_are_notes(tmp_path):
     assert "payload.exe" in red and "powershell.exe" not in red and "cmd.exe" not in red
     assert "powershell.exe (pid 7556)" in notes and "[cmd.exe:1616] NtUnmapViewOfSection" in notes
     assert "betik motorunun kendi belleğinde" in notes
+
+
+# ---------------------------------------------------------------- malware family + config (CAPE)
+def test_family_hits_are_red_with_c2_and_go_to_iocs(tmp_path):
+    job = bare_job(tmp_path)
+    job.state["status"] = "done"
+    job.state["families"] = {"status": "done", "static": [
+        {"label": "Set-up.exe", "families": ["Lumma"], "generic": [], "rules": ["Lumma"],
+         "configs": {"Lumma": {"C2": ["evil-c2.example:443", "http://203.0.113.9/gate.php"], "build": "x"}}},
+        {"label": "tool.exe", "families": [], "generic": ["Obfuscar"], "rules": ["Obfuscar"], "configs": {}},
+    ]}
+    job.state["behavior"] = pipeline.sanitize_sandbox_json({"Target": "Set-up.exe"})
+    job.state["behavior"]["MemoryFamilies"] = [
+        {"label": "loader.exe (pid 4)", "families": ["AgentTesla"], "generic": [], "rules": ["AgentTesla"], "configs": {}}]
+    pipeline.compute_verdict(job)
+    v = job.state["verdict"]
+    red = " ".join(v["red"])
+    assert "Zararlı ailesi tespit edildi: Lumma" in red and "evil-c2.example:443" in red
+    assert "AgentTesla" in red and "bellek dökümü" in red and "Ayar çıkarılamadı" in red
+    assert any("Obfuscar" in n for n in v["notes"]) and "Obfuscar" not in red
+    assert v["score"] == 10
+    assert {f["family"] for f in v["families"]} == {"Lumma", "AgentTesla"}
+    iocs = {(i["type"], i["value"]) for i in pipeline.collect_iocs(job) if i.get("malicious")}
+    assert ("domain", "evil-c2.example") in iocs and ("url", "http://203.0.113.9/gate.php") in iocs
+
+
+def test_family_extractor_missing_is_quiet_and_error_is_a_note(tmp_path, monkeypatch):
+    job = bare_job(tmp_path)
+    monkeypatch.setattr(pipeline, "config_extractor_available", lambda: False)
+    pipeline.stage_families_static(job)
+    assert job.state["families"] == {"status": "unavailable"}
+    job.state["families"] = {"status": "error", "error": "TimeoutExpired"}
+    pipeline.compute_verdict(job)
+    assert any("ailesi / ayar taraması yapılamadı" in n for n in job.state["verdict"]["notes"])
+
+
+def test_config_extractor_helpers_without_cape():
+    import config_extractor as ce
+    assert ce._family_from_type("AgentTesla Payload") == "AgentTesla"
+    assert ce._family_from_type("Cobalt Strike Beacon Config") == "Cobalt_Strike_Beacon"
+    key = b"SafeBoxMemDump!7"
+    assert ce._xor_decode(bytes(b ^ key[i % 16] for i, b in enumerate(b"MZ hello")), key) == b"MZ hello"
+    j = ce._jsonable({"k": b"plain", "b": b"\x00\xff", "s": {1, 2}, "n": {"d": [1, None]}})
+    assert j["k"] == "plain" and j["b"] == "00ff" and sorted(j["s"]) == [1, 2] and j["n"]["d"] == [1, None]
+
+
+# ---------------------------------------------------------------- HTTPS decryption (mitmproxy)
+def test_https_log_summary_and_verdict(tmp_path):
+    out = tmp_path / "output"
+    out.mkdir()
+    lines = [
+        {"t": "10:00:01", "method": "GET", "url": "https://www.microsoft.com/", "host": "www.microsoft.com", "status": 200, "req_bytes": 0},
+        {"t": "10:00:02", "method": "POST", "url": "https://collect.unknown-host.example/up", "host": "collect.unknown-host.example",
+         "status": 200, "req_bytes": 512, "req_preview": "user=alice&pass=..."},
+        {"t": "10:00:03", "method": "POST", "url": "https://api.telegram.org/bot123/sendDocument", "host": "api.telegram.org",
+         "status": 200, "req_bytes": 9000},
+        {"tls_failed": True, "host": "pinned.adobe.io"},
+        "not json", ["also", "not", "a", "dict"],
+    ]
+    (out / "https_log.jsonl").write_text("\n".join(x if isinstance(x, str) else json.dumps(x) for x in lines), encoding="utf-8")
+    s = pipeline.summarize_https_log(out)
+    assert s["count"] == 3 and s["tls_failed"] == ["pinned.adobe.io"]
+    job = bare_job(tmp_path)
+    job.state["behavior"] = pipeline.sanitize_sandbox_json({"Target": "x.exe", "Network": {"NewListening": ["127.0.0.1:8080 | mitmdump"]}})
+    job.state["behavior"]["Https"] = {"Requested": True, "Status": "done", "CaTrusted": True, **s}
+    pipeline.compute_verdict(job)
+    v = job.state["verdict"]
+    red, notes = " ".join(v["red"]), " ".join(v["notes"])
+    assert "HTTPS içinde kötüye kullanılan servise istek" in red and "api.telegram.org" in red
+    assert "unknown-host.example" in notes and "512 bayt" in notes and "microsoft.com" not in notes
+    assert "pinned.adobe.io" in notes and "dinleyici" not in red          # mitmdump's own port is not a finding
+    assert any(t["id"] == "T1102" for t in v["attack"])
+
+
+def test_https_requested_but_failed_is_a_note_and_mitm_is_hash_pinned(tmp_path, monkeypatch):
+    job = bare_job(tmp_path)
+    job.state["behavior"] = pipeline.sanitize_sandbox_json({"Target": "x.exe"})
+    job.state["behavior"]["Https"] = {"Requested": True, "Status": "mitmdump exited (code 1)", "flows": [], "tls_failed": []}
+    pipeline.compute_verdict(job)
+    assert any("HTTPS çözme çalışmadı" in n for n in job.state["verdict"]["notes"])
+    d = tmp_path / "mitm"
+    d.mkdir()
+    (d / "mitmdump.exe").write_bytes(b"not the pinned build")
+    monkeypatch.setattr(pipeline, "MITM_DIR", d)
+    assert pipeline.mitm_available() is False
+    import sandbox_manager as sbm
+    assert r"<SandboxFolder>C:\Analysis\mitm</SandboxFolder><ReadOnly>true</ReadOnly>" in sbm.build_wsb(tmp_path, True, mitm_dir=d)
+    assert r"C:\Analysis\mitm" not in sbm.build_wsb(tmp_path, True)
+
+
+def test_mitmproxy_own_driver_and_unpacked_files_are_not_findings(tmp_path):
+    mei = r"C:\Users\WDAGUtilityAccount\AppData\Local\Temp\_MEI000020182"
+    beh = {"Target": "x.exe",
+           "Persistence": {"Drivers": [rf"WinDivert | \??\{mei}\mitmproxy_windows\WinDivert64.sys"]},
+           "Files": {"NewExecutables": [rf"{mei}\mitmproxy_windows\WinDivert64.sys", rf"{mei}\python315.dll",
+                                        r"C:\Users\WDAGUtilityAccount\AppData\Local\Temp\_MEI555\payload.dll"]}}
+    import copy
+    job = bare_job(tmp_path)
+    job.state["behavior"] = pipeline.sanitize_sandbox_json(copy.deepcopy(beh))
+    job.state["behavior"]["Https"] = {"Requested": True, "Status": "done", "flows": [], "tls_failed": []}
+    pipeline.compute_verdict(job)
+    v = job.state["verdict"]
+    assert not any("sürücü" in x for x in v["red"])
+    assert any("1 yeni çalıştırılabilir dosya" in n for n in v["notes"])     # only the other _MEI folder counts
+
+    job2 = bare_job(tmp_path, "t2")                                             # same driver without HTTPS mode: red
+    job2.state["behavior"] = pipeline.sanitize_sandbox_json(copy.deepcopy(beh))
+    pipeline.compute_verdict(job2)
+    assert any("1 yeni sürücü kuruldu: WinDivert" in x for x in job2.state["verdict"]["red"])

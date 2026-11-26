@@ -70,6 +70,7 @@ DEFAULT_OPTIONS = {
     "keep_sandbox_open": False,
     "show_sandbox_window": False,
     "enable_vgpu": False,
+    "decrypt_https": False,
     "simulate_user": True,
     "notify": True,
     "memory_mb": 4096,
@@ -521,7 +522,7 @@ def cleanup_jobs(days: int) -> List[str]:
 
 _SANDBOX_OVERRIDE_KEYS = {
     "target", "target_args", "dll_export", "duration_min", "memory_mb",
-    "network", "keep_sandbox_open", "show_sandbox_window", "enable_vgpu", "simulate_user", "run_as_standard_user",
+    "network", "keep_sandbox_open", "show_sandbox_window", "enable_vgpu", "decrypt_https", "simulate_user", "run_as_standard_user",
     "seed_honeyfiles", "fake_net", "sandbox_backend", "vbox_vm", "vbox_snapshot", "vbox_user",
 }
 
@@ -1486,7 +1487,195 @@ def stage_static(job: Job) -> None:
     results.sort(key=lambda x: -x["risk_score"])
     job.state["static"] = results
     top = results[0]["risk_score"] if results else 0
-    job.stage("static", "done", f"{len(results)} dosya incelendi, en yüksek statik risk {top}/100.")
+    try:
+        stage_families_static(job)
+    except Exception as e:  # noqa: BLE001 - optional step; never fail the static stage
+        job.log(f"Zararlı ailesi taraması hata verdi: {e}")
+    fam = job.state.get("families") or {}
+    fam_txt = f", {len(fam.get('static') or [])} dosyada zararlı ailesi imzası" if fam.get("static") else ""
+    job.stage("static", "done", f"{len(results)} dosya incelendi, en yüksek statik risk {top}/100{fam_txt}.")
+
+
+# ---------------------------------------------------------------- malware family + config (CAPE parsers)
+# Separate Python 3.12+ environment with CAPE-parsers, and CAPE's family YARA rules (GPLv3, kept outside this
+# repository): %LOCALAPPDATA%\SafeBox\extractor-venv and ...\cape-rules. Overridable for other setups.
+_SAFEBOX_HOME = Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()) / "SafeBox"
+EXTRACTOR_PY = Path(os.environ.get("SAFEBOX_EXTRACTOR_PY") or (_SAFEBOX_HOME / "extractor-venv" / "Scripts" / "python.exe"))
+CAPE_RULES_DIR = Path(os.environ.get("SAFEBOX_CAPE_RULES") or (_SAFEBOX_HOME / "cape-rules"))
+EXTRACTOR_SCRIPT = Path(__file__).resolve().parent / "config_extractor.py"
+_FAMILY_MAX_FILES = 40
+
+# mitmproxy (mitmdump.exe, MIT license; downloaded separately, unsigned upstream build) for HTTPS decryption.
+# It only ever runs inside the sandbox. Pinned by hash so a swapped file is not mapped into the sandbox.
+MITM_DIR = Path(os.environ.get("SAFEBOX_MITM_DIR") or (_SAFEBOX_HOME / "mitmproxy"))
+MITM_SHA256 = os.environ.get("SAFEBOX_MITM_SHA256") or "e2f05da6385d8c76c2f5b7b23b5d0f7e2c23483b5ece99fe1f4e3b0c04c5f8b5"
+HTTPS_ADDON = Path(__file__).resolve().parent / "sandbox" / "https_logger.py"
+_HTTPS_LOG_MAX = 20 * 1024 * 1024
+
+
+def mitm_available() -> bool:
+    exe = MITM_DIR / "mitmdump.exe"
+    if not exe.is_file() or not HTTPS_ADDON.is_file():
+        return False
+    try:
+        return _sha256_file(exe) == MITM_SHA256.lower()
+    except OSError:
+        return False
+
+
+def _sha256_file(p: Path) -> str:
+    h = hashlib.sha256()
+    with open(p, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# mitmproxy's local capture mode loads the WinDivert packet driver from its own unpacked bundle. Only that exact
+# location is ignored (and only when HTTPS decryption was on): malware ships WinDivert too, from elsewhere.
+_MITM_DRIVER_RX = re.compile(r"^WinDivert\s*\|\s*(\\\?\?\\)?[A-Z]:\\Users\\[^\\]+\\AppData\\Local\\Temp\\_MEI\d+\\"
+                             r"mitmproxy_windows\\WinDivert64\.sys$", re.I)
+
+
+def summarize_https_log(out: Path) -> Dict[str, Any]:
+    """Reads the addon's JSON lines (untrusted: written inside the sandbox). Keeps plain, capped fields."""
+    p = out / "https_log.jsonl"
+    res: Dict[str, Any] = {"flows": [], "tls_failed": [], "count": 0}
+    if not p.is_file():
+        return res
+    try:
+        raw = p.read_bytes()[:_HTTPS_LOG_MAX].decode("utf-8", "replace")
+    except OSError:
+        return res
+    hosts_failed: List[str] = []
+    for line in raw.splitlines():
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(r, dict):
+            continue
+        if r.get("tls_failed"):
+            h = str(r.get("host") or "")[:200]
+            if h and h not in hosts_failed:
+                hosts_failed.append(h)
+            continue
+        res["count"] += 1
+        if len(res["flows"]) < 400:
+            res["flows"].append({
+                "t": str(r.get("t") or "")[:8], "method": str(r.get("method") or "")[:10],
+                "url": str(r.get("url") or "")[:600], "host": str(r.get("host") or "")[:200],
+                "status": r.get("status") if isinstance(r.get("status"), int) else None,
+                "req_bytes": r.get("req_bytes") if isinstance(r.get("req_bytes"), int) else 0,
+                "req_type": str(r.get("req_type") or "")[:100], "req_preview": str(r.get("req_preview") or "")[:1024],
+                "resp_bytes": r.get("resp_bytes") if isinstance(r.get("resp_bytes"), int) else 0,
+                "ua": str(r.get("ua") or "")[:200], "error": str(r.get("error") or "")[:200]})
+    res["tls_failed"] = hosts_failed[:100]
+    return res
+_FAMILY_MAX_BYTES = 64 * 1024 * 1024
+
+
+def config_extractor_available() -> bool:
+    return EXTRACTOR_PY.is_file() and CAPE_RULES_DIR.is_dir() and EXTRACTOR_SCRIPT.is_file()
+
+
+def run_config_extractor(files: List[Dict[str, Any]], timeout: int = 300) -> Dict[str, Any]:
+    """Runs config_extractor.py in its own environment and process (it reads suspicious files with third-party
+    parsers). files: [{"label", "path", "xor_key"?}]. Returns its JSON, or {"ok": False, "error": ...}."""
+    if not files:
+        return {"ok": True, "results": []}
+    if not config_extractor_available():
+        return {"ok": False, "error": "aile/ayar ayıklayıcı kurulu değil"}
+    req = {"rules_dir": str(CAPE_RULES_DIR), "max_bytes": _FAMILY_MAX_BYTES, "files": files}
+    try:
+        p = subprocess.run([str(EXTRACTOR_PY), "-I", str(EXTRACTOR_SCRIPT)], input=json.dumps(req).encode("utf-8"),
+                           capture_output=True, timeout=timeout, creationflags=NO_WINDOW)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"[:300]}
+    try:
+        return json.loads(p.stdout.decode("utf-8", "replace") or "{}") or {"ok": False, "error": "boş çıktı"}
+    except ValueError:
+        return {"ok": False, "error": (p.stderr.decode("utf-8", "replace") or "geçersiz çıktı")[-300:]}
+
+
+def _family_candidates(job: Job) -> List[Dict[str, Any]]:
+    """Executables from static analysis, riskiest first: unsigned/odd ones are where a stealer hides."""
+    out = []
+    for st in sorted(job.state.get("static") or [], key=lambda x: -(x.get("risk_score") or 0)):
+        path = st.get("file_path")
+        pe = (st.get("pe_info") or {}).get("is_pe")
+        if not path or not (pe or str(st.get("extension") or "").lower() in (".exe", ".dll", ".scr", ".bin")):
+            continue
+        try:
+            if Path(path).stat().st_size > _FAMILY_MAX_BYTES:
+                continue
+        except OSError:
+            continue
+        out.append({"label": st.get("rel") or Path(path).name, "path": path})
+        if len(out) >= _FAMILY_MAX_FILES:
+            break
+    return out
+
+
+def stage_families_static(job: Job) -> None:
+    """Family detection + config extraction on the sample's executables (part of the static stage)."""
+    if not config_extractor_available():
+        job.state["families"] = {"status": "unavailable"}
+        return
+    cands = _family_candidates(job)
+    if not cands:
+        job.state["families"] = {"status": "done", "static": []}
+        return
+    job.stage("static", "running", f"Zararlı ailesi / ayar taraması ({len(cands)} çalıştırılabilir dosya)...")
+    res = run_config_extractor(cands)
+    if not res.get("ok"):
+        job.log(f"Zararlı ailesi taraması yapılamadı: {res.get('error')}")
+        job.state["families"] = {"status": "error", "error": str(res.get("error"))[:300]}
+        return
+    hits = [r for r in res.get("results") or [] if r.get("families") or r.get("generic")]
+    job.state["families"] = {"status": "done", "static": hits, "checked": len(cands)}
+    job.log(f"Zararlı ailesi taraması: {len(cands)} dosya, {res.get('parsers')} ayıklayıcı, {res.get('rules')} kural — "
+            + (", ".join(f"{','.join(h.get('families') or h.get('generic'))} ({h['label']})" for h in hits[:6]) or "eşleşme yok"))
+
+
+def _memory_family_scan(job: Job, out: Path) -> List[Dict[str, Any]]:
+    """Same, on the memory dumps (packed stealers show their config only in memory). Dumps stay XOR-encoded on
+    disk; the extractor decodes them in memory."""
+    d = out / MEMDUMP_DIR
+    if not d.is_dir() or not config_extractor_available():
+        return []
+    files = []
+    for p in sorted(d.iterdir()):
+        m = _MEMDUMP_RX.match(p.name)
+        if m and p.is_file() and p.stat().st_size <= _MEMDUMP_MAX_FILE:
+            files.append({"label": f"{m.group('proc')}.exe (pid {m.group('pid')})", "path": str(p), "xor_key": MEMDUMP_KEY.hex()})
+    if not files:
+        return []
+    res = run_config_extractor(files)
+    if not res.get("ok"):
+        job.log(f"Bellek dökümünde aile taraması yapılamadı: {res.get('error')}")
+        return []
+    return [r for r in res.get("results") or [] if r.get("families") or r.get("generic")]
+
+
+_C2_RX = re.compile(r"(?:https?://[^\s'\"<>]{3,200})|(?:\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?\b)|"
+                    r"(?:\b[a-z0-9][a-z0-9.-]{1,200}\.[a-z]{2,24}(?::\d{1,5})?\b)", re.I)
+
+
+def _config_c2(cfg: Any, found: Optional[List[str]] = None) -> List[str]:
+    """Network addresses anywhere in an extracted config (C2 servers, panels, download URLs)."""
+    found = [] if found is None else found
+    if isinstance(cfg, dict):
+        for v in cfg.values():
+            _config_c2(v, found)
+    elif isinstance(cfg, list):
+        for v in cfg:
+            _config_c2(v, found)
+    elif isinstance(cfg, str):
+        for m in _C2_RX.findall(cfg):
+            if m not in found and not m.lower().endswith((".exe", ".dll", ".dat", ".txt", ".json", ".log")):
+                found.append(m)
+    return found[:30]
 
 
 # ======================================================================== 4. VirusTotal
@@ -1981,6 +2170,13 @@ def stage_sandbox(job: Job) -> None:
         tools = job.tools_dir
         (tools / "stop.flag").unlink(missing_ok=True)
         shutil.copy2(MONITOR_SCRIPT, tools / "Inside-Sandbox.ps1")
+        want_https = bool(job.opt("decrypt_https")) and bool(job.opt("network")) and backend == "wsb"
+        https_ok = want_https and mitm_available()
+        if https_ok:
+            shutil.copy2(HTTPS_ADDON, tools / "https_logger.py")
+            job.log("HTTPS çözme açık: sandbox içinde mitmproxy çalışacak (sertifika sabitleyen programlar bağlanamayabilir).")
+        elif want_https:
+            job.log("HTTPS çözme istendi ama mitmproxy bulunamadı ya da dosyası doğrulanamadı; bu analizde HTTPS çözülmeyecek.")
         for pm in ("Procmon64.exe", "Procmon.exe"):
             if (BASE_DIR / "sandbox" / pm).exists():
                 shutil.copy2(BASE_DIR / "sandbox" / pm, tools / pm)
@@ -2000,6 +2196,7 @@ def stage_sandbox(job: Job) -> None:
             "BlockLan": bool(job.opt("network")),
             "FakeNet": bool(job.opt("fake_net")),
             "SimulateUser": bool(job.opt("simulate_user")),
+            "DecryptHttps": https_ok,
         })
 
         net = "açık (trafik kaydediliyor)" if job.opt("network") else "kapalı"
@@ -2029,7 +2226,7 @@ def stage_sandbox(job: Job) -> None:
             wsb = job.case_dir / "analysis.wsb"
             vgpu = bool(job.opt("enable_vgpu"))
             wsb.write_text(sbm.build_wsb(job.case_dir, bool(job.opt("network")), int(job.opt("memory_mb")), sandbox_input,
-                                         vgpu=vgpu), encoding="utf-8")
+                                         vgpu=vgpu, mitm_dir=MITM_DIR if https_ok else None), encoding="utf-8")
             if vgpu:
                 job.log("Sandbox'a ekran kartı (vGPU) verildi: GPU isteyen programlar çalışabilir, ama ana bilgisayarın "
                         "ekran kartı sürücüsü sandbox'a açıldığı için yalıtım daha zayıf.")
@@ -2054,14 +2251,21 @@ def stage_sandbox(job: Job) -> None:
             job.log("İzleyici durdu; 'kapatma' seçili olmadığı için ortam açık bırakıldı. İçindekileri ana bilgisayara kopyalamayın.")
 
         mem_yara: List[Dict[str, Any]] = []
+        mem_families: List[Dict[str, Any]] = []
         if (out / MEMDUMP_DIR).is_dir():
             job.stage("sandbox", "running", "Bellek dökümleri YARA ile taranıyor...")
             try:
-                mem_yara = scan_memory_dumps(out)
+                mem_yara = scan_memory_dumps(out, keep=True)
                 job.log(f"Bellek dökümü taraması: {len(mem_yara)} YARA eşleşmesi"
                         + (": " + ", ".join(f"{h['rule']} ({h['proc']})" for h in mem_yara[:6]) if mem_yara else "."))
+                job.stage("sandbox", "running", "Bellek dökümlerinde zararlı ailesi / ayar aranıyor...")
+                mem_families = _memory_family_scan(job, out)
+                if mem_families:
+                    job.log("Bellek dökümünde zararlı ailesi: " + ", ".join(
+                        f"{','.join(h.get('families') or h.get('generic'))} ({h['label']})" for h in mem_families[:6]))
             except Exception as e:  # noqa: BLE001 - a failed scan must not lose the sandbox results
                 job.log(f"Bellek dökümü taranamadı: {e}")
+            finally:
                 shutil.rmtree(out / MEMDUMP_DIR, ignore_errors=True)
         quarantined = quarantine_output(out)
         job.state["sandbox"]["quarantined"] = quarantined
@@ -2072,6 +2276,11 @@ def stage_sandbox(job: Job) -> None:
         if beh:
             beh.get("Files", {}).pop("NewFilesSample", None)
             beh["MemoryYara"] = mem_yara
+            beh["MemoryFamilies"] = mem_families
+            if isinstance(beh.get("Https"), dict) or (out / "https_log.jsonl").is_file():
+                hs = beh.get("Https") if isinstance(beh.get("Https"), dict) else {}
+                beh["Https"] = {"Requested": bool(hs.get("Requested")), "Status": str(hs.get("Status") or "")[:300],
+                                "CaTrusted": bool(hs.get("CaTrusted")), **summarize_https_log(out)}
             job.state["behavior"] = beh
             _check_dropped_files_vt(job, beh)
             job.stage("sandbox", "done", f"Tamamlandı. Ağ kaydı: {beh.get('CaptureStatus')}")
@@ -2095,7 +2304,8 @@ def stage_sandbox(job: Job) -> None:
 
 
 # Files the monitor itself writes into output/. Anything else was put there by something inside the sandbox.
-OUTPUT_ALLOWLIST = {"live.json", "behavior.json", "status.txt", "timeline.log", "capture.pcapng", "procmon.pml", "procmon_summary.json", "done.flag"}
+OUTPUT_ALLOWLIST = {"live.json", "behavior.json", "status.txt", "timeline.log", "capture.pcapng", "procmon.pml", "procmon_summary.json", "done.flag",
+                    "https_log.jsonl"}
 _SCREENSHOT_NAME_RX = re.compile(r"^scr_\d{3}\.png$")
 LIVE_SCREEN_NAME = "live.png"   # overwritten every ~5 s by the monitor; shown in the panel, not in the gallery
 _MAX_SCREENSHOTS = 30
@@ -2890,7 +3100,7 @@ _ATTACK_MAP: List[Tuple[str, str, str, str]] = [
     (r"License_Service_Tamper|Lisans Müdahale", "T1489", "Service Stop", "Impact"),
 ]
 _KNOWN_BAD_RX = re.compile(r"^(MalwareBazaar|ThreatFox):|zararlı yazılım ailesi|^CIRCL Hashlookup: .* zararlı|"
-                           r"^Bellek dökümünde YARA")
+                           r"^Bellek dökümünde YARA|^Zararlı ailesi tespit edildi")
 
 
 def _attack_techniques(red: List[str], crack: List[str], notes: List[str]) -> List[Dict[str, str]]:
@@ -3003,6 +3213,24 @@ def _compute_verdict(job: Job) -> None:
     if inv.get("sig_errors"):
         notes.append(f"{inv['sig_errors']} dosyanın dijital imzası kontrol edilemedi, bu yüzden imzasız sayıldı "
                      f"(imza sonuçları güvenilir değil): {inv.get('sig_error_msg', '')}")
+    families_out: List[Dict[str, Any]] = []
+    fam_sources = [("statik", h) for h in ((s.get("families") or {}).get("static") or [])]
+    fam_sources += [("bellek dökümü", h) for h in ((s.get("behavior") or {}).get("MemoryFamilies") or [])]
+    for src, h in fam_sources:
+        if not isinstance(h, dict):
+            continue
+        configs = h.get("configs") or {}
+        for fam in h.get("families") or []:
+            c2 = _config_c2(configs.get(fam) or next((v for k, v in configs.items() if k.lower() == str(fam).lower()), None))
+            families_out.append({"family": fam, "source": src, "label": h.get("label"), "c2": c2,
+                                 "config": bool(configs)})
+            red.append(f"Zararlı ailesi tespit edildi: {fam} — '{h.get('label')}' ({src})"
+                       + (f". Ayardan çıkan adresler (C2): {', '.join(c2[:6])}" if c2 else
+                          (". Ayar çıkarıldı." if configs else ". Ayar çıkarılamadı (imza eşleşti).")))
+        for g in h.get("generic") or []:
+            notes.append(f"Analiz/koruma aracı imzası: {g} — '{h.get('label')}' ({src}); tek başına zararlı değil.")
+    if (s.get("families") or {}).get("status") == "error":
+        notes.append(f"Zararlı ailesi / ayar taraması yapılamadı: {(s.get('families') or {}).get('error', '')}")
     for st in s.get("static") or []:
         sig = st.get("signature") or {}
         sig_status = sig.get("status")
@@ -3090,8 +3318,10 @@ def _compute_verdict(job: Job) -> None:
         real_services = [s for s in (P.get("Services") or []) if not _is_wsb_noise_service(s)]
         if real_services:
             red.append(f"{len(real_services)} yeni servis kuruldu.")
-        if P.get("Drivers"):
-            red.append(f"{len(P['Drivers'])} yeni sürücü kuruldu.")
+        https_on = bool((b.get("Https") or {}).get("Requested"))
+        real_drivers = [d for d in P.get("Drivers") or [] if not (https_on and _MITM_DRIVER_RX.match(str(d)))]
+        if real_drivers:
+            red.append(f"{len(real_drivers)} yeni sürücü kuruldu: {'; '.join(str(d) for d in real_drivers[:3])}")
         if P.get("Startup"):
             red.append(f"Başlangıç klasörüne {len(P['Startup'])} dosya eklendi.")
         if P.get("WmiSubscriptions"):
@@ -3129,7 +3359,9 @@ def _compute_verdict(job: Job) -> None:
             notes.append(f"hosts dosyasından {len(b['Hosts']['Removed'])} satır silindi.")
         if (b.get("Firewall") or {}).get("Added"):
             crack.append(f"{len(b['Firewall']['Added'])} güvenlik duvarı kuralı eklendi — ürünün internet erişimini kesme.")
-        new_listen = (b.get("Network") or {}).get("NewListening") or []
+        new_listen = [x for x in (b.get("Network") or {}).get("NewListening") or []
+                      if not (((b.get("Https") or {}).get("Requested"))
+                              and re.search(r"\|\s*(mitmdump|windows-redirector)\s*$", str(x), re.I))]
         if new_listen:
             red.append(f"Yeni dinleyici (listening) TCP portu açıldı: {'; '.join(new_listen[:4])}")
         sus = [p for p in b.get("Processes") or [] if p.get("Suspicious")]
@@ -3146,10 +3378,20 @@ def _compute_verdict(job: Job) -> None:
                 red.append(f"Bırakılan dosya '{Path(str(dh.get('Path') or 'dosya')).name}' şüpheli dizgeler içeriyor: {', '.join(str(x) for x in d_flags[:4])}")
             elif dh.get("SigStatus") not in ("Valid", None, "") and float(dh.get("Entropy") or 0) > 7.2:
                 notes.append(f"Bırakılan imzasız dosya '{Path(str(dh.get('Path') or 'dosya')).name}' yüksek entropili ({dh.get('Entropy')}/8).")
+        new_exec = [str(f) for f in (b.get("Files") or {}).get("NewExecutables") or []]
+        # mitmdump (HTTPS decryption) unpacks itself into %TEMP%\_MEIxxxx; skip only the _MEI folder holding
+        # its "mitmproxy_windows" part (malware built with PyInstaller unpacks into _MEI folders too).
+        mitm_mei = set()
+        if (b.get("Https") or {}).get("Requested"):
+            for f in new_exec:
+                m = re.search(r"^(.*\\_MEI\d+\\)mitmproxy_windows\\", f, re.I)
+                if m:
+                    mitm_mei.add(m.group(1).lower())
         dropped = [
-            f for f in (b.get("Files") or {}).get("NewExecutables") or []
+            f for f in new_exec
             if re.search(r"\\AppData\\|\\Temp\\|\\ProgramData\\|\\Users\\Public\\", f, re.I)
             and not _is_wsb_noise_dropped_file(f)
+            and not any(f.lower().startswith(d) for d in mitm_mei)
         ]
         if dropped:
             notes.append(f"AppData/Temp/ProgramData içine {len(dropped)} yeni çalıştırılabilir dosya bırakıldı.")
@@ -3170,6 +3412,23 @@ def _compute_verdict(job: Job) -> None:
                 red.append(msg_m)
             else:
                 notes.append(msg_m + " (bellekte görüldü; tek başına kesin kanıt değil)")
+        hs = b.get("Https") if isinstance(b.get("Https"), dict) else {}
+        if hs.get("Requested"):
+            if str(hs.get("Status")) not in ("done", "running"):
+                notes.append(f"HTTPS çözme çalışmadı ({hs.get('Status')}); şifreli trafiğin içeriği görülemedi.")
+            flows = [f for f in hs.get("flows") or [] if isinstance(f, dict)]
+            abused_f = [f for f in flows if domain_class(str(f.get("host") or "")) == CLASS_ABUSED]
+            if abused_f:
+                red.append("HTTPS içinde kötüye kullanılan servise istek: "
+                           + "; ".join(f"{f.get('method')} {str(f.get('url'))[:120]}" for f in abused_f[:4]))
+            sent = [f for f in flows if f.get("method") in ("POST", "PUT") and (f.get("req_bytes") or 0) > 0
+                    and domain_class(str(f.get("host") or "")) not in ("Windows/Microsoft (gürültü)", "Yerel (gürültü)", "Adobe", CLASS_ABUSED)]
+            if sent:
+                notes.append(f"HTTPS ile {len(sent)} istekte veri gönderildi (Microsoft/Adobe dışı): "
+                             + "; ".join(f"{f.get('method')} {str(f.get('url'))[:100]} ({f.get('req_bytes')} bayt)" for f in sent[:4]))
+            if hs.get("tls_failed"):
+                notes.append(f"{len(hs['tls_failed'])} adresin HTTPS trafiği çözülemedi (program kendi sertifikasını bekliyor / "
+                             "sertifika sabitleme): " + ", ".join(hs["tls_failed"][:6]))
         crash_note = _crash_note(b.get("Crashes") or [], bool(crack))
         if crash_note:
             notes.append(crash_note)
@@ -3246,6 +3505,8 @@ def _compute_verdict(job: Job) -> None:
     verdict_obj: Dict[str, Any] = {"level": level, "red": red, "notes": notes, "crack": crack, "not_run": missing}
     verdict_obj.update(_score(red, crack, notes, missing, finished))
     verdict_obj["attack"] = _attack_techniques(red, crack, notes)
+    if families_out:
+        verdict_obj["families"] = families_out
     if "Kurulum" in missing:
         verdict_obj["install_not_started"] = True
     if known_good:
@@ -3283,6 +3544,10 @@ def write_report(job: Job) -> None:
         L.append(f"- BİLGİ (CIRCL NSRL bilinen temiz): {', '.join(v['known_good'][:10])}")
     if not v["red"] and not v["notes"] and not v.get("crack"):
         L.append("- Otomatik kontroller kırmızı bayrak bulmadı. Bu dosyanın temiz olduğunu **kanıtlamaz**.")
+    if v.get("families"):
+        L += ["", "## Zararlı ailesi ve ayar (CAPE ayıklayıcıları)", ""]
+        L += [f"- **{f['family']}** — {f['label']} ({f['source']})" + (f": {', '.join(f['c2'])}" if f.get("c2") else "")
+              for f in v["families"]]
     if v.get("attack"):
         L += ["", "## MITRE ATT&CK teknikleri", ""]
         L += [f"- [{t['id']}]({t['url']}) {t['name']} ({t['tactic']}) — {t['evidence']}" for t in v["attack"]]
@@ -3329,6 +3594,8 @@ def write_report(job: Job) -> None:
                     ("Defender değişiklikleri", (b.get("Defender") or {}).get("Added")), ("Defender tespitleri", (b.get("Defender") or {}).get("ThreatsDetected")),
                     ("Yeni servisler", (b.get("Persistence") or {}).get("Services")), ("Yeni sürücüler", (b.get("Persistence") or {}).get("Drivers")),
                     ("Çöken programlar (Windows hata kayıtları)", b.get("Crashes")),
+                    ("Çözülmüş HTTPS istekleri", [f"{f.get('method')} {f.get('url')} → {f.get('status')} (gönderilen {f.get('req_bytes')} bayt)"
+                                                  for f in ((b.get("Https") or {}).get("flows") or [])[:100] if isinstance(f, dict)]),
                     ("Bellek dökümü YARA eşleşmeleri", [f"{h.get('rule')} — {h.get('proc')} (pid {h.get('pid')})" for h in b.get("MemoryYara") or [] if isinstance(h, dict)]),
                     ("Yeni zamanlanmış görevler", (b.get("Persistence") or {}).get("Tasks")), ("Otomatik başlatma kayıtları", (b.get("Persistence") or {}).get("RunKeys")),
                     ("Başlangıç klasörü", (b.get("Persistence") or {}).get("Startup")),
@@ -3569,6 +3836,16 @@ def collect_iocs(job: Job, include_noise: bool = False) -> List[Dict[str, Any]]:
             cur["classification"] = f"{cur['classification']}; {classification}" if cur["classification"] else classification
         if context and context not in cur["context"] and len(cur["context"]) < 240:
             cur["context"] = f"{cur['context']} | {context}"[:300] if cur["context"] else context[:300]
+
+    # 0. C2 addresses from extracted malware configs (CAPE parsers): always malicious
+    for f in (s.get("verdict") or {}).get("families") or []:
+        for c in f.get("c2") or []:
+            ctx = f"{f.get('family')} ayarı — {f.get('label')}"
+            if str(c).lower().startswith(("http://", "https://")):
+                add("url", c, "config", "zararlı ailesi C2", ctx, malicious=True)
+                continue
+            host = str(c).rsplit(":", 1)[0] if re.search(r":\d{1,5}$", str(c)) else str(c)
+            add("ipv4" if _clean_ip(host) else "domain", host, "config", "zararlı ailesi C2", ctx, malicious=True)
 
     # 1. File hashes (inventory + static + VT + sandbox dropped hashes)
     orig_sha = (s.get("inventory") or {}).get("original_sha256")

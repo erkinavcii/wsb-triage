@@ -107,6 +107,8 @@
             <input type="checkbox" id="optShowWindow" /> Sandbox penceresini ekranda göster</label>
           <label class="flex items-center gap-2 bg-slate-900/90 px-3 py-2 rounded-xl border border-slate-700 cursor-pointer" title="Photoshop gibi ekran kartı isteyen programlar için. Ana bilgisayarın ekran kartı sürücüsü sandbox'a açılır; yalıtım daha zayıf olur. Tanımadığınız/şüpheli dosyalarda kapalı tutun.">
             <input type="checkbox" id="optVgpu" /> Sandbox'a ekran kartı ver (GPU) ⚠️</label>
+          <label class="flex items-center gap-2 bg-slate-900/90 px-3 py-2 rounded-xl border border-slate-700 cursor-pointer" title="Sandbox içinde mitmproxy çalışır; şifreli (HTTPS) trafiğin içeriği (gönderilen veriler, tam adresler) rapora girer. İnternet açık olmalı. Kendi sertifikasını bekleyen programlar (bazı kurulumlar, güncelleyiciler) bağlanamayabilir, bu da davranışı değiştirebilir.">
+            <input type="checkbox" id="optHttps" /> HTTPS trafiğini çöz (mitmproxy) ⚠️</label>
           <label class="flex items-center gap-2 bg-slate-900/90 px-3 py-2 rounded-xl border border-slate-700 cursor-pointer" title="Sandbox içinde fareyi gerçekçi biçimde hareket ettirir ve kurulum pencerelerindeki İleri/Yükle/Kabul düğmelerine otomatik tıklar.">
             <input type="checkbox" id="optSimUser" checked /> Sahte kullanıcı hareketi (otomatik tıkla)</label>
           <label class="flex items-center gap-2 bg-slate-900/90 px-3 py-2 rounded-xl border border-slate-700 cursor-pointer" title="Örneği sandbox içinde yönetici yerine standart kullanıcı haklarıyla başlatmayı dener.">
@@ -351,6 +353,7 @@
         <label class="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-700 cursor-pointer"><input type="checkbox" id="sbModalKeepOpen" /> Süre bitince açık bırak</label>
         <label class="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-700 cursor-pointer" title="Açık: sandbox penceresi öne gelir. Kapalı: arkada çalışır, panelden izlenir."><input type="checkbox" id="sbModalShowWindow" /> Pencereyi ekranda göster</label>
         <label class="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-700 cursor-pointer" title="Ekran kartı isteyen programlar için. Ana bilgisayarın ekran kartı sürücüsü sandbox'a açılır; yalıtım daha zayıf olur."><input type="checkbox" id="sbModalVgpu" /> Ekran kartı ver (GPU) ⚠️</label>
+        <label class="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-700 cursor-pointer" title="Şifreli trafiğin içeriğini kaydeder; sertifika sabitleyen programlar bağlanamayabilir."><input type="checkbox" id="sbModalHttps" /> HTTPS'i çöz ⚠️</label>
         <label class="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-700 cursor-pointer"><input type="checkbox" id="sbModalSimUser" checked /> Sahte kullanıcı hareketi</label>
         <label class="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-700 cursor-pointer"><input type="checkbox" id="sbModalStdUser" /> Standart kullanıcı</label>
         <label class="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-700 cursor-pointer"><input type="checkbox" id="sbModalHoney" checked /> Yem dosyalar</label>

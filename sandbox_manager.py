@@ -161,7 +161,7 @@ def enable_windows_sandbox_feature() -> Dict[str, Any]:
 
 # ------------------------------------------------------------------ Windows Sandbox
 def build_wsb(case_dir: Path, network: bool, memory_mb: int = 4096, input_dir: Optional[Path] = None,
-              vgpu: bool = False) -> str:
+              vgpu: bool = False, mitm_dir: Optional[Path] = None) -> str:
     """Hardened config: sample/tools read-only, only output writable, no clipboard/vGPU/printer/audio/camera.
     input_dir lets a user-selected folder be mapped read-only in place instead of being copied.
     vgpu=True (user's choice, off by default) shares the host GPU for programs that need it; that exposes the
@@ -171,6 +171,8 @@ def build_wsb(case_dir: Path, network: bool, memory_mb: int = 4096, input_dir: O
         (case_dir / "tools", r"C:\Analysis\tools", "true"),
         (case_dir / "output", r"C:\Analysis\output", "false"),
     ]
+    if mitm_dir is not None:      # mitmdump.exe for HTTPS decryption, read-only
+        maps.append((mitm_dir, r"C:\Analysis\mitm", "true"))
     map_xml = "\n".join(
         f"    <MappedFolder><HostFolder>{escape(str(h))}</HostFolder><SandboxFolder>{b}</SandboxFolder><ReadOnly>{ro}</ReadOnly></MappedFolder>"
         for h, b, ro in maps

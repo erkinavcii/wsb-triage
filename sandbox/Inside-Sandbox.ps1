@@ -687,7 +687,7 @@ $TreePids = @{}
 $Conns = @{}
 $DnsSeen = @{}
 $script:RootPid = $null
-$MonitorNames = @('pktmon.exe', 'procmon.exe', 'procmon64.exe', 'wmiprvse.exe', 'conhost.exe', 'auditpol.exe')
+$MonitorNames = @('pktmon.exe', 'procmon.exe', 'procmon64.exe', 'wmiprvse.exe', 'conhost.exe', 'auditpol.exe', 'mitmdump.exe', 'windows-redirector.exe')
 $SuspiciousCmdRx = '(?i)-enc(odedcommand)?\s|frombase64string|downloadstring|downloadfile|invoke-webrequest|\biwr\b|invoke-expression|\biex\b|start-bitstransfer|add-mppreference|set-mppreference|-windowstyle\s+hidden|-w\s+hidden|vssadmin.*delete|bcdedit|wevtutil\s+cl|certutil.*(-urlcache|-decode)|bitsadmin.*/transfer|mshta\s+http|regsvr32.*/i:http|rundll32.*javascript|schtasks.*/create|reg\s+add.*\\run\b|netsh\s+advfirewall\s+set.*off|cmd.*/c.*del.*\\'
 
 function Add-Proc([int]$ProcId, [int]$ParentId, [string]$Name, [string]$Path, [string]$Cmd, [string]$SeenAt = '') {
@@ -1506,7 +1506,55 @@ function Stop-FakeNet {
     return @($script:FakeNetLog)
 }
 
+# ------------------------------------------------------------------ HTTPS decryption (optional)
+# mitmproxy in "local" capture mode intercepts every program's traffic (proxy settings are not needed); its CA is
+# trusted in LocalMachine\Root so Windows (Schannel) programs accept the intercepted TLS. Programs that pin their
+# certificate fail instead and are logged as tls_failed by the addon.
+$script:Https = [ordered]@{ Requested = [bool]$cfg.DecryptHttps; Status = 'not requested'; CaTrusted = $false }
+$script:MitmProc = $null
+function Start-HttpsDecrypt {
+    if (-not $cfg.DecryptHttps -or $TestMode) { return }
+    $exe = 'C:\Analysis\mitm\mitmdump.exe'
+    $addon = Join-Path $ToolsDir 'https_logger.py'
+    if (-not (Test-Path -LiteralPath $exe) -or -not (Test-Path -LiteralPath $addon)) {
+        $script:Https.Status = 'mitmdump.exe or addon missing'; Log "HTTPS decryption: $($script:Https.Status)"; return
+    }
+    $conf = Join-Path $WorkPath 'mitm'
+    New-Item -ItemType Directory -Force -Path $conf | Out-Null
+    $env:SAFEBOX_HTTPS_LOG = Join-Path $OutputDir 'https_log.jsonl'
+    $errLog = Join-Path $WorkPath 'mitm_stderr.txt'
+    $argList = @('--mode', 'local', '--set', "confdir=$conf", '-s', $addon, '-q')
+    try {
+        $script:MitmProc = Start-Process -FilePath $exe -ArgumentList $argList -WindowStyle Hidden -PassThru -RedirectStandardError $errLog
+    } catch { $script:Https.Status = "start failed: $($_.Exception.Message)"; Log "HTTPS decryption: $($script:Https.Status)"; return }
+    $ca = Join-Path $conf 'mitmproxy-ca-cert.cer'
+    foreach ($i in 1..60) { if (Test-Path -LiteralPath $ca) { break }; Start-Sleep -Milliseconds 500 }
+    if (-not (Test-Path -LiteralPath $ca)) {
+        $script:Https.Status = 'CA certificate was not created'
+    } else {
+        try { Import-Certificate -FilePath $ca -CertStoreLocation 'Cert:\LocalMachine\Root' -ErrorAction Stop | Out-Null; $script:Https.CaTrusted = $true } catch {}
+        Start-Sleep -Seconds 3
+        if ($script:MitmProc.HasExited) {
+            $tail = ''
+            try { $tail = (Get-Content -LiteralPath $errLog -Tail 3 -ErrorAction Stop) -join ' ' } catch {}
+            $script:Https.Status = "mitmdump exited (code $($script:MitmProc.ExitCode)) $tail".Trim()
+        } else {
+            $script:Https.Status = 'running'
+        }
+    }
+    Log "HTTPS decryption: $($script:Https.Status) (CA trusted: $($script:Https.CaTrusted))"
+}
+
+function Stop-HttpsDecrypt {
+    if ($script:MitmProc -and -not $script:MitmProc.HasExited) {
+        try { Stop-Process -Id $script:MitmProc.Id -Force -ErrorAction Stop } catch {}
+        Get-Process -Name 'windows-redirector' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    }
+    if ($script:Https.Status -eq 'running') { $script:Https.Status = 'done' }
+}
+
 # ------------------------------------------------------------------ 3. run sample + watch
+Start-HttpsDecrypt
 Start-FakeNet
 $watchStart = (Get-Date).AddSeconds(-2)
 $startedAt = Get-Date
@@ -1608,6 +1656,7 @@ Log 'Observation window finished.'
 Set-Status 'Ag kaydi durduruluyor ve donusturuluyor'
 Write-Live 0 'finishing'
 $fakeNetReqs = @(Stop-FakeNet)
+Stop-HttpsDecrypt
 if ($UseTrace) { Unregister-Event -SourceIdentifier ProcStart -ErrorAction SilentlyContinue }
 if ($procmon -and -not $TestMode) {
     & $procmon /Terminate | Out-Null
@@ -1741,6 +1790,7 @@ $result = [ordered]@{
     MemoryFindings  = @($memFindings)
     Crashes         = @($crashes)
     MemoryDumps     = @($memDumps)
+    Https           = $script:Https
     FakeNetRequests = @($fakeNetReqs)
     AutoClicks      = @($script:ClickedActions)
     Processes       = @($Procs.Values | Where-Object { $MonitorNames -notcontains ([string]$_.Name).ToLower() } | Sort-Object FirstSeen)

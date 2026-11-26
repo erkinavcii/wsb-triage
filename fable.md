@@ -436,3 +436,28 @@ Triage (tria.ge) karşılaştırmasındaki eksiklerden indirme gerektirmeyen iki
 - **M3. MITRE ATT&CK eşlemesi — ✅ EKLENDİ.** Bulgular 25 tekniğe eşleniyor (ör. Defender değişikliği → T1562.001, yeni servis → T1543.003, zamanlanmış görev → T1053.005, sahte üretici → T1036, lisans servisi durdurma → T1489, tarayıcı kimlik bilgisi → T1555.003). Panelde bulgu kutusunun altında attack.mitre.org bağlantılı etiketler (kırmızı/turuncu/gri, üzerine gelince kanıt), raporda ayrı bölüm.
 - **M4. Artık sandbox'ı olmayan pencere süreci yeni analizi engelliyordu — ✅ DÜZELTİLDİ.** Bir analizden kalan, penceresiz `WindowsSandboxRemoteSession.exe` "açık sandbox var" sayılıyordu; `wsb list` boşken ve sandbox sanal makinesi (`vmmemWindowsSandbox`) yokken tek başına bir görüntüleyici süreci artık çalışan sandbox sayılmıyor (`wsb` yoksa eski temkinli davranış korunuyor).
 - **Test:** 220 test geçiyor.
+
+## N. Zararlı ailesi / ayar çıkarma ve HTTPS çözme (26 Kasım 2026)
+
+Triage karşılaştırmasındaki 1. ve 2. madde. İkisi de ayrıca indirilen araçlara dayanıyor; araçlar **depoya girmiyor**, `%LOCALAPPDATA%\SafeBox\` altında duruyor ve yoksa ilgili adım sessizce atlanıyor (panelde rozet: "Aile / ayar ayıklayıcı yok").
+
+| Araç | Kaynak | Boyut | Lisans | Yer |
+|---|---|---|---|---|
+| Python 3.13.13 (yalnızca bu kullanıcı, PATH'e eklenmedi) | python.org, PSF imzalı | 29,1 MB | PSF | `SafeBox\python313` |
+| CAPE-parsers 0.1.74 + kütüphaneler (ayrı sanal ortam) | PyPI | ~28 MB indirme, 108 MB kurulu | MIT | `SafeBox\extractor-venv` |
+| CAPE aile YARA kuralları (114 dosya) | github.com/kevoreilly/CAPEv2 `data/yara/CAPE` | 113 KB | GPLv3 | `SafeBox\cape-rules` |
+| mitmproxy 12.3.1 `mitmdump.exe` | downloads.mitmproxy.org (zip 88,4 MB, imzasız resmi derleme) | 28,7 MB | MIT | `SafeBox\mitmproxy` |
+
+- CAPE-parsers Python ≥3.12 istiyor, panel 3.11'de; Python 3.12'nin son Windows kurulumu (3.12.10) sonraki güvenlik düzeltmelerini içermediği için bakımı süren 3.13 seçildi. Panelin Python'una dokunulmadı.
+- CAPE kuralları GPLv3 olduğu için herkese açık depoya konmadı.
+- `mitmdump.exe` imzasız (mitmproxy derlemelerini imzalamıyor). Yalnızca sandbox içinde çalışıyor; dosyanın SHA-256'sı koda sabitlendi (`MITM_SHA256`), değişirse sandbox'a bağlanmıyor.
+
+- **N1. Zararlı ailesi tespiti ve ayar (C2) çıkarma — ✅ EKLENDİ.** `config_extractor.py` ayrı ortamda ve ayrı süreçte çalışıyor (şüpheli dosyaları üçüncü taraf ayrıştırıcılarla okuduğu için): CAPE aile kuralları dosyada aileyi tanıyor, o ailenin ayrıştırıcısı (66 aile: Lumma, Vidar, RedLine, Stealc, AgentTesla, AsyncRAT, Remcos, XWorm, DCRat…) ayarı çıkarıyor. Statik aşamada en riskli 40 çalıştırılabilir dosyaya (≤64 MB), sandbox'tan sonra bellek dökümlerine (silinmeden önce; şifreli döküm yalnızca bellekte çözülüyor) uygulanıyor.
+  - Sonuç: aile eşleşmesi **kırmızı** ve puan **10** ("Zararlı ailesi tespit edildi: Lumma — 'Set-up.exe' (statik). Ayardan çıkan adresler (C2): …"); ayardaki adresler IOC dışa aktarımına "zararlı ailesi C2" olarak giriyor. Obfuscar (.NET karıştırıcı) ve Pafish (anti-VM test aracı) gibi araç kuralları sadece not. Panelde "💀 Zararlı ailesi" kutusu, raporda ayrı bölüm.
+  - Doğrulama: yalnızca bir aile kuralının aradığı metinleri içeren sentetik dosya hem diskte hem XOR'lu bellek dökümü olarak AgentTesla olarak tanındı (statik risk puanı 0/100 iken); Windows'un notepad'i ve Photoshop paketinin çalıştırılabilirleri temiz çıktı (0,7 sn). **Gerçek bir zararlıdan ayar çıkarılması denenmedi** (örnek yok); ayrıştırıcıların kendisi CAPE projesinin.
+- **N2. HTTPS trafiğini çözme — ✅ EKLENDİ (isteğe bağlı, varsayılan kapalı).** "HTTPS trafiğini çöz (mitmproxy)" seçilirse sandbox içinde `mitmdump --mode local` tüm programların trafiğini (proxy ayarı gerektirmeden) yakalıyor, kendi kök sertifikası sandbox'ta güvenilir olarak ekleniyor, `https_logger.py` eklentisi her istek için yöntem, tam adres, durum, boyut ve **gönderilen** verinin ilk 1 KB'ını `output/https_log.jsonl`'a yazıyor (yanıt gövdeleri tutulmuyor; en fazla 5000 satır, ana bilgisayarda 20 MB'a kadar okunuyor, güvenilmeyen veri olarak).
+  - Sonuç: kötüye kullanılan servislere (Telegram bot API, Discord webhook, Pastebin…) HTTPS istekleri kırmızı; Microsoft/Adobe dışı adreslere veri gönderen POST/PUT istekleri not; sertifika sabitleyen (çözülemeyen) adresler not; çözme çalışmadıysa not. mitmproxy'nin kendi dinleyici portu bulgu sayılmıyor.
+  - Uyarı: kendi sertifikasını bekleyen programlar (bazı kurulumlar, güncelleyiciler) bu modda bağlanamayabilir, bu da davranışı değiştirebilir; bu yüzden varsayılan kapalı ve yalnızca internet açıkken çalışıyor.
+  - *Gerçek sandbox testi:* `example.com` / `example.org`'a HTTPS isteği yapan zararsız bir betik: CA güvenilir eklendi, 44 istek çözüldü, test adresleri tam yollarıyla ve programın kimliğiyle (curl, PowerShell) göründü; sertifika sabitleyen bir Windows adresi (`arc.msn.com`) "çözülemedi" olarak işaretlendi.
+  - *mitmproxy'nin kendi izleri bulgu sayılmıyor (sadece HTTPS çözme açıkken):* yerel yakalama için yüklediği WinDivert paket sürücüsü (yalnızca kendi açılmış paket klasöründen, `%TEMP%\_MEI…\mitmproxy_windows\WinDivert64.sys`) ve kendini açtığı `_MEI…` klasöründeki dosyalar. Başka yerden yüklenen WinDivert ya da başka `_MEI` klasörleri (PyInstaller ile paketlenmiş zararlılar da böyle açılır) bulgu olmaya devam ediyor. Test analizi bu düzeltmelerden önce yanlışlıkla kırmızıydı ("1 yeni sürücü"), sonra 3/10.
+- **Test:** 226 test geçiyor.
