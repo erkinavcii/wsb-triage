@@ -1041,18 +1041,38 @@ if ($script:LanBlock.Requested -and $isAdmin -and -not $TestMode) {
     } catch { $script:LanBlock.Status = "FAILED: $($_.Exception.Message)"; Log "LAN block failed: $($_.Exception.Message)" }
 } elseif ($script:LanBlock.Requested) { $script:LanBlock.Status = 'skipped (not admin or test mode)' }
 
-$targetFile = Resolve-Target
+$targetFile = if ($cfg.Url) { $null } else { Resolve-Target }
 $script:TargetRel = $null
 if ($targetFile) {
     $mr = $script:MountedRoots | Where-Object { $targetFile.FullName.StartsWith($_.Root, [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
     if ($mr) { $script:TargetRel = "[$($mr.Image)] " + $targetFile.FullName.Substring($mr.Root.Length) }
     else { $script:TargetRel = $targetFile.FullName.Substring($SampleDir.Length).TrimStart('\') }
     Log "Target: $($targetFile.FullName)"
-} else { Log "No runnable file found - only observing the system. $($script:TargetNote)" }
+} elseif ($cfg.Url) { $script:TargetRel = [string]$cfg.Url; Log "Target: link $($cfg.Url)" }
+else { Log "No runnable file found - only observing the system. $($script:TargetNote)" }
 
 Initialize-Honeyfiles
 
 Set-Status 'Temiz sistem goruntusu (baseline) aliniyor'
+# Link analysis: Edge policies for a clean, quiet browser (no first-run, no import from other browsers, no
+# background/startup boost, no SmartScreen or download prompts so downloads land in Downloads to be analyzed).
+# Written before the baseline. A separate profile folder keeps it out of any Edge already started by Windows.
+if ($cfg.Url -and -not $TestMode) {
+    $pol = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'
+    try {
+        New-Item -Path $pol -Force | Out-Null
+        $dw = @{ HideFirstRunExperience = 1; AutoImportAtFirstRun = 4; ImportOnEachLaunch = 0; StartupBoostEnabled = 0
+                 BackgroundModeEnabled = 0; SmartScreenEnabled = 0; SmartScreenPuaEnabled = 0; PromptForDownloadLocation = 0
+                 DownloadRestrictions = 0; DefaultBrowserSettingEnabled = 0; BrowserSignin = 0; SyncDisabled = 1
+                 PersonalizationReportingEnabled = 0; ShowRecommendationsEnabled = 0; NewTabPageContentEnabled = 0 }
+        foreach ($k in $dw.Keys) { New-ItemProperty -Path $pol -Name $k -Value $dw[$k] -PropertyType DWord -Force | Out-Null }
+        New-ItemProperty -Path $pol -Name 'DownloadDirectory' -Value (Join-Path $env:USERPROFILE 'Downloads') -PropertyType String -Force | Out-Null
+        $exempt = '[' + ((@('exe', 'msi', 'zip', 'rar', '7z', 'iso', 'img', 'bat', 'cmd', 'ps1', 'js', 'vbs', 'hta', 'lnk', 'scr', 'dll', 'jar', 'apk') | ForEach-Object { '{"file_extension":"' + $_ + '","domains":["*"]}' }) -join ',') + ']'
+        New-ItemProperty -Path $pol -Name 'ExemptFileTypeDownloadWarnings' -Value $exempt -PropertyType String -Force | Out-Null
+        Log 'Edge policies set for link analysis'
+    } catch { Log "Edge policies failed: $($_.Exception.Message)" }
+}
+
 # HTTPS decryption: block QUIC (HTTP/3 over UDP 443) so browsers and Chromium/Go programs fall back to TCP, which
 # the decryptor sees. Created before the baseline, like the LAN block, so it is not reported as a change.
 $script:QuicBlocked = $false
@@ -1339,6 +1359,39 @@ function Dump-EarlySample {
             } else { Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue }
         } catch {}
     }
+}
+
+# Link analysis: files Edge downloaded, copied out XOR-encoded (same key as the dumps) for analysis on the host.
+# Unfinished downloads are skipped. Caps: 20 files, 128 MB each, 256 MB in total.
+function Save-Downloads {
+    if (-not $cfg.Url -or $TestMode) { return @() }
+    $src = Join-Path $env:USERPROFILE 'Downloads'
+    $dir = Join-Path $OutputDir 'downloads'
+    $out = @()
+    $total = [long]0
+    $files = @(Get-ChildItem -LiteralPath $src -File -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -ge $startedAt -and $_.Extension -notin '.crdownload', '.partial', '.tmp' } |
+        Sort-Object LastWriteTime | Select-Object -First 20)
+    $i = 0
+    foreach ($f in $files) {
+        if ($f.Length -gt 134217728 -or ($total + $f.Length) -gt 268435456) { $out += "$($f.Name) skipped ($([Math]::Round($f.Length / 1MB, 1)) MB)"; continue }
+        try {
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            $safe = ($f.Name -replace '[^A-Za-z0-9_. ()\[\]-]', '_')
+            if ($safe.Length -gt 120) { $safe = $safe.Substring($safe.Length - 120) }
+            $safe = $safe.TrimStart('.', ' ')
+            if (-not $safe) { $safe = 'download' }
+            $bytes = [IO.File]::ReadAllBytes($f.FullName)
+            for ($k = 0; $k -lt $bytes.Length; $k++) { $bytes[$k] = $bytes[$k] -bxor $MemDumpKey[$k % $MemDumpKey.Length] }
+            [IO.File]::WriteAllBytes((Join-Path $dir ('{0:D2}_{1}.xdl' -f $i, $safe)), $bytes)
+            $sha = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash.ToLower()
+            $out += "$($f.Name) | $($f.Length) | $sha"
+            $total += $f.Length
+            $i++
+        } catch { $out += "$($f.Name) failed: $($_.Exception.Message)" }
+    }
+    if ($out.Count) { Log ('Downloads: ' + ($out -join '; ')) }
+    return $out
 }
 
 function Scan-ProcessMemory {
@@ -1673,6 +1726,20 @@ if ($targetFile) {
             if ($proc) { $script:RootPid = $proc.Id; $TreePids[$proc.Id] = 1; Log "Sample started, pid $($proc.Id) ($launchExe $launchArg)" }
         } catch { Log "Failed to start sample: $($_.Exception.Message)" }
     }
+} elseif ($cfg.Url) {
+    # The link is the sample: open it in Edge with its own profile, so it is a new browser process tree (an Edge
+    # started by Windows would otherwise take the link over and the tree would end at once).
+    $edge = @("${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe", "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe") |
+        Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    if (-not $edge) { Log 'Edge not found - link not opened' }
+    else {
+        $profileDir = Join-Path $WorkPath 'edge-profile'
+        $edgeArgs = @("--user-data-dir=`"$profileDir`"", '--no-first-run', '--no-default-browser-check', '--start-maximized', "`"$($cfg.Url)`"")
+        try {
+            $proc = Start-Process -FilePath $edge -ArgumentList $edgeArgs -PassThru -ErrorAction Stop
+            if ($proc) { $script:RootPid = $proc.Id; $TreePids[$proc.Id] = 1; Log "Sample started, pid $($proc.Id) (Edge: $($cfg.Url))" }
+        } catch { Log "Failed to open the link in Edge: $($_.Exception.Message)" }
+    }
 }
 
 $end = $startedAt.AddSeconds($Duration)
@@ -1708,6 +1775,7 @@ Update-HoneyReads $startedAt
 $memFindings = @(Scan-ProcessMemory)
 Set-Status 'Bellek dokumu aliniyor (ornek islemleri)'
 $memDumps = @($script:EarlyDumpList) + @(Dump-ProcessMemory)
+$downloads = @(Save-Downloads)
 $crashes = @(Get-CrashEvents $startedAt)
 Test-LanBlock
 Capture-Screen
@@ -1853,6 +1921,8 @@ $result = [ordered]@{
     Crashes         = @($crashes)
     MemoryDumps     = @($memDumps)
     Https           = $script:Https
+    Url             = [string]$cfg.Url
+    Downloads       = @($downloads)
     FakeNetRequests = @($fakeNetReqs)
     AutoClicks      = @($script:ClickedActions)
     Processes       = @($Procs.Values | Where-Object { $MonitorNames -notcontains ([string]$_.Name).ToLower() } | Sort-Object FirstSeen)

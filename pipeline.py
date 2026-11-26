@@ -71,6 +71,7 @@ DEFAULT_OPTIONS = {
     "show_sandbox_window": False,
     "enable_vgpu": False,
     "decrypt_https": False,
+    "url": "",
     "simulate_user": True,
     "notify": True,
     "memory_mb": 4096,
@@ -228,12 +229,36 @@ def _new_state(case_id: str, sample: str, options: Dict[str, Any]) -> Dict[str, 
     }
 
 
+_URL_BAD_CHARS = re.compile(r"[\s\x00-\x1f\x7f\"'`<>^|\\{}]")
+
+
+def parse_url_sample(text: str) -> Optional[str]:
+    """A link to analyze instead of a file ("https://..."). Returns the URL, None for a path, or raises for a bad link.
+    The URL is passed to Edge inside the sandbox on a command line, so quotes/spaces/backslashes are refused."""
+    s = (text or "").strip().strip('"').strip("'")
+    if not re.match(r"^[a-z][a-z0-9+.-]*://", s, re.I):
+        return None
+    u = urlparse(s)
+    if u.scheme.lower() not in ("http", "https"):
+        raise PipelineError("Sadece http:// ve https:// bağlantıları incelenebilir.")
+    if not u.hostname or len(s) > 2000 or _URL_BAD_CHARS.search(s):
+        raise PipelineError("Bağlantı geçersiz (boşluk, tırnak ya da ters bölü içeremez; en fazla 2000 karakter).")
+    if "@" in (u.netloc or ""):
+        raise PipelineError("Kullanıcı adı/şifre içeren bağlantılar kabul edilmiyor (bilgileriniz sandbox'a gitmesin).")
+    return s
+
+
 def create_job(sample_path: str, options: Optional[Dict[str, Any]] = None) -> Job:
-    src = Path(sample_path.strip().strip('"').strip("'"))
-    if not src.exists():
+    url = parse_url_sample(sample_path)
+    src = Path(sample_path.strip().strip('"').strip("'")) if not url else None
+    if src is not None and not src.exists():
         raise PipelineError(f"Dosya veya klasör bulunamadı: {src}")
     opts = dict(DEFAULT_OPTIONS)
     opts.update({k: v for k, v in (options or {}).items() if k in DEFAULT_OPTIONS and v is not None})
+    if url:
+        # Link analysis: the link is opened in Edge inside the sandbox. It needs internet; HTTPS decryption shows the
+        # redirect chain and requests (Edge trusts the decryptor's CA); the auto-clicker stays off on web pages.
+        opts.update({"url": url, "network": True, "decrypt_https": True, "simulate_user": False, "target": ""})
     try:
         opts["memory_mb"] = max(1024, min(65536, int(opts.get("memory_mb") or 4096)))
     except (TypeError, ValueError):
@@ -247,14 +272,16 @@ def create_job(sample_path: str, options: Optional[Dict[str, Any]] = None) -> Jo
     vbox_password = opts.pop("vbox_password", "") or ""
     opts["has_vbox_password"] = bool(vbox_password)
     opts["sandbox_backend"] = "vbox" if opts.get("sandbox_backend") == "vbox" else "wsb"
-    safe = re.sub(r"[^\w.-]", "_", src.name)[:40] or "sample"
+    safe = re.sub(r"[^\w.-]", "_", (urlparse(url).hostname or "url") if url else src.name)[:40] or "sample"
     case_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}_{safe}"
     if (CASES_DIR / case_id).exists():      # two jobs for the same file within one second
         case_id = f"{case_id}_{uuid.uuid4().hex[:4]}"
     case_dir = CASES_DIR / case_id
     for sub in ("input", "output", "tools"):
         (case_dir / sub).mkdir(parents=True, exist_ok=True)
-    job = Job(case_dir, _new_state(case_id, str(src.resolve()), opts), password, vbox_password=vbox_password)
+    job = Job(case_dir, _new_state(case_id, url or str(src.resolve()), opts), password, vbox_password=vbox_password)
+    if url:
+        job.state["mode"] = "url"
     job.save()
     with JOBS_LOCK:
         JOBS[case_id] = job
@@ -324,6 +351,110 @@ def _mark_cancelled(job: Job, current: Optional[str]) -> None:
     job.state.pop("cancel_requested", None)
 
 
+def stage_vt_url(job: Job) -> None:
+    """VirusTotal's existing report for the link (address only; nothing is submitted)."""
+    key = vt_client.get_api_key()
+    url = str(job.opt("url") or "")
+    if not key:
+        job.stage("vt", "skipped", "API anahtarı yok: bağlantı VirusTotal'da sorgulanmadı.")
+        return
+    job.stage("vt", "running", "Bağlantı VirusTotal'da sorgulanıyor (sadece adres gönderilir)...")
+    try:
+        res = vt_client.lookup_url(url, key)
+    except Exception as e:  # noqa: BLE001 - quota/network: the sandbox part still runs
+        job.state["url_vt"] = {"error": str(e)[:200]}
+        job.stage("vt", "error", f"VirusTotal sorgusu yapılamadı: {e}")
+        return
+    job.state["url_vt"] = res or {"not_found": True}
+    if not res:
+        job.stage("vt", "done", "Bağlantı VirusTotal'da daha önce taranmamış.")
+    else:
+        job.stage("vt", "done", f"VirusTotal: {res['malicious']} motor zararlı, {res['suspicious']} şüpheli dedi.")
+
+
+DOWNLOADS_DIR = "downloads"
+_DOWNLOAD_RX = re.compile(r"^(?P<idx>\d{2})_(?P<name>[A-Za-z0-9_][A-Za-z0-9_. ()\[\]-]{0,119})\.xdl$")
+_DOWNLOAD_MAX = 128 * 1024 * 1024
+
+
+def _collect_downloads(job: Job, out: Path) -> List[Path]:
+    """Files the link made Edge download, written XOR-encoded by the monitor (output/downloads/NN_name.xdl).
+    Decoded into the case folder (never next to the user's files) for static analysis; never run on the host.
+    The host antivirus may remove a decoded file: that is reported, not hidden."""
+    d = out / DOWNLOADS_DIR
+    got: List[Path] = []
+    if not d.is_dir():
+        return got
+    dest = job.case_dir / "downloads"
+    try:
+        for p in sorted(d.iterdir()):
+            m = _DOWNLOAD_RX.match(p.name)
+            if not m or not p.is_file() or p.stat().st_size > _DOWNLOAD_MAX:
+                continue
+            dest.mkdir(exist_ok=True)
+            target = dest / f"{m.group('idx')}_{m.group('name')}"
+            target.write_bytes(_xor_decode(p.read_bytes(), MEMDUMP_KEY))
+            got.append(target)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return got
+
+
+def _analyze_downloads(job: Job, paths: List[Path]) -> None:
+    """Static analysis + signatures + family/config + VirusTotal hash lookup for downloaded files; results join the
+    normal static list (marked [indirilen]) so the usual verdict rules apply."""
+    if not paths:
+        return
+    job.stage("sandbox", "running", f"İndirilen {len(paths)} dosya inceleniyor (çalıştırılmadan)...")
+    time.sleep(AV_SETTLE_SEC)                     # give the host antivirus its chance, then see what is left
+    sigs: Dict[str, Dict[str, str]] = {}
+    try:
+        sigs, _ = check_signatures(job.case_dir, [str(p) for p in paths if p.exists()])
+    except Exception as e:  # noqa: BLE001
+        job.log(f"İndirilen dosyaların imzası kontrol edilemedi: {e}")
+    downloads, results = [], []
+    for p in paths[:20]:
+        name = p.name[3:]
+        item: Dict[str, Any] = {"name": name, "size": p.stat().st_size if p.exists() else 0}
+        if not p.exists():
+            item["missing"] = True
+            downloads.append(item)
+            continue
+        item["sha256"] = hashlib.sha256(p.read_bytes()).hexdigest()
+        try:
+            res = analyzer.analyze_single_file(str(p), sigs.get(str(p)) or {"status": "Unknown", "message": "", "signer": "", "issuer": ""})
+            res["rel"] = f"[indirilen] {name}"
+            results.append(res)
+        except Exception as e:  # noqa: BLE001
+            job.log(f"İndirilen dosya incelenemedi ({name}): {e}")
+        downloads.append(item)
+    job.state["downloads"] = downloads
+    job.state["static"] = sorted((job.state.get("static") or []) + results, key=lambda x: -x["risk_score"])
+    if config_extractor_available():
+        cands = [{"label": r["rel"], "path": r["file_path"]} for r in results
+                 if (r.get("pe_info") or {}).get("is_pe") and Path(r["file_path"]).stat().st_size <= _FAMILY_MAX_BYTES]
+        fam = run_config_extractor(cands) if cands else {"ok": True, "results": []}
+        if fam.get("ok"):
+            hits = [r for r in fam.get("results") or [] if r.get("families") or r.get("generic")]
+            st = job.state.setdefault("families", {"status": "done"})
+            st["status"] = "done"
+            st["static"] = (st.get("static") or []) + hits
+    key = vt_client.get_api_key()
+    if key:
+        for item in downloads:
+            if not item.get("sha256"):
+                continue
+            e = {"rel": f"[indirilen] {item['name']}", "sha256": item["sha256"], "size": item["size"], "status": "Sırada",
+                 "result": None, "gui_url": f"https://www.virustotal.com/gui/file/{item['sha256']}"}
+            try:
+                e["result"] = vt_client.lookup(item["sha256"], key)
+                e["status"] = "VT'de kayıtlı" if e["result"] else "VT'de yok (indirilen dosya; yüklenmedi)"
+            except Exception as ex:  # noqa: BLE001
+                e["status"] = f"Hata: {ex}"
+            job.state.setdefault("vt", []).append(e)
+    job.log(f"İndirilen dosyalar: {', '.join(d['name'] + (' (kayboldu)' if d.get('missing') else '') for d in downloads)}")
+
+
 def _start_vt_thread(job: Job) -> threading.Thread:
     """VirusTotal lookups next to the sandbox. The sandbox does not use their results, and the free API allows only
     4 requests a minute, so 16 files used to delay the sandbox by ~4 minutes. Errors stay in the VT stage."""
@@ -355,13 +486,26 @@ def run_job(job: Job) -> None:
     current = None
     vt_thread: Optional[threading.Thread] = None
     try:
-        for key, fn in (("extract", stage_extract), ("inventory", stage_inventory), ("static", stage_static)):
+        if job.state.get("mode") == "url":
+            for key in ("extract", "inventory", "static"):
+                job.stage(key, "skipped", "Bağlantı analizi: dosya yok (indirilen dosyalar sandbox'tan sonra incelenir).")
+            current = "vt"
+            stage_vt_url(job)
+            compute_verdict(job)
+        for key, fn in (() if job.state.get("mode") == "url" else
+                        (("extract", stage_extract), ("inventory", stage_inventory), ("static", stage_static))):
             job.check_cancel()
             current = key
             fn(job)
             compute_verdict(job)
         job.check_cancel()
-        if job.opt("run_sandbox"):
+        if job.state.get("mode") == "url":
+            current = "sandbox"
+            if job.opt("run_sandbox"):
+                stage_sandbox(job)
+            else:
+                job.stage("sandbox", "waiting", "Hazır. Bağlantıyı izole ortamda açmak için 'Sandbox'ta Çalıştır' butonuna basın.")
+        elif job.opt("run_sandbox"):
             vt_thread = _start_vt_thread(job)
             current = "sandbox"
             stage_sandbox(job)
@@ -2224,6 +2368,7 @@ def stage_sandbox(job: Job) -> None:
             "FakeNet": bool(job.opt("fake_net")),
             "SimulateUser": bool(job.opt("simulate_user")),
             "DecryptHttps": https_ok,
+            "Url": str(job.opt("url") or "") if job.state.get("mode") == "url" else "",
         })
 
         net = "açık (trafik kaydediliyor)" if job.opt("network") else "kapalı"
@@ -2294,6 +2439,12 @@ def stage_sandbox(job: Job) -> None:
                 job.log(f"Bellek dökümü taranamadı: {e}")
             finally:
                 shutil.rmtree(out / MEMDUMP_DIR, ignore_errors=True)
+        downloaded: List[Path] = []
+        if (out / DOWNLOADS_DIR).is_dir():
+            try:
+                downloaded = _collect_downloads(job, out)
+            except Exception as e:  # noqa: BLE001
+                job.log(f"İndirilen dosyalar alınamadı: {e}")
         quarantined = quarantine_output(out)
         job.state["sandbox"]["quarantined"] = quarantined
         job.state["sandbox"]["screenshots"] = list_screenshots(job)
@@ -2311,6 +2462,10 @@ def stage_sandbox(job: Job) -> None:
                                 "QuicBlocked": bool(hs.get("QuicBlocked")), **summarize_https_log(out)}
             job.state["behavior"] = beh
             _check_dropped_files_vt(job, beh)
+            try:
+                _analyze_downloads(job, downloaded)
+            except Exception as e:  # noqa: BLE001 - never lose the sandbox results over the downloads
+                job.log(f"İndirilen dosyalar incelenemedi: {e}")
             job.stage("sandbox", "done", f"Tamamlandı. Ağ kaydı: {beh.get('CaptureStatus')}")
         elif job.state["sandbox"].get("monitor_lost"):
             job.stage("sandbox", "error", "İzleyici yanıt vermeyi bıraktı (örnek tarafından durdurulmuş olabilir). Son canlı veriler aşağıda.")
@@ -3037,7 +3192,8 @@ def _split_memory_findings(items: List[Any]) -> Tuple[List[str], List[str], List
         body = re.sub(r"^\[[^\]]*\]\s*", "", text)
         m = _MEM_URL_RX.match(body)
         if not m:
-            if tag and _SCRIPT_ENGINE_RX.match(tag.group(1).rsplit(".", 1)[0]):
+            base = tag.group(1).rsplit(".", 1)[0] if tag else ""
+            if tag and (_SCRIPT_ENGINE_RX.match(base) or _BROWSER_ENGINE_RX.match(base)):
                 engine_items.append(text)
             else:
                 red_items.append(text)
@@ -3045,6 +3201,8 @@ def _split_memory_findings(items: List[Any]) -> Tuple[List[str], List[str], List
         cls = domain_class(m.group(1))
         if cls in _MEM_SKIP_CLASSES:
             continue
+        if tag and _BROWSER_ENGINE_RX.match(tag.group(1).rsplit(".", 1)[0]) and cls != CLASS_ABUSED:
+            continue                     # a browser's memory is full of web addresses (docs, ads, CDNs)
         (red_items if cls == CLASS_ABUSED else url_items).append(text)
     return red_items, url_items, engine_items
 
@@ -3163,6 +3321,53 @@ def _score(red: List[str], crack: List[str], notes: List[str], missing: List[str
     return {"score": sc, "label": label, "incomplete": bool(missing)}
 
 
+# Edge's own footprint when a link is opened in it (link analysis): not findings in that mode.
+_EDGE_PATH_RX = re.compile(r"\\Microsoft\\(Edge|EdgeWebView|EdgeUpdate|EdgeCore)\\|\\SandboxWork\\edge-profile\\", re.I)
+_BROWSER_SERVICE_HOST_RX = re.compile(r"(^|\.)(googleapis\.com|gvt1\.com|gstatic\.com|clients\d*\.google\.com)$", re.I)
+_EDGE_PROC_NAMES = {"msedge.exe", "msedgewebview2.exe", "identity_helper.exe", "cookie_exporter.exe", "notification_helper.exe",
+                    "elevation_service.exe", "pwahelper.exe", "msedge_proxy.exe", "ie_to_edge_stub.exe",
+                    "microsoftedgeupdate.exe", "msedge_pwa_launcher.exe", "setup.exe"}
+
+
+def _edge_noise(item: str) -> bool:
+    s = str(item or "")
+    return bool(_EDGE_PATH_RX.search(s) or re.search(r"MicrosoftEdge(AutoLaunch|UpdateTask)|\\Quick Launch\\.*Edge.*\.lnk$"
+                                                     r"|^edgeupdatem?\b|^MicrosoftEdgeElevationService\b", s, re.I))
+
+
+def _url_findings(s: Dict[str, Any], b: Dict[str, Any], red: List[str], notes: List[str]) -> None:
+    """Link analysis: VirusTotal's view of the link, what Edge started, redirects, downloads."""
+    vt = s.get("url_vt") or {}
+    if vt.get("malicious", 0) >= 3:
+        red.append(f"VirusTotal: bağlantı {vt['malicious']} motor tarafından zararlı/oltalama olarak işaretli"
+                   + (f" ({', '.join(sorted({f['result'] for f in vt.get('flagged') or [] if f.get('result')})[:4])})" if vt.get("flagged") else "") + ".")
+    elif vt.get("malicious", 0) + vt.get("suspicious", 0) > 0:
+        notes.append(f"VirusTotal: bağlantıyı {vt.get('malicious', 0)} motor zararlı, {vt.get('suspicious', 0)} motor şüpheli işaretledi.")
+    if not b:
+        return
+    odd = [p for p in b.get("Processes") or [] if isinstance(p, dict) and p.get("InTree")
+           and str(p.get("Name") or "").lower() not in _EDGE_PROC_NAMES and not _EDGE_PATH_RX.search(str(p.get("Path") or ""))]
+    if odd:
+        red.append("Tarayıcı beklenmeyen bir program başlattı (açık istismarı ya da indirilenin çalışması olabilir): "
+                   + "; ".join(f"{p.get('Name')} {str(p.get('CommandLine') or '')[:100]}".strip() for p in odd[:4]))
+    flows = [f for f in (b.get("Https") or {}).get("flows") or [] if isinstance(f, dict)]
+    hops: List[str] = []
+    for f in flows:
+        if f.get("status") in (301, 302, 303, 307, 308):
+            h = str(f.get("host") or "")
+            if h and (not hops or hops[-1] != h):
+                hops.append(h)
+    if len(hops) >= 2 or (hops and hops[0] != (urlparse(str(s.get("sample") or "")).hostname or "")):
+        notes.append("Bağlantı yönlendirdi: " + " → ".join(hops[:8]))
+    downloads = s.get("downloads") or []
+    if downloads:
+        notes.append(f"Bağlantı {len(downloads)} dosya indirdi (çalıştırılmadı, aşağıda statik olarak incelendi): "
+                     + ", ".join(d.get("name", "?") for d in downloads[:6]))
+    gone = [d["name"] for d in downloads if d.get("missing")]
+    if gone:
+        red.append(f"İndirilen dosya ana bilgisayarda açılırken kayboldu (antivirüs zararlı bulup silmiş olabilir): {', '.join(gone[:4])}")
+
+
 def _installer_never_started(b: Dict[str, Any]) -> str:
     """An installer or disc menu that ran alone the whole time: no child process, nothing clicked, no new program
     file. Typical for a custom-drawn "Install" button the auto-clicker cannot see. The run then says nothing about
@@ -3225,7 +3430,7 @@ def _compute_verdict(job: Job) -> None:
             continue
         mal = r["stats"]["malicious"]
         txt = r.get("suggested_threat_label", "") + " " + " ".join(x["result"] for x in r.get("flagged_engines", []))
-        if mal and SEVERE_RX.search(txt):
+        if mal >= 3 and SEVERE_RX.search(txt):        # one engine's "trojan" on the official 7-Zip installer was red
             red.append(f"VirusTotal: '{e['rel']}' zararlı yazılım ailesi olarak tespit edildi ({mal} motor): {r.get('suggested_threat_label')}")
         elif mal >= 3 and TOOL_RX.search(txt):
             crack.append(f"VirusTotal: '{e['rel']}' {mal} motor tarafından HackTool/Crack olarak işaretlendi (değiştirilmiş dosya).")
@@ -3241,6 +3446,9 @@ def _compute_verdict(job: Job) -> None:
     if inv.get("sig_errors"):
         notes.append(f"{inv['sig_errors']} dosyanın dijital imzası kontrol edilemedi, bu yüzden imzasız sayıldı "
                      f"(imza sonuçları güvenilir değil): {inv.get('sig_error_msg', '')}")
+    url_mode = s.get("mode") == "url"
+    if url_mode and not s.get("behavior"):
+        _url_findings(s, {}, red, notes)
     families_out: List[Dict[str, Any]] = []
     fam_sources = [("statik", h) for h in ((s.get("families") or {}).get("static") or [])]
     fam_sources += [("bellek dökümü", h) for h in ((s.get("behavior") or {}).get("MemoryFamilies") or [])]
@@ -3339,11 +3547,19 @@ def _compute_verdict(job: Job) -> None:
                 if any(tok in str(a) for tok in ("DELETED", "MODIFIED", "(Modified)", " read by "))
             ]
             unverified_honey = [a for a in b["HoneyfileAlerts"] if a not in confirmed_honey]
+            if url_mode:
+                # Edge reads other browsers' "Local State" to detect them (seen live, even with import disabled);
+                # a web page cannot read files from the browser sandbox. Any other reader stays red.
+                by_browser = [a for a in confirmed_honey if re.search(r" by (msedge|msedgewebview2)\.exe\b", str(a), re.I)]
+                if by_browser:
+                    notes.append(f"Tarayıcının kendisi yem dosya okudu (Edge diğer tarayıcıları tanımak için okur; web sayfaları "
+                                 f"diske erişemez): {'; '.join(by_browser[:3])}")
+                confirmed_honey = [a for a in confirmed_honey if a not in by_browser]
             if confirmed_honey:
                 red.append(f"Yem dosyalara (honeyfile) erişildi/değiştirildi: {'; '.join(confirmed_honey[:4])}")
             if unverified_honey:
                 notes.append(f"Yem dosya erişim izi (işlem doğrulanamadı, arka plan taraması olabilir): {'; '.join(unverified_honey[:3])}")
-        real_services = [s for s in (P.get("Services") or []) if not _is_wsb_noise_service(s)]
+        real_services = [s for s in (P.get("Services") or []) if not _is_wsb_noise_service(s) and not (url_mode and _edge_noise(s))]
         if real_services:
             red.append(f"{len(real_services)} yeni servis kuruldu.")
         https_on = bool((b.get("Https") or {}).get("Requested"))
@@ -3376,11 +3592,12 @@ def _compute_verdict(job: Job) -> None:
             notes.append(f"HKCU COM sınıfı kaydı eklendi ({len(P['ComHijacks'])}) — COM hijacking ihtimali.")
         if P.get("ActiveSetup"):
             notes.append(f"Active Setup kalıcılık kaydı eklendi ({len(P['ActiveSetup'])}).")
-        real_tasks = [x for x in (P.get("Tasks") or []) if not _is_wsb_noise_task(x)]
+        real_tasks = [x for x in (P.get("Tasks") or []) if not _is_wsb_noise_task(x) and not (url_mode and _edge_noise(x))]
         if real_tasks:
             notes.append(f"{len(real_tasks)} yeni zamanlanmış görev — ürüne mi ait kontrol edin.")
-        if P.get("RunKeys"):
-            notes.append(f"{len(P['RunKeys'])} otomatik başlatma kaydı eklendi/değişti.")
+        run_keys = [x for x in P.get("RunKeys") or [] if not (url_mode and _edge_noise(x))]
+        if run_keys:
+            notes.append(f"{len(run_keys)} otomatik başlatma kaydı eklendi/değişti.")
         if (b.get("Hosts") or {}).get("Added"):
             crack.append(f"hosts dosyası değişti ({len(b['Hosts']['Added'])} satır) — lisans sunucularını engelleme.")
         if (b.get("Hosts") or {}).get("Removed"):
@@ -3420,26 +3637,37 @@ def _compute_verdict(job: Job) -> None:
             if re.search(r"\\AppData\\|\\Temp\\|\\ProgramData\\|\\Users\\Public\\", f, re.I)
             and not _is_wsb_noise_dropped_file(f)
             and not any(f.lower().startswith(d) for d in mitm_mei)
+            and not (url_mode and _edge_noise(f))
         ]
         if dropped:
             notes.append(f"AppData/Temp/ProgramData içine {len(dropped)} yeni çalıştırılabilir dosya bırakıldı.")
         conns = [c for c in (b.get("Network") or {}).get("Connections") or [] if c.get("FromSample")]
         if conns:
             notes.append(f"Örneğin başlattığı işlemler {len(conns)} ağ bağlantısı açtı.")
+        mem_note_groups: Dict[Tuple[str, str], Dict[str, Any]] = {}
         for h in b.get("MemoryYara") or []:
             if not isinstance(h, dict):
                 continue
             proc = str(h.get("proc") or "?")
             msg_m = f"Bellek dökümünde YARA [{h.get('rule')}]: {proc} (pid {h.get('pid')}) — {h.get('description')}"
             sev = str(h.get("severity") or "medium").lower()
-            if _SCRIPT_ENGINE_RX.match(proc.rsplit(".", 1)[0]):        # first: engines match crack rules too
-                notes.append(f"{msg_m} ({_ENGINE_NOTE})")
+            base = proc.rsplit(".", 1)[0]
+            if _BROWSER_ENGINE_RX.match(base) and sev != "critical":
+                continue                 # Chromium's own memory matches medium/high rules; only critical ones are worth a note
+            if _SCRIPT_ENGINE_RX.match(base) or _BROWSER_ENGINE_RX.match(base):   # first: engines match crack rules too
+                g = mem_note_groups.setdefault((proc.lower(), str(h.get("rule"))), {"proc": proc, "rule": h.get("rule"),
+                                               "desc": h.get("description"), "pids": [], "browser": bool(_BROWSER_ENGINE_RX.match(base))})
+                g["pids"].append(str(h.get("pid")))
             elif h.get("rule") in CRACK_YARA_RULES:
                 crack.append(msg_m)
-            elif sev == "critical" and not _BROWSER_ENGINE_RX.match(proc.rsplit(".", 1)[0]):
+            elif sev == "critical":
                 red.append(msg_m)
             else:
                 notes.append(msg_m + " (bellekte görüldü; tek başına kesin kanıt değil)")
+        for g in mem_note_groups.values():
+            who = f"pid {g['pids'][0]}" if len(g["pids"]) == 1 else f"{len(g['pids'])} süreç"
+            why = "tarayıcı motorunun kendi belleğinde bu kalıplar normalde de bulunur; tek başına kanıt değil" if g["browser"] else _ENGINE_NOTE
+            notes.append(f"Bellek dökümünde YARA [{g['rule']}]: {g['proc']} ({who}) — {g['desc']} ({why})")
         hs = b.get("Https") if isinstance(b.get("Https"), dict) else {}
         if hs.get("Requested"):
             if str(hs.get("Status")) not in ("done", "running"):
@@ -3450,19 +3678,24 @@ def _compute_verdict(job: Job) -> None:
                 red.append("HTTPS içinde kötüye kullanılan servise istek: "
                            + "; ".join(f"{f.get('method')} {str(f.get('url'))[:120]}" for f in abused_f[:4]))
             sent = [f for f in flows if f.get("method") in ("POST", "PUT") and (f.get("req_bytes") or 0) > 0
-                    and domain_class(str(f.get("host") or "")) not in ("Windows/Microsoft (gürültü)", "Yerel (gürültü)", "Adobe", CLASS_ABUSED)]
+                    and domain_class(str(f.get("host") or "")) not in ("Windows/Microsoft (gürültü)", "Yerel (gürültü)", "Adobe", CLASS_ABUSED)
+                    and not (url_mode and _BROWSER_SERVICE_HOST_RX.search(str(f.get("host") or "")))]
             if sent:
                 notes.append(f"HTTPS ile {len(sent)} istekte veri gönderildi (Microsoft/Adobe dışı): "
                              + "; ".join(f"{f.get('method')} {str(f.get('url'))[:100]} ({f.get('req_bytes')} bayt)" for f in sent[:4]))
-            if hs.get("tls_failed"):
-                notes.append(f"{len(hs['tls_failed'])} adresin HTTPS trafiği çözülemedi (program kendi sertifikasını bekliyor / "
-                             "sertifika sabitleme): " + ", ".join(hs["tls_failed"][:6]))
+            seen_hosts = {str(f.get("host") or "").lower() for f in flows}
+            tls_failed = [h for h in hs.get("tls_failed") or [] if str(h).lower() not in seen_hosts]
+            if tls_failed:
+                notes.append(f"{len(tls_failed)} adresin HTTPS trafiği çözülemedi (program kendi sertifikasını bekliyor / "
+                             "sertifika sabitleme): " + ", ".join(tls_failed[:6]))
+        if url_mode:
+            _url_findings(s, b, red, notes)
         crash_note = _crash_note(b.get("Crashes") or [], bool(crack))
         if crash_note:
             notes.append(crash_note)
         mem_red, mem_urls, mem_engine = _split_memory_findings(b.get("MemoryFindings") or [])
         if mem_engine:
-            notes.append(f"Betik motoru belleğinde {len(mem_engine)} gösterge ({_ENGINE_NOTE}): " + "; ".join(mem_engine[:5]))
+            notes.append(f"Betik/tarayıcı motoru belleğinde {len(mem_engine)} gösterge ({_ENGINE_NOTE}): " + "; ".join(mem_engine[:5]))
         if mem_red:
             red.append(f"Canlı işlem belleğinde zararlı/şüpheli izler tespit edildi ({len(mem_red)}): "
                        + "; ".join(mem_red[:5]))
@@ -3517,14 +3750,14 @@ def _compute_verdict(job: Job) -> None:
             missing.append("Sandbox")
             notes.append("Sandbox adımı çalışmadı: dosyanın davranışı (işlemler, ağ, kalıcılık) incelenmedi; "
                          "bu sonuç sadece statik kontrollere dayanıyor.")
-        elif b is not None and not str(b.get("Target") or "").strip():
+        elif b is not None and not str(b.get("Target") or "").strip() and not url_mode:
             # the sandbox ran, but there was nothing to execute (e.g. only checksum files, or an image that could not be mounted)
             missing.append("Sandbox")
             notes.append("Sandbox açıldı ama çalıştırılacak dosya bulunamadı (.exe/.msi/script yok, ISO bağlanamadı); "
                          "dosyanın davranışı incelenmedi — bu sonuç temiz olduğu anlamına gelmez. "
                          + " ".join(x for x in (str((s.get("sandbox") or {}).get("image_note") or ""),
                                                  str(b.get("TargetNote") or "")) if x))
-        else:
+        elif not url_mode:
             stalled = _installer_never_started(b)
             if stalled:
                 missing.append("Kurulum")
@@ -3572,6 +3805,15 @@ def write_report(job: Job) -> None:
         L.append(f"- BİLGİ (CIRCL NSRL bilinen temiz): {', '.join(v['known_good'][:10])}")
     if not v["red"] and not v["notes"] and not v.get("crack"):
         L.append("- Otomatik kontroller kırmızı bayrak bulmadı. Bu dosyanın temiz olduğunu **kanıtlamaz**.")
+    if s.get("mode") == "url":
+        uv = s.get("url_vt") or {}
+        L += ["", "## Bağlantı analizi", "", f"- **Bağlantı:** {s['sample']}"]
+        if uv.get("gui_url"):
+            L.append(f"- **VirusTotal:** {uv.get('malicious', 0)} zararlı / {uv.get('suspicious', 0)} şüpheli — {uv['gui_url']}")
+        elif uv.get("not_found"):
+            L.append("- **VirusTotal:** daha önce taranmamış")
+        for d in s.get("downloads") or []:
+            L.append(f"- **İndirilen:** {d.get('name')} ({d.get('size', 0)} bayt)" + (" — ana bilgisayarda kayboldu" if d.get("missing") else f" sha256 {d.get('sha256', '')}"))
     if v.get("families"):
         L += ["", "## Zararlı ailesi ve ayar (CAPE ayıklayıcıları)", ""]
         L += [f"- **{f['family']}** — {f['label']} ({f['source']})" + (f": {', '.join(f['c2'])}" if f.get("c2") else "")

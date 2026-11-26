@@ -147,6 +147,35 @@ def lookup(sha256: str, key: Optional[str] = None) -> Optional[Dict[str, Any]]:
     return summarize(data, sha256) if data else None
 
 
+def url_id(url: str) -> str:
+    """VirusTotal's URL identifier: unpadded URL-safe base64 of the URL."""
+    import base64
+    return base64.urlsafe_b64encode(url.encode("utf-8")).decode("ascii").strip("=")
+
+
+def lookup_url(url: str, key: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Existing VirusTotal report for a URL (only the address is sent; nothing is submitted for scanning).
+    None when VirusTotal has never seen it."""
+    import hashlib
+    key = key or get_api_key()
+    data = _get(f"{VT_BASE_URL}/urls/{url_id(url)}", key)
+    if not data:
+        return None
+    attr = (data.get("data") or {}).get("attributes") or {}
+    stats = attr.get("last_analysis_stats") or {}
+    flagged = [{"engine": eng, "result": str(r.get("result") or "")}
+               for eng, r in (attr.get("last_analysis_results") or {}).items()
+               if isinstance(r, dict) and r.get("category") in ("malicious", "suspicious")]
+    return {
+        "malicious": int(stats.get("malicious") or 0), "suspicious": int(stats.get("suspicious") or 0),
+        "harmless": int(stats.get("harmless") or 0), "undetected": int(stats.get("undetected") or 0),
+        "final_url": str(attr.get("last_final_url") or "")[:500], "title": str(attr.get("title") or "")[:200],
+        "categories": sorted({str(c) for c in (attr.get("categories") or {}).values()})[:8],
+        "flagged": flagged[:20],
+        "gui_url": "https://www.virustotal.com/gui/url/" + hashlib.sha256(url.encode("utf-8")).hexdigest(),
+    }
+
+
 class StreamingMultipart:
     """File-like multipart/form-data body (one 'file' field) read lazily from disk. requests sends a file-like object
     with a length in chunks, so memory use stays at a few KB whatever the file size."""

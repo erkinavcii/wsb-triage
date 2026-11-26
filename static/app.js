@@ -551,6 +551,7 @@ function renderSandbox(st) {
       + listBox('⚙️ Yeni servisler', P.Services, 'rose') + listBox('🧩 Yeni sürücüler', P.Drivers, 'rose')
       + listBox('🔁 Ayarı değişen mevcut servisler', P.ServicesChanged, 'amber')
       + listBox('💥 Çöken programlar (Windows hata kayıtları)', b.Crashes, 'amber')
+      + listBox('📥 Bağlantının indirdiği dosyalar', asArr(st.downloads).filter(d => d && typeof d === 'object').map(d => `${d.name} (${fmtMB(d.size || 0)})${d.missing ? ' — ana bilgisayarda kayboldu' : ''}`), 'rose')
       + listBox('🔓 Çözülmüş HTTPS istekleri', asArr((b.Https || {}).flows).filter(f => f && typeof f === 'object').map(f => `${f.method} ${f.url} → ${f.status ?? '-'} · gönderilen ${f.req_bytes} bayt${f.req_preview ? ' · ' + String(f.req_preview).slice(0, 160) : ''}`), 'amber')
       + listBox('🧠 Bellek dökümü YARA eşleşmeleri', asArr(b.MemoryYara).filter(h => h && typeof h === 'object').map(h => `${h.rule} — ${h.proc} (pid ${h.pid}): ${h.description}`), 'rose')
       + listBox('⏰ Zamanlanmış görevler', P.Tasks, 'amber') + listBox('📌 Otomatik başlatma (Run/IFEO)', asArr(P.RunKeys).concat(asArr(P.Startup)), 'amber')
