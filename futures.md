@@ -35,3 +35,29 @@ Sınırlar: adres şifreli ayar bloğunda, çalışırken çözülen metinlerde,
   - `Passport.NET` (Microsoft'un eski giriş adresi, Windows bileşenlerinin belleğinde görülüyor)
 - **Disk kullanımı:** Sandbox kapandıktan sonra açılmış disk görüntüsünü (`image_root`, Photoshop'ta ~5,7 GB) silme seçeneği. ISO'daki dosya listesi analiz kaydında saklanır ki "tekrar çalıştır" listesi boş kalmasın; "süre bitince açık bırak" seçiliyse silinmez. Şimdilik kullanıcı elle siliyor.
 - **Özel çizilmiş butonlar:** Adobe kurulumu gibi web tabanlı pencerelerde otomatik tıklayıcı butonları göremiyor (Windows'a buton olarak bildirilmiyorlar). Ekran görüntüsünde butonu görsel olarak bulup tıklamak (OCR / görüntü eşleme) ile çözülebilir.
+
+## Triage (tria.ge) ile karşılaştırma
+
+[Triage](https://tria.ge/) (Recorded Future Sandbox) eksiklerimizi görmek için iyi bir ölçüt. Kendi dokümanlarından (ana sayfa, docs, analysis, FAQ, scoring, live monitor sayfaları) okunanlara göre:
+
+### ⚠️ Kullanırken dikkat
+
+- Ücretsiz sürümde **yüklenen her dosya herkese açık ve silinemiyor**; gizli analiz için ücretli kurumsal sürüm gerekiyor. Kişisel/iş dosyası ya da başkasının telifli yazılımı yüklenmez.
+- Güvenli kullanım **hash ile aramak**: `https://tria.ge/s?q=<sha256>`. Panelde her dosyanın altındaki "Triage ↗" bağlantısı bunu yapıyor. (Otomatik istekler zaman aşımı / 502 aldı; tarayıcıdan bakılmalı.)
+
+### Triage'da olup bizde eksik olanlar
+
+1. **Zararlı ailesi tespiti ve ayar (config) çıkarma — en büyük fark.** Bilinen bir aileyi tanıyınca içindeki ayarı çıkarıyor: komuta sunucusu (C2) adresleri, anahtarlar, botnet/kampanya kimlikleri. Statik ayar çıkarılabiliyorsa davranış analizine gerek kalmadan puan veriyor. Açık kaynak karşılıklar: CAPE sandbox ayar çıkarıcıları, MACO, DC3-MWCP. (Yukarıdaki "koddan nereye gönderiyor" bölümünün hazır cevabı.)
+2. **HTTPS trafiğini çözme.** Ağ kaydında şifresi çözülmüş HTTPS de var. Biz sadece alan adını görüyoruz, içeriği göremiyoruz. Sandbox'a kendi sertifikamızı kurup araya proxy (ör. mitmproxy) koyarak yapılabilir; sertifika sabitleyen programlarda çalışmaz.
+3. **Bellek dökümü üzerinde tarama.** Süreç belleğini döküp tarıyor; paketlenmiş zararlının bellekte açılmış gerçek kodu orada yakalanır. Biz bellekte sadece adres ve birkaç gösterge arıyoruz; YARA kurallarımız bellek dökümünde de çalıştırılabilir (ayar çıkarma da dökümden yapılabilir).
+4. **1–10 puan ve TTP / MITRE ATT&CK eşlemesi.** Puan tetiklenen imzalardan çıkıyor (10 bilinen zararlı aile, 8–9 büyük olasılıkla zararlı, 5–7 şüpheli, 2–4 büyük olasılıkla zararsız, 1 zararlı davranış yok). Bulgularımızı ATT&CK teknik kodlarıyla etiketlemek raporu başka araçlarla karşılaştırılabilir yapar.
+5. **Triage'ı istihbarat kaynağı olarak eklemek.** MalwareBazaar / Hybrid Analysis gibi hash ile API sorgusu (ücretsiz kayıt + API anahtarı, `https://tria.ge/api/v0/`, resmi Python istemcisi `hatching/triage`). Başkası taratmışsa puan ve aile yükleme yapmadan rapora gelir.
+6. **Linux, macOS, Android konukları** — bizim kapsamımız Windows olduğu için eksik sayılmıyor.
+
+### Bizde olup Triage'ın ücretsiz sürümünde olmayanlar (bilinçli tercihler)
+
+Yerel ve gizli çalışma; crack'e özel turuncu sınıf ("crack'te beklenen davranış" ayrımı); yem dosyalar (honeyfile); ev ağı engeli; statik + VirusTotal + diğer istihbarat + davranış aynı raporda.
+
+### Kıyaslama yöntemi
+
+Herkese açık ve Triage'da analizi zaten bulunan **bilinen zararlı örnekleri** (ör. MalwareBazaar'dan, aile etiketli) bizim sandbox'ta çalıştırıp iki raporu yan yana koymak: "onlar buldu, biz bulamadık" listesi hiçbir şey yüklemeden çıkar. Gerçek zararlı indirildiği için yalnızca internet kapalıyken / ev ağı engeli açıkken, şifreli arşivden doğrudan sandbox'a verilerek yapılmalı.
