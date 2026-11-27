@@ -377,15 +377,18 @@ _DOWNLOAD_RX = re.compile(r"^(?P<idx>\d{2})_(?P<name>[A-Za-z0-9_][A-Za-z0-9_. ()
 _DOWNLOAD_MAX = 128 * 1024 * 1024
 
 
-def _collect_downloads(job: Job, out: Path) -> List[Path]:
-    """Files the link made Edge download, written XOR-encoded by the monitor (output/downloads/NN_name.xdl).
-    Decoded into the case folder (never next to the user's files) for static analysis; never run on the host.
-    The host antivirus may remove a decoded file: that is reported, not hidden."""
-    d = out / DOWNLOADS_DIR
+DROPPED_DIR = "dropped"
+
+
+def _collect_xdl(job: Job, out: Path, subdir: str, dest_name: str) -> List[Path]:
+    """Files the monitor copied out XOR-encoded (output/<subdir>/NN_name.xdl): link downloads or files the sample
+    dropped. Decoded into the case folder (never next to the user's files) for static analysis; never run on the
+    host. The host antivirus may remove a decoded file: that is reported, not hidden."""
+    d = out / subdir
     got: List[Path] = []
     if not d.is_dir():
         return got
-    dest = job.case_dir / "downloads"
+    dest = job.case_dir / dest_name
     try:
         for p in sorted(d.iterdir()):
             m = _DOWNLOAD_RX.match(p.name)
@@ -400,35 +403,39 @@ def _collect_downloads(job: Job, out: Path) -> List[Path]:
     return got
 
 
-def _analyze_downloads(job: Job, paths: List[Path]) -> None:
-    """Static analysis + signatures + family/config + VirusTotal hash lookup for downloaded files; results join the
-    normal static list (marked [indirilen]) so the usual verdict rules apply."""
+def _collect_downloads(job: Job, out: Path) -> List[Path]:
+    return _collect_xdl(job, out, DOWNLOADS_DIR, "downloads")
+
+
+def _analyze_extracted(job: Job, paths: List[Path], tag: str, state_key: str, vt_lookup: bool) -> None:
+    """Static analysis + signatures + family/config (+ VirusTotal hash lookup) for files brought out of the sandbox;
+    results join the normal static list (marked [tag]) so the usual verdict rules apply."""
     if not paths:
         return
-    job.stage("sandbox", "running", f"İndirilen {len(paths)} dosya inceleniyor (çalıştırılmadan)...")
+    job.stage("sandbox", "running", f"{len(paths)} dosya ({tag}) inceleniyor (çalıştırılmadan)...")
     time.sleep(AV_SETTLE_SEC)                     # give the host antivirus its chance, then see what is left
     sigs: Dict[str, Dict[str, str]] = {}
     try:
         sigs, _ = check_signatures(job.case_dir, [str(p) for p in paths if p.exists()])
     except Exception as e:  # noqa: BLE001
-        job.log(f"İndirilen dosyaların imzası kontrol edilemedi: {e}")
-    downloads, results = [], []
-    for p in paths[:20]:
+        job.log(f"{tag} dosyaların imzası kontrol edilemedi: {e}")
+    items, results = [], []
+    for p in paths[:25]:
         name = p.name[3:]
         item: Dict[str, Any] = {"name": name, "size": p.stat().st_size if p.exists() else 0}
         if not p.exists():
             item["missing"] = True
-            downloads.append(item)
+            items.append(item)
             continue
         item["sha256"] = hashlib.sha256(p.read_bytes()).hexdigest()
         try:
             res = analyzer.analyze_single_file(str(p), sigs.get(str(p)) or {"status": "Unknown", "message": "", "signer": "", "issuer": ""})
-            res["rel"] = f"[indirilen] {name}"
+            res["rel"] = f"[{tag}] {name}"
             results.append(res)
         except Exception as e:  # noqa: BLE001
-            job.log(f"İndirilen dosya incelenemedi ({name}): {e}")
-        downloads.append(item)
-    job.state["downloads"] = downloads
+            job.log(f"{tag} dosya incelenemedi ({name}): {e}")
+        items.append(item)
+    job.state[state_key] = items
     job.state["static"] = sorted((job.state.get("static") or []) + results, key=lambda x: -x["risk_score"])
     if config_extractor_available():
         cands = [{"label": r["rel"], "path": r["file_path"]} for r in results
@@ -439,20 +446,66 @@ def _analyze_downloads(job: Job, paths: List[Path]) -> None:
             st = job.state.setdefault("families", {"status": "done"})
             st["status"] = "done"
             st["static"] = (st.get("static") or []) + hits
-    key = vt_client.get_api_key()
+    key = vt_client.get_api_key() if vt_lookup else ""
     if key:
-        for item in downloads:
+        for item in items:
             if not item.get("sha256"):
                 continue
-            e = {"rel": f"[indirilen] {item['name']}", "sha256": item["sha256"], "size": item["size"], "status": "Sırada",
+            e = {"rel": f"[{tag}] {item['name']}", "sha256": item["sha256"], "size": item["size"], "status": "Sırada",
                  "result": None, "gui_url": f"https://www.virustotal.com/gui/file/{item['sha256']}"}
             try:
                 e["result"] = vt_client.lookup(item["sha256"], key)
-                e["status"] = "VT'de kayıtlı" if e["result"] else "VT'de yok (indirilen dosya; yüklenmedi)"
+                e["status"] = "VT'de kayıtlı" if e["result"] else f"VT'de yok ({tag} dosya; yüklenmedi)"
             except Exception as ex:  # noqa: BLE001
                 e["status"] = f"Hata: {ex}"
             job.state.setdefault("vt", []).append(e)
-    job.log(f"İndirilen dosyalar: {', '.join(d['name'] + (' (kayboldu)' if d.get('missing') else '') for d in downloads)}")
+    job.log(f"{tag} dosyalar: {', '.join(d['name'] + (' (kayboldu)' if d.get('missing') else '') for d in items)}")
+
+
+def _analyze_downloads(job: Job, paths: List[Path]) -> None:
+    _analyze_extracted(job, paths, "indirilen", "downloads", vt_lookup=True)
+
+
+_SCRIPTBLOCK_MAX_FILE = 4 * 1024 * 1024
+# Blocks powershell.exe itself runs around -Command / -EncodedCommand (seen live: "$global:?" for the exit status).
+_POWERSHELL_HOST_BLOCKS = {"$global:?", "prompt", "exit $LASTEXITCODE"}
+
+
+def _analyze_scriptblocks(job: Job, out: Path) -> None:
+    """PowerShell script blocks (event 4104) the sample's PowerShell processes ran, as PowerShell saw them after its own
+    decoding: obfuscated / -EncodedCommand scripts arrive as plain code. Each goes through the normal static analysis
+    (deobfuscation, YARA, string rules). scriptblocks.json is written inside the sandbox: untrusted data."""
+    p = out / "scriptblocks.json"
+    if not p.is_file() or p.stat().st_size > _SCRIPTBLOCK_MAX_FILE:
+        return
+    data = _read_json(p)
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return
+    dest = job.case_dir / "scriptblocks"
+    blocks, results = [], []
+    for i, b in enumerate([x for x in data if isinstance(x, dict)][:100]):
+        text = b.get("Text")
+        if not isinstance(text, str) or not text.strip() or text.strip() in _POWERSHELL_HOST_BLOCKS:
+            continue
+        pid = b.get("Pid") if isinstance(b.get("Pid"), int) else 0
+        dest.mkdir(exist_ok=True)
+        f = dest / f"{i:02d}_pid{pid}.ps1"
+        f.write_text(text[:524288], encoding="utf-8")
+        blocks.append({"pid": pid, "path": str(b.get("Path") or "")[:300], "chars": len(text),
+                       "parts": b.get("Parts") if isinstance(b.get("Parts"), int) else 1, "preview": text[:300]})
+        try:
+            res = analyzer.analyze_single_file(str(f), {"status": "NotSigned", "message": "", "signer": "", "issuer": ""})
+            res["rel"] = f"[PowerShell betiği] pid {pid} #{i + 1}"
+            results.append(res)
+        except Exception as e:  # noqa: BLE001
+            job.log(f"PowerShell betiği incelenemedi (#{i + 1}): {e}")
+    job.state["scriptblocks"] = blocks
+    if results:
+        job.state["static"] = sorted((job.state.get("static") or []) + results, key=lambda x: -x["risk_score"])
+    if blocks:
+        job.log(f"Örneğin PowerShell süreçleri {len(blocks)} betik bloğu çalıştırdı (4104); çözülmüş hâlleri incelendi.")
 
 
 def _start_vt_thread(job: Job) -> threading.Thread:
@@ -2440,11 +2493,12 @@ def stage_sandbox(job: Job) -> None:
             finally:
                 shutil.rmtree(out / MEMDUMP_DIR, ignore_errors=True)
         downloaded: List[Path] = []
-        if (out / DOWNLOADS_DIR).is_dir():
-            try:
-                downloaded = _collect_downloads(job, out)
-            except Exception as e:  # noqa: BLE001
-                job.log(f"İndirilen dosyalar alınamadı: {e}")
+        dropped_out: List[Path] = []
+        try:
+            downloaded = _collect_downloads(job, out)
+            dropped_out = _collect_xdl(job, out, DROPPED_DIR, "dropped")
+        except Exception as e:  # noqa: BLE001
+            job.log(f"Sandbox'tan dosyalar alınamadı: {e}")
         quarantined = quarantine_output(out)
         job.state["sandbox"]["quarantined"] = quarantined
         job.state["sandbox"]["screenshots"] = list_screenshots(job)
@@ -2462,10 +2516,13 @@ def stage_sandbox(job: Job) -> None:
                                 "QuicBlocked": bool(hs.get("QuicBlocked")), **summarize_https_log(out)}
             job.state["behavior"] = beh
             _check_dropped_files_vt(job, beh)
-            try:
-                _analyze_downloads(job, downloaded)
-            except Exception as e:  # noqa: BLE001 - never lose the sandbox results over the downloads
-                job.log(f"İndirilen dosyalar incelenemedi: {e}")
+            for label, fn in (("indirilen", lambda: _analyze_downloads(job, downloaded)),
+                              ("bırakılan", lambda: _analyze_extracted(job, dropped_out, "bırakılan", "dropped_files", vt_lookup=False)),
+                              ("PowerShell", lambda: _analyze_scriptblocks(job, out))):
+                try:
+                    fn()
+                except Exception as e:  # noqa: BLE001 - never lose the sandbox results over these extras
+                    job.log(f"{label} dosyalar incelenemedi: {e}")
             job.stage("sandbox", "done", f"Tamamlandı. Ağ kaydı: {beh.get('CaptureStatus')}")
         elif job.state["sandbox"].get("monitor_lost"):
             job.stage("sandbox", "error", "İzleyici yanıt vermeyi bıraktı (örnek tarafından durdurulmuş olabilir). Son canlı veriler aşağıda.")
@@ -2488,7 +2545,7 @@ def stage_sandbox(job: Job) -> None:
 
 # Files the monitor itself writes into output/. Anything else was put there by something inside the sandbox.
 OUTPUT_ALLOWLIST = {"live.json", "behavior.json", "status.txt", "timeline.log", "capture.pcapng", "procmon.pml", "procmon_summary.json", "done.flag",
-                    "https_log.jsonl"}
+                    "https_log.jsonl", "scriptblocks.json"}
 _SCREENSHOT_NAME_RX = re.compile(r"^scr_\d{3}\.png$")
 LIVE_SCREEN_NAME = "live.png"   # overwritten every ~5 s by the monitor; shown in the panel, not in the gallery
 _MAX_SCREENSHOTS = 30
@@ -3690,6 +3747,16 @@ def _compute_verdict(job: Job) -> None:
                              "sertifika sabitleme): " + ", ".join(tls_failed[:6]))
         if url_mode:
             _url_findings(s, b, red, notes)
+        dropped_files = s.get("dropped_files") or []
+        if dropped_files:
+            notes.append(f"Örneğin bıraktığı {len(dropped_files)} dosya dışarı alınıp çalıştırılmadan incelendi: "
+                         + ", ".join(d.get("name", "?") for d in dropped_files[:6]))
+            gone = [d["name"] for d in dropped_files if d.get("missing")]
+            if gone:
+                red.append(f"Örneğin bıraktığı dosya ana bilgisayarda açılırken kayboldu (antivirüs zararlı bulup silmiş olabilir): {', '.join(gone[:4])}")
+        if s.get("scriptblocks"):
+            notes.append(f"Örneğin PowerShell süreçleri {len(s['scriptblocks'])} betik çalıştırdı; Windows'un kaydettiği çözülmüş "
+                         "hâlleri ([PowerShell betiği]) statik olarak incelendi.")
         crash_note = _crash_note(b.get("Crashes") or [], bool(crack))
         if crash_note:
             notes.append(crash_note)
@@ -3814,6 +3881,15 @@ def write_report(job: Job) -> None:
             L.append("- **VirusTotal:** daha önce taranmamış")
         for d in s.get("downloads") or []:
             L.append(f"- **İndirilen:** {d.get('name')} ({d.get('size', 0)} bayt)" + (" — ana bilgisayarda kayboldu" if d.get("missing") else f" sha256 {d.get('sha256', '')}"))
+    if s.get("dropped_files"):
+        L += ["", "## Örneğin bıraktığı dosyalar (dışarı alınıp incelendi)", ""]
+        L += [f"- {d.get('name')} ({d.get('size', 0)} bayt)" + (" — ana bilgisayarda kayboldu" if d.get("missing") else f" sha256 {d.get('sha256', '')}")
+              for d in s["dropped_files"]]
+    if s.get("scriptblocks"):
+        L += ["", "## Çalıştırılan PowerShell betikleri (4104, çözülmüş)", ""]
+        for i, sb in enumerate(s["scriptblocks"][:30], 1):
+            prev = str(sb.get("preview") or "").replace("```", "'" * 3)
+            L += [f"### #{i} — pid {sb.get('pid')}, {sb.get('chars')} karakter", "", "```powershell", prev, "```", ""]
     if v.get("families"):
         L += ["", "## Zararlı ailesi ve ayar (CAPE ayıklayıcıları)", ""]
         L += [f"- **{f['family']}** — {f['label']} ({f['source']})" + (f": {', '.join(f['c2'])}" if f.get("c2") else "")

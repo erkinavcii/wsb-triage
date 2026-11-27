@@ -1073,6 +1073,17 @@ if ($cfg.Url -and -not $TestMode) {
     } catch { Log "Edge policies failed: $($_.Exception.Message)" }
 }
 
+# PowerShell script block logging (event 4104): PowerShell writes every script block it runs, AFTER its own
+# decoding, so an obfuscated/encoded script shows up as plain code. Only the sample's processes are kept.
+if (-not $TestMode) {
+    try {
+        $sbk = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging'
+        New-Item -Path $sbk -Force | Out-Null
+        New-ItemProperty -Path $sbk -Name 'EnableScriptBlockLogging' -Value 1 -PropertyType DWord -Force | Out-Null
+        Log 'PowerShell script block logging (4104) enabled'
+    } catch { Log "Script block logging could not be enabled: $($_.Exception.Message)" }
+}
+
 # HTTPS decryption: block QUIC (HTTP/3 over UDP 443) so browsers and Chromium/Go programs fall back to TCP, which
 # the decryptor sees. Created before the baseline, like the LAN block, so it is not reported as a change.
 $script:QuicBlocked = $false
@@ -1391,6 +1402,80 @@ function Save-Downloads {
         } catch { $out += "$($f.Name) failed: $($_.Exception.Message)" }
     }
     if ($out.Count) { Log ('Downloads: ' + ($out -join '; ')) }
+    return $out
+}
+
+# Script blocks (4104) the sample's PowerShell processes ran, re-assembled (a long script is split over several
+# events: MessageNumber of MessageTotal). Properties: 0 MessageNumber, 1 MessageTotal, 2 text, 3 ScriptBlockId, 4 Path.
+# Caps: 100 blocks, 512 KB each, 2 MB in total. Written to scriptblocks.json for the host.
+function Get-SampleScriptBlocks([datetime]$Since) {
+    if ($TestMode) { return @() }
+    $evs = @()
+    try { $evs = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-PowerShell/Operational'; Id = 4104; StartTime = $Since } -ErrorAction Stop) } catch {}
+    $blocks = [ordered]@{}
+    foreach ($e in ($evs | Sort-Object RecordId)) {
+        $epid = [int]$e.ProcessId
+        if (-not $TreePids.ContainsKey($epid)) { continue }
+        $p = $e.Properties
+        if ($p.Count -lt 4) { continue }
+        $id = [string]$p[3].Value
+        if (-not $blocks.Contains($id)) {
+            if ($blocks.Count -ge 100) { continue }
+            $path = ''
+            if ($p.Count -ge 5) { $path = [string]$p[4].Value }
+            $blocks[$id] = [ordered]@{ Id = $id; Pid = $epid; Path = $path; Total = [int]$p[1].Value; Parts = @{} }
+        }
+        $blocks[$id].Parts[[int]$p[0].Value] = [string]$p[2].Value
+    }
+    $out = @()
+    $total = 0
+    foreach ($b in $blocks.Values) {
+        $text = (@($b.Parts.Keys | Sort-Object | ForEach-Object { $b.Parts[$_] }) -join '')
+        if ($text.Length -gt 524288) { $text = $text.Substring(0, 524288) }
+        if ($total + $text.Length -gt 2097152) { break }
+        $total += $text.Length
+        $out += [ordered]@{ Id = $b.Id; Pid = $b.Pid; Path = $b.Path; Parts = $b.Parts.Count; Total = $b.Total; Text = $text }
+    }
+    if ($out.Count) {
+        Write-JsonFile 'scriptblocks.json' @($out) 4
+        Log "PowerShell script blocks from the sample: $($out.Count) ($([Math]::Round($total / 1KB)) KB)"
+    }
+    return @($out | ForEach-Object { "pid $($_.Pid) | $($_.Parts)/$($_.Total) parts | $($_.Text.Length) chars | $($_.Path)" })
+}
+
+# Executables the sample dropped, copied out XOR-encoded (same key as the dumps) so the host can analyze them
+# without running them. Validly signed files, Windows/Edge/SafeBox folders and (link mode) Downloads are skipped;
+# suspicious places first. Caps: 25 files, 32 MB each, 160 MB in total.
+function Save-DroppedFiles($Items) {
+    if ($TestMode) { return @() }
+    $dir = Join-Path $OutputDir 'dropped'
+    $skipRx = '\\EBWebView\\|\\Microsoft\\Edge\\|\\WindowsApps\\|\\SandboxWork\\|\\mitmproxy_windows\\|\\Package Cache\\|\\WinSxS\\'
+    $hotRx = '\\AppData\\|\\Temp\\|\\ProgramData\\|\\Users\\Public\\'
+    $cands = @($Items | Where-Object {
+            $_.SigStatus -ne 'Valid' -and [string]$_.Path -notmatch $skipRx -and [long]$_.Size -le 33554432 -and
+            -not ($cfg.Url -and [string]$_.Path -match '\\Downloads\\') } |
+        Sort-Object @{ E = { if ([string]$_.Path -match $hotRx) { 0 } else { 1 } } }, @{ E = { [long]$_.Size } } |
+        Select-Object -First 25)
+    $out = @()
+    $total = [long]0
+    $i = 0
+    foreach ($c in $cands) {
+        $src = [string]$c.Path
+        if (($total + [long]$c.Size) -gt 167772160 -or -not (Test-Path -LiteralPath $src)) { continue }
+        try {
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            $safe = ([IO.Path]::GetFileName($src) -replace '[^A-Za-z0-9_. ()\[\]-]', '_').TrimStart('.', ' ')
+            if ($safe.Length -gt 120) { $safe = $safe.Substring($safe.Length - 120) }
+            if (-not $safe) { $safe = 'dropped' }
+            $bytes = [IO.File]::ReadAllBytes($src)
+            for ($k = 0; $k -lt $bytes.Length; $k++) { $bytes[$k] = $bytes[$k] -bxor $MemDumpKey[$k % $MemDumpKey.Length] }
+            [IO.File]::WriteAllBytes((Join-Path $dir ('{0:D2}_{1}.xdl' -f $i, $safe)), $bytes)
+            $out += "$src | $($c.Size) | $($c.SHA256)"
+            $total += [long]$c.Size
+            $i++
+        } catch {}
+    }
+    if ($out.Count) { Log ('Dropped files saved: ' + ($out -join '; ')) }
     return $out
 }
 
@@ -1891,6 +1976,9 @@ foreach ($p in ($newExec | Select-Object -First 100)) {
     } catch {}
 }
 
+$droppedSaved = @(Save-DroppedFiles $droppedHashes)
+$scriptBlocks = @(Get-SampleScriptBlocks $startedAt)
+
 $threats = @()
 try {
     $threats = @(Get-MpThreatDetection -ErrorAction Stop | Where-Object { $_.InitialDetectionTime -ge $startedAt.AddMinutes(-1) } | ForEach-Object {
@@ -1922,6 +2010,7 @@ $result = [ordered]@{
     MemoryDumps     = @($memDumps)
     Https           = $script:Https
     Url             = [string]$cfg.Url
+    ScriptBlocks    = @($scriptBlocks)
     Downloads       = @($downloads)
     FakeNetRequests = @($fakeNetReqs)
     AutoClicks      = @($script:ClickedActions)
@@ -1958,6 +2047,7 @@ $result = [ordered]@{
         NewExecutables      = @($newExec | Select-Object -First 1000)
         ModifiedExecutables = @($modExec | Select-Object -First 500)
         DroppedHashes       = @($droppedHashes)
+        DroppedSaved        = @($droppedSaved)
         NewFilesSample      = @($newFiles | Sort-Object | Select-Object -First 1500)
     }
 }
