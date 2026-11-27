@@ -262,7 +262,8 @@ async def index(request: Request, token: Optional[str] = None):
     html_text = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
     safe_tok = html.escape(API_TOKEN, quote=True)
     return HTMLResponse(
-        html_text.replace('<meta name="safebox-token" content="" />', f'<meta name="safebox-token" content="{safe_tok}" />')
+        html_text.replace('<meta name="safebox-token" content="" />', f'<meta name="safebox-token" content="{safe_tok}" />'),
+        headers={"Cache-Control": "no-store"},   # carries the session token; also makes UI updates show up at once
     )
 
 

@@ -1,418 +1,454 @@
 <!DOCTYPE html>
-<html lang="tr" class="dark">
+<html lang="tr" data-theme="dark">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>SafeBox Analiz Merkezi</title>
+  <title>SafeBox</title>
   <meta name="safebox-token" content="" />
   <link rel="icon" href="data:," />
-  <link rel="stylesheet" href="/static/styles.css" />
+  <link rel="stylesheet" href="/static/styles.css?v=3" />
 </head>
-<body class="min-h-screen pb-16">
+<body>
 
-  <!-- ÜST BAR -->
-  <header class="border-b border-slate-800 bg-slate-950/90 sticky top-0 z-40 backdrop-blur">
-    <div class="max-w-7xl mx-auto px-4 py-3.5 flex flex-wrap items-center justify-between gap-3">
-      <div class="flex items-center gap-3">
-        <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-cyan-500 to-blue-600 flex items-center justify-center shadow-lg shadow-cyan-500/20">
-          <svg class="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
-        </div>
-        <div>
-          <h1 class="text-lg font-bold tracking-tight text-white flex items-center gap-2">SafeBox Analiz Merkezi
-            <span class="text-xs px-2 py-0.5 rounded-full bg-cyan-500/15 text-cyan-400 border border-cyan-500/30 font-medium">Yerel & İzole</span></h1>
-          <p class="text-xs text-slate-400">Arşiv açma • Hash & imza • Statik analiz • VirusTotal • Windows Sandbox + ağ kaydı • Rapor</p>
-        </div>
+  <!-- top bar -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark"><i data-ic="shield"></i></div>
+      <div>
+        <h1>SafeBox</h1>
+        <div class="brand-sub">Yerel ve izole dosya / bağlantı analizi</div>
       </div>
-      <div class="flex items-center gap-2.5">
-        <div class="text-xs px-3 py-1.5 rounded-lg border border-slate-700 bg-slate-900 flex items-center gap-2">
-          <span class="w-2 h-2 rounded-full bg-amber-400" id="vtStatusDot"></span><span id="vtStatusText">VT API: kontrol ediliyor...</span>
-        </div>
-        <button id="btnVtModal" class="text-xs font-medium px-3.5 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-slate-700">VirusTotal API Ayarları</button>
-      </div>
+    </div>
+    <div class="topbar-actions">
+      <button id="btnInfra" class="status-pill" title="Analiz altyapısının durumu"><span class="dot" id="infraDot"></span><span id="infraText">Altyapı kontrol ediliyor</span></button>
+      <button id="btnWatchView" class="status-pill hide-sm" title="İndirilenler klasörünü izleme"><i data-ic="inbox"></i><span id="watchPillText">İndirilenler</span></button>
+      <button id="btnVtModal" class="btn btn-sm" title="VirusTotal ve diğer istihbarat anahtarları"><span class="dot" id="vtStatusDot"></span><span id="vtStatusText" class="hide-sm">API anahtarları</span></button>
+      <button id="btnTheme" class="btn btn-sm btn-icon btn-ghost" title="Açık / koyu tema"><i data-ic="moon"></i></button>
     </div>
   </header>
 
-  <main class="max-w-7xl mx-auto px-4 mt-6 space-y-6">
+  <div class="shell">
 
-    <!-- SİSTEM DURUMU -->
-    <section class="glass-card rounded-2xl p-4">
-      <div class="flex flex-wrap items-center justify-between gap-4">
-        <div>
-          <h2 class="text-sm font-semibold text-white">Analiz altyapısı</h2>
-          <p class="text-xs text-slate-400" id="sysSubText">Kontrol ediliyor...</p>
-        </div>
-        <div class="flex flex-wrap items-center gap-2" id="sysCapsBadges"></div>
+    <!-- sidebar: analyses -->
+    <aside class="sidebar">
+      <button id="btnNew" class="btn btn-primary btn-block"><i data-ic="plus"></i> Yeni analiz</button>
+      <div class="sidebar-section grow">
+        <div class="row between"><span class="sidebar-title">Analizler</span><span class="count small" id="jobsCount"></span></div>
+        <input id="jobsSearch" class="input" type="search" placeholder="Dosya adına göre ara" />
+        <div class="seg seg-fill" id="jobsFilter"></div>
+        <div id="jobsList" class="job-list"></div>
+        <div id="jobsPager"></div>
       </div>
-    </section>
-
-    <!-- YENİ ANALİZ -->
-    <section class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-      <div id="dropZone" class="glass-card rounded-2xl p-6 border-2 border-dashed border-slate-700 hover:border-cyan-500/60 transition flex flex-col items-center justify-center text-center cursor-pointer">
-        <input type="file" id="fileInput" class="hidden" multiple />
-        <div class="w-12 h-12 rounded-2xl bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center text-cyan-400 mb-3">
-          <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/></svg>
-        </div>
-        <h3 class="text-sm font-semibold text-white">Dosyayı buraya bırak</h3>
-        <p class="text-xs text-slate-400 mt-1">.exe, .msi, .zip, .rar, .7z... Birden fazla dosya ya da klasör de bırakabilirsin: hepsi tek analiz olarak incelenir.</p>
-        <p class="text-[11px] text-slate-500 mt-2">Birkaç GB'lık kurulumlar ve çok parçalı arşivler için sağdan yol seçin. Seçilen klasör kopyalanmaz, sandbox'a salt okunur bağlanır.</p>
+      <div class="sidebar-foot">
+        <button id="btnCompareModal" class="btn btn-ghost btn-sm btn-block" title="Örneğin resmi kurulum ile crack'li sürüm arasındaki davranış ve dosya farkı"><i data-ic="compare"></i> İki analizi karşılaştır</button>
+        <button id="btnCleanup" class="btn btn-ghost btn-sm btn-block" title="Bitmiş analizlerin klasörlerini siler; orijinal dosyalara dokunulmaz"><i data-ic="trash"></i> 30 günden eskileri sil</button>
       </div>
+    </aside>
 
-      <div class="glass-card rounded-2xl p-6 lg:col-span-2 space-y-4">
-        <div class="flex flex-wrap items-center justify-between gap-2">
-          <h3 class="text-sm font-semibold text-white">Yeni analiz</h3>
-          <button id="btnDemo" class="text-xs px-3 py-1 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 font-medium">⚡ Zararsız demo paketiyle dene</button>
-        </div>
-        <div class="flex flex-wrap gap-2">
-          <input id="pathInput" type="text" placeholder="Dosya, klasör, arşiv yolu ya da incelenecek bağlantı (https://…)" title="Bağlantı yazarsanız bilgisayarınızda açılmaz: sandbox içindeki Edge'de açılır; sayfa, yönlendirmeler ve indirilen dosyalar incelenir (indirilenler çalıştırılmaz). Bağlantı VirusTotal'da da sorgulanır (yalnızca adres gönderilir)." class="flex-1 min-w-[240px] bg-slate-900/90 border border-slate-700 rounded-xl px-3.5 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500" />
-          <button data-browse="file" class="px-3.5 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs text-slate-200 border border-slate-700">📄 Dosya</button>
-          <button data-browse="folder" class="px-3.5 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs text-slate-200 border border-slate-700">📁 Klasör</button>
-        </div>
-        <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
-          <input id="pwInput" type="text" autocomplete="off" placeholder="Arşiv şifresi (varsa)" class="bg-slate-900/90 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500" />
-          <input id="targetInput" type="text" placeholder="Çalıştırılacak dosya (boş = otomatik)" class="bg-slate-900/90 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500" />
-          <input id="targetArgsInput" type="text" placeholder="Komut satırı argümanı (isteğe bağlı)" class="bg-slate-900/90 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500" />
-          <input id="dllExportInput" type="text" placeholder="DLL export adı (tek .dll için, örn. DllRegisterServer)" class="bg-slate-900/90 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500" />
-          <select id="durationInput" class="bg-slate-900/90 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white">
-            <option value="5">Sandbox'ta 5 dk izle</option><option value="10" selected>Sandbox'ta 10 dk izle</option>
-            <option value="15">Sandbox'ta 15 dk izle</option><option value="30">Sandbox'ta 30 dk izle</option><option value="60">Sandbox'ta 60 dk izle</option>
-          </select>
-          <select id="memoryInput" class="bg-slate-900/90 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white" title="Windows Sandbox için ayrılacak RAM miktarı">
-            <option value="2048">Bellek: 2 GB RAM</option>
-            <option value="4096" selected>Bellek: 4 GB RAM (Varsayılan)</option>
-            <option value="8192">Bellek: 8 GB RAM (Ağır Kurulum)</option>
-            <option value="12288">Bellek: 12 GB RAM</option>
-            <option value="16384">Bellek: 16 GB RAM</option>
-          </select>
-          <select id="backendInput" class="bg-slate-900/90 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white sm:col-span-2" title="Örneğin çalıştırılacağı izole ortam">
-            <option value="wsb" selected>Ortam: Windows Sandbox (tek kullanımlık)</option>
-            <option value="vbox">Ortam: VirtualBox Sanal Makine (snapshot geri dönüşlü)</option>
-          </select>
-        </div>
-        <div id="vboxOpts" class="hidden grid grid-cols-1 sm:grid-cols-2 gap-2 p-3 rounded-xl bg-slate-900/80 border border-indigo-500/30">
-          <select id="vboxVmInput" class="bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white"></select>
-          <select id="vboxSnapInput" class="bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white"><option value="">Son SafeBox_Temiz snapshot</option></select>
-          <input id="vboxUserInput" type="text" placeholder="VM Windows kullanıcı adı" class="bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white placeholder-slate-500" />
-          <input id="vboxPassInput" type="password" autocomplete="off" placeholder="VM Windows parolası (saklanmaz)" class="bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white placeholder-slate-500" />
-        </div>
-        <div class="flex flex-wrap gap-2 text-xs">
-          <label class="flex items-center gap-2 bg-slate-900/90 px-3 py-2 rounded-xl border border-slate-700 cursor-pointer" title="Açıkken trafik Wireshark formatında kaydedilir. Ev ağınız (modem, NAS, diğer bilgisayarlar) ve ana bilgisayar sandbox içinden güvenlik duvarıyla engellenir; engel kaldırılmaya çalışılırsa kırmızı bayrak verilir.">
-            <input type="checkbox" id="optNetwork" checked /> Sandbox'ta internet açık (trafiği kaydet, ev ağı engelli)</label>
-          <label class="flex items-center gap-2 bg-slate-900/90 px-3 py-2 rounded-xl border border-slate-700 cursor-pointer" title="VT'nin bilmediği dosyalar yüklenir. Yüklenen dosyaları VT'nin ücretli kullanıcıları indirebilir; kişisel dosya vermeyin.">
-            <input type="checkbox" id="optUpload" checked /> Bilinmeyen dosyaları VT'ye yükle</label>
-          <label class="flex items-center gap-2 bg-slate-900/90 px-3 py-2 rounded-xl border border-slate-700 cursor-pointer">
-            <input type="checkbox" id="optSandbox" checked /> VT'den sonra Sandbox'ı otomatik başlat</label>
-          <label class="flex items-center gap-2 bg-slate-900/90 px-3 py-2 rounded-xl border border-slate-700 cursor-pointer">
-            <input type="checkbox" id="optKeepOpen" /> Süre bitince sandbox'ı kapatma</label>
-          <label class="flex items-center gap-2 bg-slate-900/90 px-3 py-2 rounded-xl border border-slate-700 cursor-pointer" title="Açık: sandbox penceresi açılınca öne gelir, kurulumu kendiniz ilerletebilirsiniz. Kapalı: pencere diğer pencerelerin arkasına alınır, analiz arka planda sürer ve paneldeki canlı ekrandan izlenir.">
-            <input type="checkbox" id="optShowWindow" /> Sandbox penceresini ekranda göster</label>
-          <label class="flex items-center gap-2 bg-slate-900/90 px-3 py-2 rounded-xl border border-slate-700 cursor-pointer" title="Photoshop gibi ekran kartı isteyen programlar için. Ana bilgisayarın ekran kartı sürücüsü sandbox'a açılır; yalıtım daha zayıf olur. Tanımadığınız/şüpheli dosyalarda kapalı tutun.">
-            <input type="checkbox" id="optVgpu" /> Sandbox'a ekran kartı ver (GPU) ⚠️</label>
-          <label class="flex items-center gap-2 bg-slate-900/90 px-3 py-2 rounded-xl border border-slate-700 cursor-pointer" title="Sandbox içinde mitmproxy çalışır; şifreli (HTTPS) trafiğin içeriği (gönderilen veriler, tam adresler) rapora girer. İnternet açık olmalı. Kendi sertifikasını bekleyen programlar (bazı kurulumlar, güncelleyiciler) bağlanamayabilir, bu da davranışı değiştirebilir.">
-            <input type="checkbox" id="optHttps" /> HTTPS trafiğini çöz (mitmproxy) ⚠️</label>
-          <label class="flex items-center gap-2 bg-slate-900/90 px-3 py-2 rounded-xl border border-slate-700 cursor-pointer" title="Sandbox içinde fareyi gerçekçi biçimde hareket ettirir ve kurulum pencerelerindeki İleri/Yükle/Kabul düğmelerine otomatik tıklar.">
-            <input type="checkbox" id="optSimUser" checked /> Sahte kullanıcı hareketi (otomatik tıkla)</label>
-          <label class="flex items-center gap-2 bg-slate-900/90 px-3 py-2 rounded-xl border border-slate-700 cursor-pointer" title="Örneği sandbox içinde yönetici yerine standart kullanıcı haklarıyla başlatmayı dener.">
-            <input type="checkbox" id="optStdUser" /> Standart kullanıcı yetkisi (admin değil)</label>
-          <label class="flex items-center gap-2 bg-slate-900/90 px-3 py-2 rounded-xl border border-slate-700 cursor-pointer" title="Sahte tarayıcı/cüzdan/belge yemleri oluşturup okuma veya şifreleme girişimlerini yakalar.">
-            <input type="checkbox" id="optHoneyfiles" checked /> Yem dosyalar (honeyfiles)</label>
-          <label class="flex items-center gap-2 bg-slate-900/90 px-3 py-2 rounded-xl border border-slate-700 cursor-pointer" title="İnternet kapalıyken sandbox içinde sahte DNS (UDP 53) ve HTTP (TCP 80) sunucusu çalıştırıp örneğin bağlanmaya çalıştığı adresleri yakalar.">
-            <input type="checkbox" id="optFakeNet" /> FakeNet (ağ kapalıyken sahte DNS/HTTP tuzağı)</label>
-          <label class="flex items-center gap-2 bg-slate-900/90 px-3 py-2 rounded-xl border border-slate-700 cursor-pointer" title="Analiz tamamlandığında veya kırmızı bayrak çıktığında Windows masaüstü bildirimi gönderir.">
-            <input type="checkbox" id="optNotify" checked /> Analiz bitince Windows bildirimi göster</label>
-        </div>
-        <div class="flex justify-end">
-          <button id="btnStart" class="px-6 py-2.5 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-sm font-semibold text-white shadow-lg shadow-cyan-500/20">Analizi Başlat</button>
-        </div>
-      </div>
-    </section>
+    <main class="main">
 
-    <!-- İNDİRİLENLER İZLEME + GEÇMİŞ -->
-    <section class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-      <div class="glass-card rounded-2xl p-5 space-y-3">
-        <div class="flex flex-wrap items-center justify-between gap-2">
-          <h3 class="text-sm font-semibold text-white">📥 İndirilenler klasörünü izle</h3>
-          <div class="flex items-center gap-3 text-xs">
-            <label class="flex items-center gap-1.5 cursor-pointer"><input type="checkbox" id="watchEnabled" /> Açık</label>
-            <label class="flex items-center gap-1.5 cursor-pointer" title="Yeni dosya indirilince analiz otomatik başlar. VirusTotal'e dosya yüklenmez, sadece hash sorulur. Sandbox adımı sizin onayınızı bekler."><input type="checkbox" id="watchAuto" /> Otomatik analiz et</label>
+      <!-- ============================================================ new analysis wizard -->
+      <section id="viewNew" class="view">
+        <div class="view-head">
+          <div>
+            <h2>Yeni analiz</h2>
+            <p>Neyi inceleyeceğinizi seçin, bir profil seçin, gerekirse ayarları değiştirin ve başlatın.</p>
           </div>
+          <button id="btnDemo" class="btn btn-sm" title="İçinde zararsız bir test betiği olan hazır paketle tüm akışı dener">Zararsız demo ile dene</button>
         </div>
-        <div class="flex gap-2">
-          <input id="watchFolder" type="text" class="flex-1 bg-slate-900/90 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white" />
-          <button id="btnWatchSave" class="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs text-slate-200 border border-slate-700">Kaydet</button>
-        </div>
-        <p class="text-[11px] text-slate-500">İndirmesi biten yeni dosyalar burada listelenir. Otomatik modda VirusTotal'e hiçbir dosya yüklenmez (sadece hash sorgusu) ve sandbox adımı onayınızı bekler, çünkü örneği çalıştırır.</p>
-        <div id="watchList" class="space-y-1.5 max-h-48 overflow-y-auto text-xs text-slate-400">—</div>
-      </div>
-      <div class="glass-card rounded-2xl p-5 space-y-3">
-        <div class="flex flex-wrap items-center justify-between gap-2">
-          <h3 class="text-sm font-semibold text-white">🗂️ Geçmiş analizler</h3>
-          <div class="flex items-center gap-2">
-            <button id="btnCompareModal" class="text-[11px] px-2.5 py-1 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-300 border border-indigo-500/40" title="Örn. resmi kurulum ile crack'li sürüm arasındaki davranış/dosya farkını göster">⚖️ Karşılaştır</button>
-            <button id="btnCleanup" class="text-[11px] px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300" title="Bitmiş analizlerin klasörlerini siler; orijinal dosyalara dokunulmaz.">30 günden eskileri sil</button>
-          </div>
-        </div>
-        <div id="jobsList" class="space-y-1.5 max-h-60 overflow-y-auto text-xs text-slate-400">—</div>
-      </div>
-    </section>
 
-    <!-- AKTİF ANALİZ -->
-    <section id="jobSection" class="hidden space-y-6">
-      <div class="glass-card rounded-2xl p-5 space-y-4">
-        <div class="flex flex-wrap items-start justify-between gap-3">
-          <div class="min-w-0">
-            <div class="text-xs text-slate-400">Analiz edilen</div>
-            <div class="text-sm mono text-cyan-300 break-all" id="jobSample">-</div>
-            <div class="text-[11px] text-slate-500 mt-0.5" id="jobMeta"></div>
-          </div>
-          <div class="flex flex-wrap gap-2" id="jobButtons"></div>
+        <div class="stepper" id="stepper">
+          <button class="step" data-step="0"><span class="step-num">1</span><span class="step-text"><span class="step-name">Kaynak</span><span class="step-sub" id="stepSub0">Dosya, klasör veya bağlantı</span></span></button>
+          <button class="step" data-step="1"><span class="step-num">2</span><span class="step-text"><span class="step-name">Profil</span><span class="step-sub" id="stepSub1">Nasıl incelensin?</span></span></button>
+          <button class="step" data-step="2"><span class="step-num">3</span><span class="step-text"><span class="step-name">Ayarlar</span><span class="step-sub" id="stepSub2">İsteğe bağlı ince ayar</span></span></button>
+          <button class="step" data-step="3"><span class="step-num">4</span><span class="step-text"><span class="step-name">Özet ve başlat</span><span class="step-sub" id="stepSub3">Kontrol edip başlatın</span></span></button>
         </div>
-        <div id="jobBanner"></div>
-        <div id="verdictBox"></div>
-        <ol id="stageList" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-2"></ol>
-      </div>
 
-      <div id="vtSection" class="glass-card rounded-2xl p-5 space-y-3 hidden">
-        <h3 class="text-sm font-semibold text-white">🛡️ VirusTotal sonuçları</h3>
-        <div class="overflow-x-auto max-h-96"><table class="tbl w-full text-xs" id="vtTable"></table></div>
-      </div>
+        <div class="card">
+          <div class="wiz-body">
 
-      <div id="sbSection" class="glass-card rounded-2xl p-5 space-y-4 hidden border border-indigo-500/40">
-        <div class="flex flex-wrap items-center justify-between gap-2">
-          <h3 class="text-sm font-semibold text-white flex items-center gap-2"><span id="sbPulse" class="w-2.5 h-2.5 rounded-full bg-slate-500"></span> Windows Sandbox davranışı</h3>
-          <span class="text-xs text-slate-400" id="sbStatusText"></span>
-        </div>
-        <div class="grid grid-cols-2 md:grid-cols-4 gap-3" id="sbCounters"></div>
-        <div id="sbLiveWrap" class="hidden space-y-2">
-          <div class="flex flex-wrap items-center justify-between gap-2">
-            <div class="text-xs font-semibold text-emerald-300">🔴 Canlı sandbox ekranı <span id="sbLiveAge" class="text-slate-500 font-normal"></span></div>
-            <div class="flex items-center gap-2">
-              <span id="sbFocusMsg" class="text-[11px] text-slate-400"></span>
-              <button id="btnSbFocus" class="text-xs px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200">🖥️ Sandbox penceresini öne getir</button>
-              <button id="btnSbBack" class="text-xs px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200">⬇️ Arka plana al</button>
+            <!-- step 1: source -->
+            <div data-pane="0" class="stack-lg">
+              <div class="group-head">
+                <h3>Ne incelenecek?</h3>
+                <p>Dosya ya da klasör statik olarak incelenir, VirusTotal'da sorgulanır ve Windows Sandbox içinde çalıştırılıp izlenir. Bağlantılar sandbox içindeki tarayıcıda açılır.</p>
+              </div>
+              <div class="seg" id="srcMode">
+                <button class="seg-btn active" data-src="file"><i data-ic="file"></i> Dosya veya klasör</button>
+                <button class="seg-btn" data-src="url"><i data-ic="link"></i> Bağlantı (URL)</button>
+              </div>
+
+              <div id="srcFile" class="stack">
+                <div id="dropZone" class="dropzone">
+                  <input type="file" id="fileInput" class="hidden" multiple />
+                  <div class="dropzone-icon"><i data-ic="upload"></i></div>
+                  <div class="strong">Dosyaları buraya bırakın ya da tıklayıp seçin</div>
+                  <div class="hint">.exe, .msi, .zip, .rar, .7z, .iso… Birden fazla dosya ya da klasör tek analiz olarak incelenir. Panele bırakma sınırı 4 GB.</div>
+                </div>
+                <div class="field">
+                  <label class="label" for="pathInput">Ya da diskteki yolu verin</label>
+                  <div class="row">
+                    <input id="pathInput" class="input" type="text" placeholder="C:\Kurulumlar\program.zip" />
+                    <button class="btn" data-browse="file"><i data-ic="file"></i> Dosya</button>
+                    <button class="btn" data-browse="folder"><i data-ic="folder"></i> Klasör</button>
+                  </div>
+                  <div class="hint">Büyük kurulumlar ve çok parçalı arşivler için bunu kullanın: seçilen yol kopyalanmaz, sandbox'a salt okunur bağlanır.</div>
+                </div>
+                <div class="field">
+                  <label class="label" for="pwInput">Arşiv şifresi</label>
+                  <input id="pwInput" class="input" type="text" autocomplete="off" placeholder="Şifre yoksa boş bırakın" />
+                </div>
+              </div>
+
+              <div id="srcUrl" class="stack hidden">
+                <div class="field">
+                  <label class="label" for="urlInput">İncelenecek bağlantı</label>
+                  <input id="urlInput" class="input input-lg" type="text" placeholder="https://ornek.com/indir" />
+                </div>
+                <div class="callout tone-low">
+                  <i data-ic="info"></i>
+                  <div>
+                    <div class="callout-title">Bağlantı bu bilgisayarda açılmaz</div>
+                    <div class="callout-body">Sandbox içindeki Edge'de açılır. Sayfa, yönlendirmeler ve indirilen dosyalar incelenir; indirilen dosyalar çalıştırılmaz. Bağlantının adresi VirusTotal'da sorgulanır (yalnızca adres gönderilir). Bu modda internet ve HTTPS çözme her zaman açıktır.</div>
+                  </div>
+                </div>
+              </div>
+
+              <div id="pickedBox"></div>
+            </div>
+
+            <!-- step 2: profile -->
+            <div data-pane="1" class="stack-lg hidden">
+              <div class="group-head">
+                <h3>Nasıl incelensin?</h3>
+                <p>Bir profil seçin; ayarları bir sonraki adımda tek tek değiştirebilirsiniz. Emin değilseniz <b>Standart</b> çoğu dosya için uygundur.</p>
+              </div>
+              <div class="preset-grid" id="presetGrid"></div>
+              <div id="presetNote"></div>
+            </div>
+
+            <!-- step 3: settings -->
+            <div data-pane="2" class="hidden">
+              <div class="settings">
+                <nav class="subnav" id="setNav">
+                  <button class="subnav-btn active" data-group="run"><i data-ic="play"></i> Çalıştırma <span class="count" data-group-count="run"></span></button>
+                  <button class="subnav-btn" data-group="env"><i data-ic="monitor"></i> Ortam ve pencere <span class="count" data-group-count="env"></span></button>
+                  <button class="subnav-btn" data-group="net"><i data-ic="globe"></i> Ağ <span class="count" data-group-count="net"></span></button>
+                  <button class="subnav-btn" data-group="user"><i data-ic="user"></i> Kullanıcı ve tuzaklar <span class="count" data-group-count="user"></span></button>
+                  <button class="subnav-btn" data-group="intel"><i data-ic="search"></i> İstihbarat ve bildirim <span class="count" data-group-count="intel"></span></button>
+                </nav>
+
+                <div>
+                  <div data-group-pane="run" class="stack">
+                    <div class="group-head"><h3>Çalıştırma</h3><p>Sandbox'ta neyin, ne kadar süre ve hangi kaynaklarla çalıştırılacağı.</p></div>
+                    <div class="grid-2">
+                      <div class="field span-all">
+                        <label class="label" for="targetInput">Çalıştırılacak dosya</label>
+                        <input id="targetInput" class="input" type="text" placeholder="Boş bırakın: kurulum dosyası otomatik seçilir" />
+                        <div class="hint">Arşivin ya da klasörün içindeki göreli yol, örn. <span class="mono">Set-up.exe</span>. Analiz başladıktan sonra listeden de seçebilirsiniz.</div>
+                      </div>
+                      <div class="field">
+                        <label class="label" for="targetArgsInput">Komut satırı argümanı</label>
+                        <input id="targetArgsInput" class="input" type="text" placeholder="İsteğe bağlı" />
+                      </div>
+                      <div class="field">
+                        <label class="label" for="dllExportInput">DLL export adı</label>
+                        <input id="dllExportInput" class="input" type="text" placeholder="Tek .dll için, örn. DllRegisterServer" />
+                      </div>
+                      <div class="field">
+                        <label class="label" for="durationInput">İzleme süresi</label>
+                        <select id="durationInput" class="select">
+                          <option value="5">5 dakika</option><option value="10" selected>10 dakika</option>
+                          <option value="15">15 dakika</option><option value="30">30 dakika</option><option value="60">60 dakika</option>
+                        </select>
+                      </div>
+                      <div class="field">
+                        <label class="label" for="memoryInput">Sandbox belleği</label>
+                        <select id="memoryInput" class="select">
+                          <option value="2048">2 GB</option>
+                          <option value="4096" selected>4 GB (varsayılan)</option>
+                          <option value="8192">8 GB (büyük kurulumlar)</option>
+                          <option value="12288">12 GB</option>
+                          <option value="16384">16 GB</option>
+                        </select>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div data-group-pane="env" class="stack hidden">
+                    <div class="group-head"><h3>Ortam ve pencere</h3><p>Örneğin çalışacağı izole ortam ve sandbox penceresinin davranışı.</p></div>
+                    <div class="field">
+                      <label class="label" for="backendInput">İzole ortam</label>
+                      <select id="backendInput" class="select">
+                        <option value="wsb" selected>Windows Sandbox (her seferinde sıfırdan, tek kullanımlık)</option>
+                        <option value="vbox">VirtualBox sanal makine (snapshot'a geri dönerek)</option>
+                      </select>
+                    </div>
+                    <div id="vboxOpts" class="panel grid-2 hidden">
+                      <div class="field"><label class="label" for="vboxVmInput">Sanal makine</label><select id="vboxVmInput" class="select"></select></div>
+                      <div class="field"><label class="label" for="vboxSnapInput">Snapshot</label><select id="vboxSnapInput" class="select"><option value="">Son SafeBox_Temiz snapshot</option></select></div>
+                      <div class="field"><label class="label" for="vboxUserInput">VM Windows kullanıcı adı</label><input id="vboxUserInput" class="input" type="text" /></div>
+                      <div class="field"><label class="label" for="vboxPassInput">VM Windows parolası</label><input id="vboxPassInput" class="input" type="password" autocomplete="off" placeholder="Saklanmaz" /></div>
+                    </div>
+                    <div class="opt-list">
+                      <label class="opt"><input type="checkbox" class="switch" id="optShowWindow" /><span class="opt-text"><span class="opt-title">Sandbox penceresini ekranda göster</span><span class="opt-desc">Açıkken pencere öne gelir ve kurulumu kendiniz ilerletebilirsiniz. Kapalıyken arka planda çalışır; paneldeki canlı ekrandan izlersiniz.</span></span></label>
+                      <label class="opt"><input type="checkbox" class="switch" id="optKeepOpen" /><span class="opt-text"><span class="opt-title">Süre bitince sandbox'ı kapatma</span><span class="opt-desc">Kayıt alındıktan sonra sandbox açık kalır, içinde elle inceleme yapabilirsiniz.</span></span></label>
+                      <label class="opt"><input type="checkbox" class="switch" id="optVgpu" /><span class="opt-text"><span class="opt-title">Ekran kartı ver (GPU) <span class="chip tone-high">Yalıtımı zayıflatır</span></span><span class="opt-desc">Photoshop gibi ekran kartı isteyen programlar için. Ana bilgisayarın ekran kartı sürücüsü sandbox'a açılır; tanımadığınız dosyalarda kapalı tutun.</span></span></label>
+                    </div>
+                  </div>
+
+                  <div data-group-pane="net" class="stack hidden">
+                    <div class="group-head"><h3>Ağ</h3><p>Örneğin internete çıkıp çıkamayacağı ve trafiğin nasıl kaydedileceği.</p></div>
+                    <div class="opt-list">
+                      <label class="opt"><input type="checkbox" class="switch" id="optNetwork" checked /><span class="opt-text"><span class="opt-title">İnternet açık</span><span class="opt-desc">Trafik Wireshark biçiminde kaydedilir. Ev ağınız (modem, NAS, diğer bilgisayarlar) ve bu bilgisayar sandbox içinden engellenir; engeli kaldırma girişimi kırmızı bulgu olur.</span></span></label>
+                      <label class="opt"><input type="checkbox" class="switch" id="optHttps" /><span class="opt-text"><span class="opt-title">HTTPS trafiğini çöz <span class="chip tone-med">Davranışı değiştirebilir</span></span><span class="opt-desc">Sandbox içinde mitmproxy çalışır; şifreli trafiğin içeriği (gönderilen veriler, tam adresler) rapora girer. Kendi sertifikasını bekleyen programlar bağlanamayabilir. İnternet açık olmalı.</span></span></label>
+                      <label class="opt"><input type="checkbox" class="switch" id="optFakeNet" /><span class="opt-text"><span class="opt-title">Sahte DNS / HTTP tuzağı (FakeNet)</span><span class="opt-desc">İnternet kapalıyken sandbox içinde sahte DNS ve HTTP sunucusu çalışır; örneğin bağlanmaya çalıştığı adresler yakalanır.</span></span></label>
+                    </div>
+                  </div>
+
+                  <div data-group-pane="user" class="stack hidden">
+                    <div class="group-head"><h3>Kullanıcı ve tuzaklar</h3><p>Sandbox'ı gerçek bir bilgisayar gibi göstermek ve veri çalma girişimlerini yakalamak için.</p></div>
+                    <div class="opt-list">
+                      <label class="opt"><input type="checkbox" class="switch" id="optSimUser" checked /><span class="opt-text"><span class="opt-title">Sahte kullanıcı hareketi</span><span class="opt-desc">Fareyi gerçekçi biçimde hareket ettirir, kurulum pencerelerindeki İleri / Yükle / Kabul düğmelerine otomatik tıklar.</span></span></label>
+                      <label class="opt"><input type="checkbox" class="switch" id="optStdUser" /><span class="opt-text"><span class="opt-title">Standart kullanıcı yetkisiyle çalıştır</span><span class="opt-desc">Örneği yönetici yerine standart kullanıcı olarak başlatmayı dener; yetki yükseltme girişimleri görünür olur.</span></span></label>
+                      <label class="opt"><input type="checkbox" class="switch" id="optHoneyfiles" checked /><span class="opt-text"><span class="opt-title">Yem dosyalar</span><span class="opt-desc">Sahte tarayıcı, cüzdan ve belge dosyaları oluşturur; okunurlarsa ya da şifrelenirlerse kırmızı bulgu olur.</span></span></label>
+                    </div>
+                  </div>
+
+                  <div data-group-pane="intel" class="stack hidden">
+                    <div class="group-head"><h3>İstihbarat ve bildirim</h3><p>VirusTotal kullanımı, adımların sırası ve bitiş bildirimi.</p></div>
+                    <div class="opt-list">
+                      <label class="opt"><input type="checkbox" class="switch" id="optUpload" checked /><span class="opt-text"><span class="opt-title">VirusTotal'ın bilmediği dosyaları yükle <span class="chip tone-med">Gizlilik</span></span><span class="opt-desc">Yüklenen dosyaları VirusTotal'ın ücretli kullanıcıları indirebilir. Kişisel belge içeren dosyalarda kapatın; kapalıyken yalnızca hash sorulur.</span></span></label>
+                      <label class="opt"><input type="checkbox" class="switch" id="optSandbox" checked /><span class="opt-text"><span class="opt-title">Sandbox'ı otomatik başlat</span><span class="opt-desc">Kapalıyken yalnızca statik analiz ve VirusTotal yapılır; sandbox adımı sizin onayınızı bekler.</span></span></label>
+                      <label class="opt"><input type="checkbox" class="switch" id="optNotify" checked /><span class="opt-text"><span class="opt-title">Bitince Windows bildirimi göster</span><span class="opt-desc">Analiz tamamlandığında ya da kırmızı bulgu çıktığında masaüstü bildirimi gönderir.</span></span></label>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- step 4: summary -->
+            <div data-pane="3" class="stack-lg hidden">
+              <div class="group-head"><h3>Özet</h3><p>Seçimlerinizi kontrol edin. Değiştirmek istediğiniz bölümün yanındaki "Düzenle"ye basın.</p></div>
+              <div id="wizSummary" class="stack"></div>
             </div>
           </div>
-          <img id="sbLiveImg" class="sb-live" alt="Sandbox ekranının canlı görüntüsü" />
-          <div class="text-[11px] text-slate-500">Görüntü birkaç saniyede bir yenilenir. Kurulumda tıklamanız gereken bir pencere varsa "öne getir" ile sandbox penceresine geçip butona kendiniz basabilirsiniz; işiniz bitince "arka plana al" ile geri gönderin. Sandbox her iki durumda da çalışmaya devam eder.</div>
-        </div>
-        <div id="sbScreenshotsWrap" class="hidden space-y-2">
-          <div class="text-xs font-semibold text-indigo-300">📸 Sandbox ekran görüntüleri (<span id="sbShotCount">0</span>)</div>
-          <div id="sbScreenshots" class="grid grid-cols-2 md:grid-cols-4 gap-3"></div>
-        </div>
-        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3" id="sbPersistence"></div>
-        <div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
-          <div><div class="text-xs font-semibold text-cyan-300 mb-1">⚙️ Başlayan işlemler</div>
-            <div class="overflow-auto max-h-80 rounded-lg border border-slate-800"><table class="tbl w-full text-[11px]" id="sbProcs"></table></div></div>
-          <div><div class="text-xs font-semibold text-purple-300 mb-1">🌐 TCP bağlantıları</div>
-            <div class="overflow-auto max-h-80 rounded-lg border border-slate-800"><table class="tbl w-full text-[11px]" id="sbConns"></table></div></div>
-        </div>
-      </div>
 
-      <div id="netSection" class="glass-card rounded-2xl p-5 space-y-3 hidden">
-        <h3 class="text-sm font-semibold text-white">📡 Ağ kaydı özeti (Wireshark / tshark)</h3>
-        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4" id="netBody"></div>
-      </div>
-
-      <div id="staticSection" class="space-y-4 hidden">
-        <div class="flex flex-wrap items-center justify-between gap-2">
-          <h3 class="text-base font-bold text-white">🔍 Statik analiz — en riskliden sıralı</h3>
-          <div id="staticFilter" class="flex flex-wrap items-center gap-2 text-xs"></div>
-        </div>
-        <div id="filesContainer" class="space-y-4"></div>
-        <div id="staticFilterEmpty" class="hidden text-xs text-slate-400">Bu filtreye uyan dosya yok.</div>
-      </div>
-
-      <details class="glass-card rounded-2xl p-4">
-        <summary class="text-xs text-slate-400 cursor-pointer">İşlem günlüğü</summary>
-        <div id="jobLog" class="mt-2 text-[11px] mono text-slate-400 space-y-0.5 max-h-64 overflow-y-auto"></div>
-      </details>
-    </section>
-  </main>
-
-  <!-- VT MODAL -->
-  <div id="vtModal" class="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 hidden items-center justify-center p-4">
-    <div class="glass-card rounded-2xl max-w-lg w-full p-6 space-y-4">
-      <div class="flex items-center justify-between">
-        <h3 class="text-base font-bold text-white">API anahtarları &amp; tehdit istihbaratı</h3>
-        <button data-close="vtModal" class="text-slate-400 hover:text-white text-lg">&times;</button>
-      </div>
-      <ol class="list-decimal list-inside space-y-1 text-xs text-slate-300 bg-slate-900/90 p-4 rounded-xl border border-slate-800">
-        <li><a href="https://www.virustotal.com/gui/join-us" target="_blank" rel="noopener" class="text-cyan-400 underline">virustotal.com</a>'dan ücretsiz API anahtarı alabilirsiniz.</li>
-        <li>VT kotası dolduğunda veya VT anahtarı olmadığında yedek olarak <a href="https://bazaar.abuse.ch/" target="_blank" rel="noopener" class="text-cyan-400 underline">MalwareBazaar</a> ve <a href="https://www.hybrid-analysis.com/" target="_blank" rel="noopener" class="text-cyan-400 underline">Hybrid Analysis</a> yalnızca hash sorgular (dosya yüklemez).</li>
-        <li>Anahtarlar bu bilgisayarda config.json içinde saklanır.</li>
-      </ol>
-      <div class="space-y-3 text-xs">
-        <div>
-          <div class="flex items-center justify-between mb-1">
-            <label class="text-slate-400">VirusTotal API Anahtarı <span id="vtCurStatus" class="text-slate-500"></span></label>
-            <label class="flex items-center gap-1 text-rose-300 cursor-pointer"><input type="checkbox" id="vtClearInput" /> Temizle</label>
+          <div class="wiz-foot">
+            <button id="wizBack" class="btn"><i data-ic="left"></i> Geri</button>
+            <span id="wizHint" class="hint grow"></span>
+            <button id="wizSkip" class="btn btn-ghost hidden">Doğrudan özete geç</button>
+            <button id="wizNext" class="btn btn-primary">İleri <i data-ic="right"></i></button>
+            <button id="btnStart" class="btn btn-primary btn-lg hidden"><i data-ic="play"></i> Analizi başlat</button>
           </div>
-          <input id="vtApiKeyInput" type="password" placeholder="VT API anahtarı (değiştirmek için yazın)" class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2 text-sm text-white focus:outline-none focus:border-cyan-500" />
         </div>
-        <div>
-          <div class="flex items-center justify-between mb-1">
-            <label class="text-slate-400">MalwareBazaar Auth-Key (isteğe bağlı) <span id="mbCurStatus" class="text-slate-500"></span></label>
-            <label class="flex items-center gap-1 text-rose-300 cursor-pointer"><input type="checkbox" id="mbClearInput" /> Temizle</label>
+      </section>
+
+      <!-- ============================================================ job view -->
+      <section id="jobSection" class="view hidden">
+        <div class="card">
+          <div class="job-head">
+            <div class="grow">
+              <div class="job-title break" id="jobTitle">-</div>
+              <div class="job-path mono break" id="jobSample"></div>
+              <div class="meta-row" id="jobMeta"></div>
+            </div>
+            <div class="actions" id="jobButtons"></div>
           </div>
-          <input id="mbApiKeyInput" type="password" placeholder="abuse.ch Auth-Key (varsa)" class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2 text-sm text-white focus:outline-none focus:border-cyan-500" />
+          <div class="mt" id="stageList"></div>
         </div>
+        <div id="jobBanner"></div>
         <div>
-          <div class="flex items-center justify-between mb-1">
-            <label class="text-slate-400">Hybrid Analysis API Anahtarı (isteğe bağlı) <span id="haCurStatus" class="text-slate-500"></span></label>
-            <label class="flex items-center gap-1 text-rose-300 cursor-pointer"><input type="checkbox" id="haClearInput" /> Temizle</label>
+          <nav class="tabs" id="jobTabs"></nav>
+          <div class="tab-panel" data-panel="summary" id="panelSummary"></div>
+          <div class="tab-panel hidden" data-panel="behavior" id="panelBehavior"></div>
+          <div class="tab-panel hidden" data-panel="network" id="panelNetwork"></div>
+          <div class="tab-panel hidden" data-panel="files" id="panelFiles"></div>
+          <div class="tab-panel hidden" data-panel="intel" id="panelIntel"></div>
+          <div class="tab-panel hidden" data-panel="screen">
+            <div class="stack">
+              <div id="sbLiveWrap" class="card hidden">
+                <div class="card-head">
+                  <div>
+                    <h3>Canlı sandbox ekranı <span id="sbLiveAge" class="faint small"></span></h3>
+                    <p>Birkaç saniyede bir yenilenir. Kurulumda sizin basmanız gereken bir düğme varsa pencereyi öne getirin; işiniz bitince arka plana alın. Sandbox iki durumda da çalışmaya devam eder.</p>
+                  </div>
+                  <div class="btn-group">
+                    <span id="sbFocusMsg" class="hint"></span>
+                    <button id="btnSbFocus" class="btn btn-sm"><i data-ic="monitor"></i> Öne getir</button>
+                    <button id="btnSbBack" class="btn btn-sm">Arka plana al</button>
+                  </div>
+                </div>
+                <img id="sbLiveImg" class="live" alt="Sandbox ekranının canlı görüntüsü" />
+              </div>
+              <div id="panelScreenShots"></div>
+            </div>
           </div>
-          <input id="haApiKeyInput" type="password" placeholder="Hybrid Analysis Community API Key" class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2 text-sm text-white focus:outline-none focus:border-cyan-500" />
+          <div class="tab-panel hidden" data-panel="log" id="panelLog"></div>
         </div>
-        <label class="flex items-center gap-2 text-slate-300 cursor-pointer pt-2">
-          <input type="checkbox" id="mbEnabledInput" /> VT anahtarı yoksa veya kota dolarsa MalwareBazaar / HA yedek hash sorgusunu çalıştır
-        </label>
-        <label class="flex items-center gap-2 text-slate-300 cursor-pointer">
-          <input type="checkbox" id="chkCirclEnabled" /> CIRCL Hashlookup (NSRL — anahtarsız bilinen temiz yazılım kontrolü)
-        </label>
-        <label class="flex items-center gap-2 text-slate-300 cursor-pointer">
-          <input type="checkbox" id="chkTfEnabled" /> ThreatFox IOC sorgusu (abuse.ch zararlı hash kontrolü)
-        </label>
-      </div>
-      <div class="flex justify-end gap-2">
-        <button data-close="vtModal" class="px-4 py-2 rounded-xl bg-slate-800 text-xs text-slate-300 hover:bg-slate-700">Kapat</button>
-        <button id="btnVtSave" class="px-4 py-2 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-xs font-semibold text-slate-950">Kaydet</button>
-      </div>
-    </div>
-  </div>
+      </section>
 
-  <!-- RAPOR MODAL -->
-  <div id="reportModal" class="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 hidden items-center justify-center p-4">
-    <div class="glass-card rounded-2xl max-w-5xl w-full p-5 space-y-3 max-h-[90vh] flex flex-col">
-      <div class="flex items-center justify-between">
-        <h3 class="text-base font-bold text-white">report.md</h3>
-        <button data-close="reportModal" class="text-slate-400 hover:text-white text-lg">&times;</button>
-      </div>
-      <pre id="reportText" class="flex-1 overflow-auto text-[11px] mono text-slate-300 bg-slate-950 p-4 rounded-xl border border-slate-800 whitespace-pre-wrap"></pre>
-    </div>
-  </div>
+      <!-- ============================================================ infrastructure -->
+      <section id="viewSystem" class="view hidden">
+        <div class="view-head">
+          <div><h2>Altyapı</h2><p id="sysSubText">Kontrol ediliyor…</p></div>
+        </div>
+        <div class="grid-2" id="sysCapsBadges"></div>
+      </section>
 
-  <!-- KARŞILAŞTIRMA MODAL -->
-  <div id="compareModal" class="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 hidden items-center justify-center p-4">
-    <div class="glass-card rounded-2xl max-w-5xl w-full p-5 space-y-4 max-h-[90vh] flex flex-col">
-      <div class="flex items-center justify-between">
-        <h3 class="text-base font-bold text-white">⚖️ İki analizi karşılaştır (Resmi vs Crack)</h3>
-        <button data-close="compareModal" class="text-slate-400 hover:text-white text-lg">&times;</button>
-      </div>
-      <div class="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
-        <div>
-          <label class="text-slate-400 block mb-1">Temel analiz (resmi / referans)</label>
-          <select id="cmpBase" class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-slate-200"></select>
+      <!-- ============================================================ downloads watcher -->
+      <section id="viewWatch" class="view hidden">
+        <div class="view-head">
+          <div><h2>İndirilenler klasörünü izle</h2><p>İndirmesi biten yeni dosyalar burada listelenir; tek tıkla analiz edebilirsiniz.</p></div>
         </div>
-        <div>
-          <label class="text-slate-400 block mb-1">Hedef analiz (crack / şüpheli)</label>
-          <select id="cmpTarget" class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-slate-200"></select>
-        </div>
-      </div>
-      <div class="flex justify-end">
-        <button id="btnRunCompare" class="px-4 py-2 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-xs font-semibold text-slate-950">Farkları Hesapla</button>
-      </div>
-      <div id="compareResult" class="flex-1 overflow-auto space-y-3 text-xs text-slate-300"></div>
-    </div>
-  </div>
-
-  <!-- SANDBOX BAŞLATMA MODAL -->
-  <div id="sandboxModal" class="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 hidden items-center justify-center p-4">
-    <div class="glass-card rounded-2xl max-w-2xl w-full p-5 space-y-4 max-h-[90vh] overflow-y-auto">
-      <div class="flex items-center justify-between">
-        <h3 class="text-base font-bold text-white">🚀 Sandbox / Sanal Makine Ayarları</h3>
-        <button data-close="sandboxModal" class="text-slate-400 hover:text-white text-lg">&times;</button>
-      </div>
-      <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5 text-xs">
-        <div class="sm:col-span-2">
-          <label class="text-slate-400 block mb-1">Çalıştırılacak hedef dosya</label>
-          <select id="sbModalTarget" class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-white"></select>
-        </div>
-        <input id="sbModalTargetCustom" type="text" placeholder="Özel hedef yolu (liste yerine)" class="bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-white placeholder-slate-500" />
-        <input id="sbModalArgs" type="text" placeholder="Komut satırı argümanı" class="bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-white placeholder-slate-500" />
-        <input id="sbModalDllExport" type="text" placeholder="DLL export adı (örn. DllRegisterServer)" class="bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-white placeholder-slate-500" />
-        <select id="sbModalDuration" class="bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-white">
-          <option value="5">5 dk izle</option><option value="10" selected>10 dk izle</option>
-          <option value="15">15 dk izle</option><option value="30">30 dk izle</option><option value="60">60 dk izle</option>
-        </select>
-        <select id="sbModalMemory" class="bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-white">
-          <option value="2048">2 GB RAM</option><option value="4096" selected>4 GB RAM</option>
-          <option value="8192">8 GB RAM</option><option value="12288">12 GB RAM</option><option value="16384">16 GB RAM</option>
-        </select>
-        <select id="sbModalBackend" class="bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-white">
-          <option value="wsb">Windows Sandbox</option>
-          <option value="vbox">VirtualBox VM</option>
-        </select>
-      </div>
-      <div id="sbModalVboxOpts" class="hidden grid grid-cols-1 sm:grid-cols-2 gap-2 p-3 rounded-xl bg-slate-900/80 border border-indigo-500/30 text-xs">
-        <select id="sbModalVm" class="bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-white"></select>
-        <select id="sbModalSnap" class="bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-white"><option value="">Son SafeBox_Temiz snapshot</option></select>
-        <input id="sbModalUser" type="text" placeholder="VM Windows kullanıcı adı" class="bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-white placeholder-slate-500" />
-        <input id="sbModalPass" type="password" autocomplete="off" placeholder="VM Windows parolası" class="bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-white placeholder-slate-500" />
-      </div>
-      <div class="flex flex-wrap gap-2 text-xs">
-        <label class="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-700 cursor-pointer"><input type="checkbox" id="sbModalNet" checked /> İnternet açık</label>
-        <label class="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-700 cursor-pointer"><input type="checkbox" id="sbModalKeepOpen" /> Süre bitince açık bırak</label>
-        <label class="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-700 cursor-pointer" title="Açık: sandbox penceresi öne gelir. Kapalı: arkada çalışır, panelden izlenir."><input type="checkbox" id="sbModalShowWindow" /> Pencereyi ekranda göster</label>
-        <label class="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-700 cursor-pointer" title="Ekran kartı isteyen programlar için. Ana bilgisayarın ekran kartı sürücüsü sandbox'a açılır; yalıtım daha zayıf olur."><input type="checkbox" id="sbModalVgpu" /> Ekran kartı ver (GPU) ⚠️</label>
-        <label class="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-700 cursor-pointer" title="Şifreli trafiğin içeriğini kaydeder; sertifika sabitleyen programlar bağlanamayabilir."><input type="checkbox" id="sbModalHttps" /> HTTPS'i çöz ⚠️</label>
-        <label class="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-700 cursor-pointer"><input type="checkbox" id="sbModalSimUser" checked /> Sahte kullanıcı hareketi</label>
-        <label class="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-700 cursor-pointer"><input type="checkbox" id="sbModalStdUser" /> Standart kullanıcı</label>
-        <label class="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-700 cursor-pointer"><input type="checkbox" id="sbModalHoney" checked /> Yem dosyalar</label>
-        <label class="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-700 cursor-pointer"><input type="checkbox" id="sbModFakeNet" /> FakeNet (ağ kapalıyken sahte DNS/HTTP tuzağı)</label>
-      </div>
-      <div class="flex justify-end gap-2">
-        <button data-close="sandboxModal" class="px-4 py-2 rounded-xl bg-slate-800 text-xs text-slate-300 hover:bg-slate-700">Vazgeç</button>
-        <button id="btnSbModalStart" class="px-4 py-2 rounded-xl bg-gradient-to-r from-indigo-500 to-purple-600 text-xs font-semibold text-white">Başlat</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- YARA KURAL YÖNETİCİSİ MODAL -->
-  <div id="yaraModal" class="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 hidden items-center justify-center p-4">
-    <div class="glass-card rounded-2xl max-w-5xl w-full p-5 space-y-3 max-h-[90vh] flex flex-col">
-      <div class="flex items-center justify-between">
-        <div>
-          <h3 class="text-base font-bold text-white">🎯 YARA Kural Yönetimi</h3>
-          <div id="yaraEngineInfo" class="text-[11px] text-slate-400"></div>
-        </div>
-        <button data-close="yaraModal" class="text-slate-400 hover:text-white text-lg">&times;</button>
-      </div>
-      <div class="grid grid-cols-1 md:grid-cols-3 gap-3 flex-1 min-h-0">
-        <div class="space-y-2 overflow-y-auto max-h-96">
-          <button id="btnYaraNew" class="w-full px-3 py-2 rounded-xl bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 border border-cyan-500/40 text-xs font-semibold">+ Yeni Özel Kural Dosyası</button>
-          <div id="yaraFilesList" class="space-y-1.5 text-xs"></div>
-        </div>
-        <div class="md:col-span-2 flex flex-col space-y-2">
-          <div class="flex flex-wrap gap-2 items-center">
-            <input id="yaraFileName" type="text" placeholder="custom_rules.yar" class="flex-1 bg-slate-900 border border-slate-700 rounded-xl px-3 py-1.5 text-xs text-white mono" />
-            <button id="btnYaraSave" class="px-3 py-1.5 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-xs font-semibold text-slate-950">Doğrula &amp; Kaydet</button>
-            <button id="btnYaraDelete" class="px-3 py-1.5 rounded-xl bg-rose-500/20 hover:bg-rose-500/30 text-rose-200 border border-rose-500/40 text-xs hidden">Sil</button>
+        <div class="card stack">
+          <div class="field">
+            <label class="label" for="watchFolder">İzlenecek klasör</label>
+            <div class="row"><input id="watchFolder" class="input" type="text" /><button id="btnWatchSave" class="btn">Kaydet</button></div>
           </div>
-          <div id="yaraErr" class="hidden text-xs text-rose-300 bg-rose-950/40 border border-rose-500/40 rounded-xl px-3 py-2"></div>
-          <textarea id="yaraFileContent" rows="16" class="w-full flex-1 bg-slate-950 border border-slate-800 rounded-xl p-3 text-[11px] mono text-slate-200 focus:outline-none focus:border-cyan-500"></textarea>
+          <div class="opt-list">
+            <label class="opt"><input type="checkbox" class="switch" id="watchEnabled" /><span class="opt-text"><span class="opt-title">İzleme açık</span><span class="opt-desc">Klasöre yeni bir dosya indiğinde listeye eklenir.</span></span></label>
+            <label class="opt"><input type="checkbox" class="switch" id="watchAuto" /><span class="opt-text"><span class="opt-title">Yeni dosyaları otomatik analiz et</span><span class="opt-desc">Bu modda VirusTotal'a hiçbir dosya yüklenmez (yalnızca hash sorulur) ve sandbox adımı onayınızı bekler, çünkü örneği çalıştırır.</span></span></label>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>Bulunan dosyalar</h3></div>
+          <div id="watchList"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- ============================================================ modals -->
+  <div id="vtModal" class="modal">
+    <div class="modal-card">
+      <div class="modal-head"><h3>API anahtarları ve tehdit istihbaratı</h3><button data-close="vtModal" class="btn btn-sm btn-icon btn-ghost" title="Kapat"><i data-ic="x"></i></button></div>
+      <div class="modal-body">
+        <p class="muted small">Anahtarlar bu bilgisayarda <span class="mono">config.json</span> içinde saklanır. VirusTotal anahtarı <a href="https://www.virustotal.com/gui/join-us" target="_blank" rel="noopener">virustotal.com</a>'dan ücretsiz alınır. Kota dolduğunda ya da anahtar olmadığında <a href="https://bazaar.abuse.ch/" target="_blank" rel="noopener">MalwareBazaar</a> ve <a href="https://www.hybrid-analysis.com/" target="_blank" rel="noopener">Hybrid Analysis</a> yedek olarak yalnızca hash sorgular.</p>
+        <div class="field">
+          <div class="row between"><label class="label" for="vtApiKeyInput">VirusTotal API anahtarı <span id="vtCurStatus" class="faint"></span></label><label class="check-row"><input type="checkbox" class="check" id="vtClearInput" /> Temizle</label></div>
+          <input id="vtApiKeyInput" class="input" type="password" placeholder="Değiştirmek için yazın" />
+        </div>
+        <div class="field">
+          <div class="row between"><label class="label" for="mbApiKeyInput">MalwareBazaar Auth-Key <span id="mbCurStatus" class="faint"></span></label><label class="check-row"><input type="checkbox" class="check" id="mbClearInput" /> Temizle</label></div>
+          <input id="mbApiKeyInput" class="input" type="password" placeholder="İsteğe bağlı" />
+        </div>
+        <div class="field">
+          <div class="row between"><label class="label" for="haApiKeyInput">Hybrid Analysis API anahtarı <span id="haCurStatus" class="faint"></span></label><label class="check-row"><input type="checkbox" class="check" id="haClearInput" /> Temizle</label></div>
+          <input id="haApiKeyInput" class="input" type="password" placeholder="İsteğe bağlı" />
+        </div>
+        <div class="opt-list">
+          <label class="opt"><input type="checkbox" class="switch" id="mbEnabledInput" /><span class="opt-text"><span class="opt-title">Yedek hash sorgusu</span><span class="opt-desc">VirusTotal anahtarı yoksa ya da kota dolduysa MalwareBazaar ve Hybrid Analysis'e hash sorulur.</span></span></label>
+          <label class="opt"><input type="checkbox" class="switch" id="chkCirclEnabled" /><span class="opt-text"><span class="opt-title">CIRCL Hashlookup (NSRL)</span><span class="opt-desc">Anahtarsız; dosyanın bilinen temiz yazılım listesinde olup olmadığına bakar.</span></span></label>
+          <label class="opt"><input type="checkbox" class="switch" id="chkTfEnabled" /><span class="opt-text"><span class="opt-title">ThreatFox IOC sorgusu</span><span class="opt-desc">abuse.ch'nin zararlı hash veritabanına sorar.</span></span></label>
+        </div>
+      </div>
+      <div class="modal-foot"><button data-close="vtModal" class="btn">Vazgeç</button><button id="btnVtSave" class="btn btn-primary">Kaydet</button></div>
+    </div>
+  </div>
+
+  <div id="reportModal" class="modal">
+    <div class="modal-card modal-wide">
+      <div class="modal-head"><h3>Rapor (report.md)</h3><button data-close="reportModal" class="btn btn-sm btn-icon btn-ghost" title="Kapat"><i data-ic="x"></i></button></div>
+      <div class="modal-body"><pre id="reportText" class="modal-pre mono"></pre></div>
+    </div>
+  </div>
+
+  <div id="compareModal" class="modal">
+    <div class="modal-card modal-wide">
+      <div class="modal-head"><h3>İki analizi karşılaştır</h3><button data-close="compareModal" class="btn btn-sm btn-icon btn-ghost" title="Kapat"><i data-ic="x"></i></button></div>
+      <div class="modal-body">
+        <div class="grid-2">
+          <div class="field"><label class="label" for="cmpBase">Referans analiz (örn. resmi sürüm)</label><select id="cmpBase" class="select"></select></div>
+          <div class="field"><label class="label" for="cmpTarget">Karşılaştırılan analiz (örn. şüpheli sürüm)</label><select id="cmpTarget" class="select"></select></div>
+        </div>
+        <div class="row end"><button id="btnRunCompare" class="btn btn-primary">Farkları hesapla</button></div>
+        <div id="compareResult" class="stack"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="sandboxModal" class="modal">
+    <div class="modal-card modal-mid">
+      <div class="modal-head"><h3>Sandbox'ta çalıştır</h3><button data-close="sandboxModal" class="btn btn-sm btn-icon btn-ghost" title="Kapat"><i data-ic="x"></i></button></div>
+      <div class="modal-body">
+        <div class="section-title cat-proc"><span class="dot"></span> Hedef</div>
+        <div class="grid-2">
+          <div class="field span-all"><label class="label" for="sbModalTarget">Çalıştırılacak dosya</label><select id="sbModalTarget" class="select"></select></div>
+          <div class="field"><label class="label" for="sbModalTargetCustom">Listede yoksa yolu yazın</label><input id="sbModalTargetCustom" class="input" type="text" placeholder="Göreli yol" /></div>
+          <div class="field"><label class="label" for="sbModalArgs">Komut satırı argümanı</label><input id="sbModalArgs" class="input" type="text" /></div>
+          <div class="field"><label class="label" for="sbModalDllExport">DLL export adı</label><input id="sbModalDllExport" class="input" type="text" placeholder="örn. DllRegisterServer" /></div>
+          <div class="field"><label class="label" for="sbModalDuration">İzleme süresi</label>
+            <select id="sbModalDuration" class="select"><option value="5">5 dakika</option><option value="10" selected>10 dakika</option><option value="15">15 dakika</option><option value="30">30 dakika</option><option value="60">60 dakika</option></select></div>
+          <div class="field"><label class="label" for="sbModalMemory">Bellek</label>
+            <select id="sbModalMemory" class="select"><option value="2048">2 GB</option><option value="4096" selected>4 GB</option><option value="8192">8 GB</option><option value="12288">12 GB</option><option value="16384">16 GB</option></select></div>
+          <div class="field"><label class="label" for="sbModalBackend">İzole ortam</label>
+            <select id="sbModalBackend" class="select"><option value="wsb">Windows Sandbox</option><option value="vbox">VirtualBox sanal makine</option></select></div>
+        </div>
+        <div id="sbModalVboxOpts" class="panel grid-2 hidden">
+          <div class="field"><label class="label" for="sbModalVm">Sanal makine</label><select id="sbModalVm" class="select"></select></div>
+          <div class="field"><label class="label" for="sbModalSnap">Snapshot</label><select id="sbModalSnap" class="select"><option value="">Son SafeBox_Temiz snapshot</option></select></div>
+          <div class="field"><label class="label" for="sbModalUser">VM kullanıcı adı</label><input id="sbModalUser" class="input" type="text" /></div>
+          <div class="field"><label class="label" for="sbModalPass">VM parolası</label><input id="sbModalPass" class="input" type="password" autocomplete="off" /></div>
+        </div>
+        <div class="section-title cat-net"><span class="dot"></span> Ağ</div>
+        <div class="opt-list">
+          <label class="opt"><input type="checkbox" class="switch" id="sbModalNet" checked /><span class="opt-text"><span class="opt-title">İnternet açık</span><span class="opt-desc">Trafik kaydedilir; ev ağı engelli.</span></span></label>
+          <label class="opt"><input type="checkbox" class="switch" id="sbModalHttps" /><span class="opt-text"><span class="opt-title">HTTPS trafiğini çöz <span class="chip tone-med">Davranışı değiştirebilir</span></span><span class="opt-desc">Sertifika sabitleyen programlar bağlanamayabilir.</span></span></label>
+          <label class="opt"><input type="checkbox" class="switch" id="sbModFakeNet" /><span class="opt-text"><span class="opt-title">Sahte DNS / HTTP tuzağı (FakeNet)</span><span class="opt-desc">İnternet kapalıyken bağlanılmak istenen adresleri yakalar.</span></span></label>
+        </div>
+        <div class="section-title cat-sys"><span class="dot"></span> Ortam ve kullanıcı</div>
+        <div class="opt-list">
+          <label class="opt"><input type="checkbox" class="switch" id="sbModalShowWindow" /><span class="opt-text"><span class="opt-title">Pencereyi ekranda göster</span><span class="opt-desc">Kapalıyken arkada çalışır, panelden izlenir.</span></span></label>
+          <label class="opt"><input type="checkbox" class="switch" id="sbModalKeepOpen" /><span class="opt-text"><span class="opt-title">Süre bitince açık bırak</span><span class="opt-desc">Elle inceleme için.</span></span></label>
+          <label class="opt"><input type="checkbox" class="switch" id="sbModalVgpu" /><span class="opt-text"><span class="opt-title">Ekran kartı ver (GPU) <span class="chip tone-high">Yalıtımı zayıflatır</span></span><span class="opt-desc">Yalnızca ekran kartı isteyen güvendiğiniz programlar için.</span></span></label>
+          <label class="opt"><input type="checkbox" class="switch" id="sbModalSimUser" checked /><span class="opt-text"><span class="opt-title">Sahte kullanıcı hareketi</span><span class="opt-desc">Kurulum düğmelerine otomatik tıklar.</span></span></label>
+          <label class="opt"><input type="checkbox" class="switch" id="sbModalStdUser" /><span class="opt-text"><span class="opt-title">Standart kullanıcı yetkisi</span><span class="opt-desc">Yönetici yerine standart kullanıcı.</span></span></label>
+          <label class="opt"><input type="checkbox" class="switch" id="sbModalHoney" checked /><span class="opt-text"><span class="opt-title">Yem dosyalar</span><span class="opt-desc">Veri çalma girişimlerini yakalar.</span></span></label>
+        </div>
+      </div>
+      <div class="modal-foot"><button data-close="sandboxModal" class="btn">Vazgeç</button><button id="btnSbModalStart" class="btn btn-primary"><i data-ic="play"></i> Başlat</button></div>
+    </div>
+  </div>
+
+  <div id="yaraModal" class="modal">
+    <div class="modal-card modal-wide">
+      <div class="modal-head"><div><h3>YARA kuralları</h3><div id="yaraEngineInfo" class="hint"></div></div><button data-close="yaraModal" class="btn btn-sm btn-icon btn-ghost" title="Kapat"><i data-ic="x"></i></button></div>
+      <div class="modal-body">
+        <div class="yara-layout">
+          <div class="stack-sm">
+            <button id="btnYaraNew" class="btn btn-sm btn-block"><i data-ic="plus"></i> Yeni kural dosyası</button>
+            <div id="yaraFilesList" class="yara-files"></div>
+          </div>
+          <div class="stack-sm">
+            <div class="row">
+              <input id="yaraFileName" class="input mono" type="text" placeholder="custom_rules.yar" />
+              <button id="btnYaraSave" class="btn btn-primary btn-sm">Doğrula ve kaydet</button>
+              <button id="btnYaraDelete" class="btn btn-danger btn-sm hidden">Sil</button>
+            </div>
+            <div id="yaraErr" class="err hidden"></div>
+            <textarea id="yaraFileContent" rows="18" class="textarea yara-editor"></textarea>
+          </div>
         </div>
       </div>
     </div>
   </div>
 
-  <!-- GÜVENLİ DOSYA ÖNİZLEYİCİ MODAL -->
-  <div id="previewModal" class="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 hidden items-center justify-center p-4">
-    <div class="glass-card rounded-2xl max-w-5xl w-full p-5 space-y-3 max-h-[90vh] flex flex-col">
-      <div class="flex items-center justify-between gap-2">
-        <div class="min-w-0">
-          <h3 class="text-base font-bold text-white truncate" id="previewTitle">Dosya İnceleme</h3>
-          <div class="text-[11px] text-slate-400" id="previewMeta"></div>
+  <div id="previewModal" class="modal">
+    <div class="modal-card modal-wide">
+      <div class="modal-head">
+        <div class="grow"><h3 class="truncate" id="previewTitle">Dosya içeriği</h3><div class="hint" id="previewMeta"></div></div>
+        <div class="seg" id="previewModes">
+          <button class="seg-btn active" data-preview-mode="text">Metin / kod</button>
+          <button class="seg-btn" data-preview-mode="strings">Dizgeler</button>
+          <button class="seg-btn" data-preview-mode="hex">Hex</button>
         </div>
-        <div class="flex items-center gap-2">
-          <button data-preview-mode="text" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-cyan-300">Metin / Kod</button>
-          <button data-preview-mode="strings" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-200">Dizgeler</button>
-          <button data-preview-mode="hex" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-200">Hex Döküm</button>
-          <button data-close="previewModal" class="text-slate-400 hover:text-white text-lg ml-2">&times;</button>
-        </div>
+        <button data-close="previewModal" class="btn btn-sm btn-icon btn-ghost" title="Kapat"><i data-ic="x"></i></button>
       </div>
-      <pre id="previewText" class="flex-1 overflow-auto text-[11px] mono text-slate-300 bg-slate-950 p-4 rounded-xl border border-slate-800 whitespace-pre-wrap"></pre>
+      <div class="modal-body"><pre id="previewText" class="modal-pre mono"></pre></div>
     </div>
   </div>
 
-  <script src="/static/app.js" defer></script>
+  <script src="/static/app.js?v=3" defer></script>
 </body>
 </html>
