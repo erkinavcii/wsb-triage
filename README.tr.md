@@ -6,9 +6,22 @@
 
 İndirdiğin bir dosyayı kendi bilgisayarında çalıştırmadan önce otomatik ve yerel olarak inceleyen web tabanlı analiz ve triyaj paneli.
 
-![SafeBox Web Arayüzü](static/screenshot.png)
+![SafeBox analiz sonucu: karar, puan ve kırmızı bulgular](static/screenshot.png)
 
-**Başlatmak için `Baslat.bat`'a çift tıkla:** sunucu `http://127.0.0.1:8765` adresinde açılır, `%LOCALAPPDATA%\SafeBox\session.token` içindeki oturum belirteciyle tarayıcıda otomatik oturum açar. Dosyayı panele bırak (veya yolunu seç) ve **Analizi Başlat**'a bas:
+<table>
+  <tr>
+    <td width="33%"><img src="docs/screenshots/wizard-profile.png" alt="Yeni analiz sihirbazı: profil seçimi" /></td>
+    <td width="33%"><img src="docs/screenshots/wizard-summary.png" alt="Yeni analiz sihirbazı: başlatmadan önce özet" /></td>
+    <td width="33%"><img src="docs/screenshots/result-files.png" alt="Sonuç: riske göre sıralı dosya listesi" /></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>Adım 2: hazır profiller</sub></td>
+    <td align="center"><sub>Adım 4: başlatmadan önce özet ve uyarılar</sub></td>
+    <td align="center"><sub>Sonuç: riske göre süzülen dosyalar</sub></td>
+  </tr>
+</table>
+
+**Başlatmak için `Baslat.bat`'a çift tıkla:** sunucu `http://127.0.0.1:8765` adresinde açılır, `%LOCALAPPDATA%\SafeBox\session.token` içindeki oturum belirteciyle tarayıcıda otomatik oturum açar. **Yeni analiz** dört adımda ilerler: kaynağı seç (dosya, klasör, arşiv ya da bağlantı), bir profil seç (Standart, Büyük kurulum, Şüpheli dosya, İnternetsiz, Yalnızca statik), gerekirse ayarları gruplar halinde değiştir ve özeti kontrol edip başlat. Sonuçlar Özet, Davranış, Ağ, Dosyalar, İstihbarat, Ekran ve Günlük sekmelerinde, sayfalanmış olarak gösterilir. Arka planda şu adımlar çalışır:
 
 | # | Adım | Ne yapar |
 |---|---|---|

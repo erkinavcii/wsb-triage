@@ -8,7 +8,22 @@
 
 SafeBox is a lightweight, local web-based triage and malware analysis workbench for Windows. It provides end-to-end automated and interactive behavioral analysis using disposable Windows Sandbox environments, complete with network packet capture, process/registry tracing, static PE inspection, and VirusTotal enrichment.
 
-![SafeBox Web Interface](static/screenshot.png)
+![SafeBox analysis result: verdict, score and red findings](static/screenshot.png)
+
+<table>
+  <tr>
+    <td width="33%"><img src="docs/screenshots/wizard-profile.png" alt="New analysis wizard: profile selection" /></td>
+    <td width="33%"><img src="docs/screenshots/wizard-summary.png" alt="New analysis wizard: review before starting" /></td>
+    <td width="33%"><img src="docs/screenshots/result-files.png" alt="Result: files sorted by risk" /></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>Step 2: ready-made profiles</sub></td>
+    <td align="center"><sub>Step 4: review and warnings before starting</sub></td>
+    <td align="center"><sub>Result: files filtered by risk</sub></td>
+  </tr>
+</table>
+
+A new analysis is a four-step wizard: pick the source (file, folder, archive or link), pick a profile (Standard, Large installer, Suspicious file, Offline, Static only), adjust grouped settings if needed, then review and start. Results are split into paginated Summary, Behavior, Network, Files, Intel, Screen and Log tabs. *(The UI is in Turkish.)*
 
 ---
 
