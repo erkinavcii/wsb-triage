@@ -28,13 +28,19 @@
 | 1 | Hazırla & Paket Aç | Arşivi 7-Zip ile açar (RAR, şifreli, çok parçalı `.part1`/`.001`), boyut/bomba kontrolü yapar. **NSIS, MSI, CAB ve SFX** kurulum paketlerinin içindeki dosyaları da `unpacked\` altına çıkarıp (`[paket içi]`) ön taramaya ekler. Seçtiğin **klasör kopyalanmaz**, sandbox'a salt okunur bağlanır; İndirilenler/Masaüstü gibi geniş klasörler reddedilir. **Host'ta hiçbir şey çalıştırılmaz.** |
 | 2 | Hash, İmza & Statik + YARA Analizi | Tüm dosyaların SHA-256 özetini ve Authenticode dijital imzalarını doğrular (Defender tarafından karantinaya alınan dosyalar dahil). En şüpheli dosyalarda PE entropi, riskli API birleşimleri, stealer/C2 dizge izleri ve `rules\safebox_builtin.yar` (`yara-python` ile; kurulu değilse sadece basit kuralları çalıştıran yerleşik ayrıştırıcı) ile **YARA** taraması yapar. |
 | 3 | Çok Kaynaklı Tehdit İstihbaratı | **VirusTotal**'de önce tüm dosyaları hash ile sorgular, ardından istenirse bilinmeyenleri (650 MB'a kadar) yükler ve ücretsiz API kotasına göre kendisi bekler. VT anahtarı yokken veya kota dolduğunda yedek olarak **MalwareBazaar** ve **Hybrid Analysis** üzerinden yalnızca hash sorgusu yapar (dosya kartından elle de sorulabilir). |
-| 4 | Windows Sandbox (Canlı İzleme) | Örneği izole, tek kullanımlık Windows'ta çalıştırır (`2 GB–16 GB` RAM ve `1–180 dk` süre seçilebilir). Yeni işlemler (`Win32_ProcessStartTrace`), TCP bağlantıları, servisler, sürücüler, zamanlanmış görevler, başlangıç/Run/IFEO kayıtları, Defender, `hosts` ve güvenlik duvarı değişikliklerini izler. `pktmon --pkt-size 4096` ile `capture.pcapng` ağ kaydı tutar; sandbox'ta bırakılan yeni dosyaların hash'lerini VT'de sorgular. İsteğe bağlı olarak **30 saniyede bir ekran görüntüsü** alır ve **sahte kullanıcı hareketi** (yalnızca örnek işlem ağacındaki kurulum pencerelerine tıklama) uygular. |
-| 5 | Ağ Korelasyonu & Raporlama | Wireshark (`tshark`) kuruluysa DNS yanıtları, TLS SNI ve HTTP trafiğini Sandbox `Connections`/`DnsCache` kayıtlarıyla eşleştirerek hangi işlemin hangi adrese bağlandığını gösterir. Sonucu **KIRMIZI / İNCELE / bayrak yok** olarak puanlar; `report.md`, bağımsız `report.html`, `state.json` üretir ve **CSV / STIX 2.1 IOC** dışa aktarımı sunar. |
+| 4 | Windows Sandbox (Canlı İzleme) | Örneği izole, tek kullanımlık Windows'ta çalıştırır (`2 GB–16 GB` RAM ve `1–180 dk` süre seçilebilir). Yeni işlemler (`Win32_ProcessStartTrace`), TCP bağlantıları, servisler, sürücüler, zamanlanmış görevler, başlangıç/Run/IFEO kayıtları, Defender, `hosts` ve güvenlik duvarı değişikliklerini izler. `pktmon --pkt-size 4096` ile `capture.pcapng` ağ kaydı tutar. Örneğin bıraktığı çalıştırılabilir dosya ve betikleri, çalıştırdığı **PowerShell kod bloklarını (event 4104, base64 katmanları çözülmüş)** ve **bellek dökümlerini** dışarı alır; bunlar host'ta çalıştırılmadan incelenir. İsteğe bağlı olarak **30 saniyede bir ekran görüntüsü** alır ve **sahte kullanıcı hareketi** (yalnızca örnek işlem ağacındaki kurulum pencerelerine tıklama) uygular. |
+| 5 | Ağ Korelasyonu & Raporlama | Wireshark (`tshark`) kuruluysa DNS yanıtları, TLS SNI ve HTTP trafiğini Sandbox `Connections`/`DnsCache` kayıtlarıyla eşleştirerek hangi işlemin hangi adrese bağlandığını gösterir. Sonucu **KIRMIZI / İNCELE / bayrak yok** kararı, **1–10 puan** ve **MITRE ATT&CK** teknik etiketleriyle verir; `report.md`, bağımsız `report.html`, `state.json` üretir ve **CSV / STIX 2.1 IOC** dışa aktarımı sunar. |
 
 ---
 
 ## Öne Çıkan Özellikler
 
+- **Bağlantı (URL) Analizi:** Bağlantı host'ta hiç açılmaz. Sandbox içinde Edge kendi profiliyle açar (SmartScreen ve indirme sorusu kapalı); yönlendirme zinciri kaydedilir, adres VirusTotal'de sorulur (yalnızca adres gönderilir) ve indirilen her dosya şifrelenerek dışarı alınıp çalıştırılmadan incelenir. Edge'in kendisi dışında bir program başlatması kırmızı bulgudur.
+- **Zararlı Ailesi & C2 Ayarı Çıkarma:** [CAPE-parsers](https://github.com/CAPESandbox/CAPE-parsers) (66 aile) en riskli dosyalarda ve bellek dökümlerinden kesilen PE görüntülerinde ayrı bir süreç ve ortamda çalışır; bulunan C2 adresleri karara, rapora ve IOC dışa aktarımına girer.
+- **Bellek Taraması:** Örneğin işlemlerinin bellek dökümü 6. saniyede (hızlı kapanan stealer'lar için) ve sonda alınır, YARA ile yalnızca RAM'de taranır ve silinir.
+- **HTTPS Trafiğini Çözme (isteğe bağlı):** Sandbox içinde `mitmproxy` çalışır; istek yöntemi, tam adres, durum kodu, boyut ve gönderilen verinin ilk 1 KB'ı kaydedilir. Telegram, Discord webhook, paste siteleri gibi kötüye kullanılan servislere veri gitmesi kırmızı bulgudur.
+- **İnternetsiz Mod & Yem Dosyalar:** İnternet kapalıyken sandbox içindeki sahte DNS / HTTP sunucusu (FakeNet) örneğin bağlanmak istediği adresleri yakalar. Sahte tarayıcı, cüzdan ve belge dosyaları okunur ya da şifrelenirse kırmızı bulgu olur.
+- **VirtualBox Desteği:** Windows Sandbox'ı tanıyan örnekler için VirtualBox sanal makinesi kullanılabilir; panelden ağı kapatıp temiz snapshot alınır.
 - **İki Analizi Karşılaştır (Resmi vs Crack):** Geçmiş analizler içindeki iki sonucu yan yana kıyaslar; değişen dosya hash'lerini, bozulan dijital imzaları, YARA/statik risk artışlarını, yeni kalıcılık kayıtlarını ve ek dış alan adı/IP bağlantılarını raporlar.
 - **İndirilenler Klasörü İzleyici:** İndirmesi biten yeni dosyaları algılar; otomatik modda VirusTotal'e dosya yüklemez (yalnızca hash sorar) ve örneği çalıştıracağı için Sandbox adımında onayını bekler.
 - **Dosya Gezgini Sağ Tık Menüsü:** Panel üst barından tek tıkla yönetici yetkisi gerekmeden (`HKCU`) dosya ve klasörlere *"SafeBox ile analiz et"* bağlam menüsü eklenip kaldırılabilir (`enqueue.py`).
@@ -49,8 +55,11 @@
 2. **Python 3.10+ & Bağımlılıklar:** `pip install -r requirements.txt`
 3. **7-Zip 25.01+** (RAR/şifreli arşiv ve paket açma için gerekli): https://www.7-zip.org
 4. **Wireshark / tshark** *(önerilir, ağ özeti ve korelasyon için)*: https://www.wireshark.org (Sandbox içi yakalama `pktmon` kullandığı için Npcap kurulumu gerekmez).
-5. **Tehdit İstihbaratı API Anahtarları:** Paneldeki *"VirusTotal API Ayarları"* penceresinden VirusTotal (ve isteğe bağlı olarak MalwareBazaar Auth-Key / Hybrid Analysis anahtarı) girilebilir; anahtarlar yerelde `config.json` veya ortam değişkenlerinde saklanır.
+5. **Tehdit İstihbaratı API Anahtarları:** Paneldeki *"API anahtarları"* penceresinden VirusTotal (ve isteğe bağlı olarak MalwareBazaar Auth-Key / Hybrid Analysis anahtarı) girilebilir; anahtarlar yerelde `config.json` veya ortam değişkenlerinde saklanır.
 6. *(İsteğe bağlı)* Sysinternals `Procmon64.exe` aracını `sandbox\` klasörüne koyarsanız sandbox içinde `procmon.pml` kaydı da alınır. `rules\` klasörüne kendi `.yar` dosyalarınızı ekleyebilirsiniz.
+7. *(İsteğe bağlı)* Repo dışında, `%LOCALAPPDATA%\SafeBox\` altında duran araçlar (yoksa ilgili adım atlanır ve panel bunu söyler):
+   - `extractor-venv\` (`CAPE-parsers` kurulu Python 3.13 ortamı) ve `cape-rules\` (CAPE aile YARA kuralları, GPLv3): zararlı ailesi / C2 ayarı çıkarma için.
+   - `mitmproxy\mitmdump.exe`: HTTPS çözme için (SHA-256 ile sabitlenmiş, yalnızca sandbox içinde çalışır).
 
 ---
 
@@ -75,6 +84,7 @@ pytest
 | `yara_scanner.py` | `yara-python` + yerleşik offline YARA ayrıştırıcı motoru |
 | `vt_client.py` | VirusTotal API istemcisi (kota yönetimi, akışlı büyük dosya yükleme) |
 | `intel_client.py` | MalwareBazaar & Hybrid Analysis salt hash sorgu istemcisi |
+| `config_extractor.py` | CAPE-parsers ile zararlı ailesi / C2 ayarı çıkarma (ayrı Python ortamında, ayrı süreç olarak çalışır) |
 | `sandbox_manager.py` | Sertleştirilmiş `.wsb` üretimi, Sandbox yaşam döngüsü, VirtualBox izolasyonu, `HKCU` sağ tık menüsü |
 | `enqueue.py` | Sağ tık menüsünden hızlı analiz başlatıcı |
 | `rules\safebox_builtin.yar` | Yerleşik YARA tespit kuralları |

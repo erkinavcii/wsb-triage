@@ -35,14 +35,29 @@ A new analysis is a four-step wizard: pick the source (file, folder, archive or 
   - Configurable sandbox RAM allocation (2 GB up to 16 GB).
   - Automated LAN blocking firewall inside the sandbox: keeps internet access active for C2 observation while protecting local home/office subnets and host endpoints.
   - Optional **simulated user interaction** (gentle cursor movement and UI Automation clicks scoped strictly to the sample's process tree) to bypass idle evasion or advance installer prompts.
+  - **Honeyfiles:** decoy browser profiles, wallet and document files; reading or encrypting them is a red finding.
+  - **Offline mode with FakeNet:** internet off, a fake DNS / HTTP server inside the sandbox records every address the sample tries to reach.
+  - Optional **standard-user run** to surface privilege-escalation attempts, and an optional **VirtualBox** backend (network isolation + clean snapshot from the UI) for samples that detect Windows Sandbox.
+- **Link (URL) Analysis:**
+  - A link is never opened on the host. Edge opens it inside the sandbox with its own profile (no SmartScreen or download prompts), with internet and HTTPS decryption on.
+  - The redirect chain is recorded, a VirusTotal URL report is looked up (the address only), and every file it downloads is copied out encoded and analyzed on the host without being run. Edge starting a non-Edge program is a red finding.
+- **HTTPS Decryption (optional):**
+  - `mitmproxy` runs inside the sandbox with its CA trusted (system store plus `SSL_CERT_FILE` / `NODE_EXTRA_CA_CERTS`, QUIC blocked) and logs method, full URL, status, sizes and the first 1 KB sent. Data sent to abused services (Telegram, Discord webhooks, paste sites) is red.
 - **Deep Live Behavioral Monitoring & Attribution:**
   - Background network packet capture (`pktmon` / `.pcapng`) with configurable per-packet snaplen/size cap.
   - **Periodic desktop screenshots** captured inside the sandbox, strictly validated (`PNG + IHDR` header check, non-symlink, size-capped) before rendering in the UI.
   - Process creation tree (`Win32_ProcessStartTrace`), command-line tracing, and suspicious parameter flags (hidden/encoded PowerShell, bypasses).
   - **Process-to-network attribution:** correlates `tshark`-extracted DNS answers, TLS SNI, and HTTP endpoints with in-sandbox socket/DNS state to identify which process initiated each connection.
   - Persistence inspection (Services, Device Drivers, Scheduled Tasks, Run/RunOnce keys, Startup folder, IFEO) and tamper detection (Defender, `hosts`, firewall).
-- **Secondary Dropper & Multi-Source Threat Intel:**
-  - Automatically indexes newly dropped executables inside the sandbox, calculates their SHA-256 hashes, and queries VirusTotal without uploading the files outside.
+  - **PowerShell script blocks (event 4104):** ScriptBlockLogging is enabled before the baseline; blocks from the sample's PowerShell processes are reassembled and analyzed as decoded code (`-EncodedCommand` / base64 layers arrive as plain text).
+- **Dropped Files, Memory & Malware Family / C2 Config:**
+  - Executables and scripts the sample drops (unsigned, suspicious locations first) are copied out XOR-encoded and get the same static analysis, signature, YARA and config extraction on the host, never run. A file the host antivirus removes is reported red.
+  - **Memory dumps:** private and executable memory of the sample's processes (an early dump after 6 s, since stealers exit fast, and one at the end) is scanned with YARA in RAM and then deleted.
+  - **Family and C2 config extraction** with [CAPE parsers](https://github.com/CAPESandbox/CAPE-parsers) (66 families) on the riskiest files and on carved PE images from the memory dumps. Runs in a separate process and environment; config addresses become C2 IOCs.
+- **Verdict, Score & MITRE ATT&CK:**
+  - Red / review / clean verdict with a **1–10 score** (10 = known malware, "incomplete" when a check did not run) and findings mapped to **ATT&CK techniques** with evidence.
+- **Multi-Source Threat Intel:**
+  - Dropped executables are hashed inside the sandbox and looked up on VirusTotal without uploading them.
   - Optional **MalwareBazaar & Hybrid Analysis** hash-only enrichment (available automatically as a backup when VirusTotal has no key or hits quota, or per file on demand).
 - **Static PE, Installer Unpacking & YARA Triage:**
   - Recursive archive decompression and safe **installer payload unpacking** (NSIS, MSI, CAB, SFX under size guards) to triage embedded binaries prior to execution.
@@ -74,13 +89,14 @@ A new analysis is a four-step wizard: pick the source (file, folder, archive or 
                         |                                   |
             - 7-Zip archive & installer       - Provision hardened .wsb (RAM config)
               unpack (NSIS/MSI/CAB/SFX)       - Map input/tools (read-only)
-            - Authenticode & PE heuristics    - Optional fake cursor / UIA clicks
-            - YARA rules (builtin/yara-py)    - Periodic screen capture + pktmon
-            - VT / MalwareBazaar / HA hash    - Process/net correlation & drop diff
+            - Authenticode & PE heuristics    - File: run sample, fake cursor / UIA
+            - YARA rules (builtin/yara-py)    - Link: open URL in Edge, save downloads
+            - CAPE family / C2 config         - pktmon, optional mitmproxy / FakeNet
+            - VT / MalwareBazaar / HA hash    - PowerShell 4104, memory dumps, drops
                         |                                   |
                         +-----------------+-----------------+
                                           |
-                            [Report, IOCs & Diff Engine]
+                   [Verdict 1-10 + ATT&CK, Report, IOCs & Diff Engine]
                        (Markdown, HTML, JSON, CSV & STIX 2.1)
 ```
 
@@ -97,6 +113,9 @@ A new analysis is a four-step wizard: pick the source (file, folder, archive or 
 3. **7-Zip (25.01+)** installed for archive decompression: [7-zip.org](https://www.7-zip.org)
 4. *(Recommended)* **Wireshark / tshark** for network capture dissection: [wireshark.org](https://www.wireshark.org)
 5. *(Optional)* **Sysinternals Procmon64.exe** placed in `sandbox/` directory for full event logging.
+6. *(Optional)* Tools kept outside the repository under `%LOCALAPPDATA%\SafeBox\` (without them the step is skipped and the panel says so):
+   - `extractor-venv\` (a Python 3.13 venv with `CAPE-parsers`) and `cape-rules\` (CAPE family YARA rules, GPLv3) for family / C2 config extraction.
+   - `mitmproxy\mitmdump.exe` for HTTPS decryption (SHA-256 pinned, only ever run inside the sandbox).
 
 ---
 
