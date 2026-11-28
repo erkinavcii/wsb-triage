@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import analyzer
+import flare_tools
 import intel_client
 import sandbox_manager as sbm
 import vt_client
@@ -437,6 +438,15 @@ def _analyze_extracted(job: Job, paths: List[Path], tag: str, state_key: str, vt
         items.append(item)
     job.state[state_key] = items
     job.state["static"] = sorted((job.state.get("static") or []) + results, key=lambda x: -x["risk_score"])
+    extracted_too_big: List[str] = []
+    flare_cands = _flare_candidates(results, FLARE_EXTRACTED_MAX_FILES, extracted_too_big)
+    if extracted_too_big:
+        with job.lock:
+            fl_state = job.state.setdefault("flare", {})
+            fl_state["too_big"] = (fl_state.get("too_big") or []) + extracted_too_big
+    if flare_cands and flare_available():
+        job.stage("sandbox", "running", f"{tag} dosyalar capa / FLOSS ile inceleniyor ({len(flare_cands)})...")
+        run_flare(job, flare_cands, FLARE_EXTRACTED_BUDGET_SEC, append=True)
     if config_extractor_available():
         cands = [{"label": r["rel"], "path": r["file_path"]} for r in results
                  if (r.get("pe_info") or {}).get("is_pe") and Path(r["file_path"]).stat().st_size <= _FAMILY_MAX_BYTES]
@@ -535,9 +545,120 @@ def _join_vt_thread(job: Job, th: threading.Thread) -> None:
         th.join(1)
 
 
+# ---------------------------------------------------------------- capa / FLOSS (flare_tools)
+FLARE_MAX_FILES = 4                 # riskiest unsigned programs of the sample
+FLARE_BUDGET_SEC = 600              # runs next to the sandbox (10 minutes by default)
+FLARE_EXTRACTED_MAX_FILES = 2       # files brought out of the sandbox (downloads, dropped)
+FLARE_EXTRACTED_BUDGET_SEC = 300
+
+
+def flare_available() -> bool:
+    return flare_tools.capa_available() or flare_tools.floss_available()
+
+
+def _flare_candidates(results: List[Dict[str, Any]], limit: int, too_big: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """Unsigned / broken-signature programs small enough for capa, riskiest first. Validly signed files are left out:
+    capa lists dozens of capabilities for any real program. Larger ones are named in too_big (they would only time out)."""
+    out: List[Dict[str, Any]] = []
+    for st in sorted(results, key=lambda x: -(x.get("risk_score") or 0)):
+        if not (st.get("pe_info") or {}).get("is_pe") or (st.get("signature") or {}).get("status") == "Valid":
+            continue
+        path = st.get("file_path")
+        if not path or not Path(path).is_file():
+            continue
+        label = st.get("rel") or Path(path).name
+        size = int(st.get("file_size") or 0)
+        if size > flare_tools.CAPA_MAX_BYTES:
+            if too_big is not None and len(too_big) < 20:
+                too_big.append(label)
+            continue
+        out.append({"label": label, "path": path, "size": size})
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _floss_extras(floss: Dict[str, Any]) -> None:
+    """String rules over the strings FLOSS rebuilt, and the addresses among them."""
+    text = "\n".join(str(x) for k in ("decoded", "stack", "tight") for x in floss.get(k) or [])
+    floss["findings"] = analyzer.match_string_signatures(text) if text else []
+    floss["urls"] = flare_tools.floss_urls(floss)
+
+
+def run_flare(job: Job, cands: List[Dict[str, Any]], budget: int, append: bool = False) -> None:
+    def should_stop() -> bool:
+        return job.cancel_event.is_set() or bool(job.state.get("cancel_requested"))
+
+    def progress(msg: str) -> None:
+        with job.lock:
+            job.state.setdefault("flare", {})["msg"] = msg
+
+    with job.lock:
+        fl = job.state.setdefault("flare", {})
+        fl["status"] = "running"
+        fl["msg"] = f"{len(cands)} dosya inceleniyor..."
+    t0 = time.monotonic()
+    res = flare_tools.analyze_files(cands, job.case_dir / "flare", should_stop, budget, progress)
+    for r in res:
+        if (r.get("floss") or {}).get("status") == "done":
+            _floss_extras(r["floss"])
+    with job.lock:
+        fl = job.state.setdefault("flare", {})
+        fl["files"] = ((fl.get("files") or []) if append else []) + res
+        fl["status"] = "done"
+        fl["msg"] = f"{len(fl['files'])} dosya incelendi ({int(time.monotonic() - t0)} sn)."
+        fl["capa"] = flare_tools.capa_available()
+        fl["floss"] = flare_tools.floss_available()
+    job.log("capa / FLOSS: " + ", ".join(
+        f"{r['label']} (capa {(r.get('capa') or {}).get('status', '-')}, FLOSS {(r.get('floss') or {}).get('status', '-')})"
+        for r in res))
+
+
+def stage_flare(job: Job) -> None:
+    if not flare_available():
+        job.state["flare"] = {"status": "unavailable"}
+        return
+    too_big: List[str] = []
+    cands = _flare_candidates(job.state.get("static") or [], FLARE_MAX_FILES, too_big)
+    if not cands:
+        job.state["flare"] = {"status": "done", "files": [], "too_big": too_big,
+                              "msg": "İmzasız programlar capa / FLOSS için çok büyük." if too_big else "İmzasız program yok; capa / FLOSS gerekmedi."}
+        return
+    job.state["flare"] = {"too_big": too_big}
+    run_flare(job, cands, FLARE_BUDGET_SEC, append=True)
+
+
+def _start_flare_thread(job: Job) -> threading.Thread:
+    """capa / FLOSS take minutes; they run next to VirusTotal and the sandbox and are awaited before the report."""
+    def worker():
+        try:
+            stage_flare(job)
+        except Exception as e:  # noqa: BLE001 - optional step; never fail the analysis
+            job.log(f"capa / FLOSS hata verdi: {e}")
+            with job.lock:
+                job.state["flare"] = {"status": "error", "error": str(e)[:300]}
+            traceback.print_exc()
+        finally:
+            compute_verdict(job)
+            job.save()
+    th = threading.Thread(target=worker, name=f"flare-{job.id}", daemon=True)
+    th.start()
+    return th
+
+
+def _join_flare_thread(job: Job, th: Optional[threading.Thread]) -> None:
+    if th is None:
+        return
+    if th.is_alive():
+        job.stage("report", "running", "capa / FLOSS sonuçları bekleniyor...")
+    while th.is_alive():
+        th.join(1)
+
+
 def run_job(job: Job) -> None:
     current = None
     vt_thread: Optional[threading.Thread] = None
+    flare_thread: Optional[threading.Thread] = None
     try:
         if job.state.get("mode") == "url":
             for key in ("extract", "inventory", "static"):
@@ -551,6 +672,8 @@ def run_job(job: Job) -> None:
             current = key
             fn(job)
             compute_verdict(job)
+        if job.state.get("mode") != "url":
+            flare_thread = _start_flare_thread(job)
         job.check_cancel()
         if job.state.get("mode") == "url":
             current = "sandbox"
@@ -571,19 +694,23 @@ def run_job(job: Job) -> None:
             current = "sandbox"
             job.stage("sandbox", "waiting", "Hazır. Örneği izole ortamda çalıştırmak için 'Sandbox'ta Çalıştır' butonuna basın.")
         current = "report"
+        _join_flare_thread(job, flare_thread)
         stage_report(job)
         job.state["status"] = "waiting_sandbox" if job.state["stages"]["sandbox"]["status"] == "waiting" else "done"
     except Cancelled:
-        if vt_thread is not None:
-            job.cancel_event.set()
-            vt_thread.join(30)
+        job.cancel_event.set()
+        for th in (vt_thread, flare_thread):
+            if th is not None:
+                th.join(30)
         _mark_cancelled(job, current)
     except Exception as e:
         job.log(f"HATA ({current}): {e}")
         if current:
             job.stage(current, "error", str(e))
-        if vt_thread is not None:
-            _join_vt_thread(job, vt_thread)          # VirusTotal results are still useful after a sandbox error
+        if vt_thread is not None or flare_thread is not None:
+            if vt_thread is not None:
+                _join_vt_thread(job, vt_thread)          # VirusTotal results are still useful after a sandbox error
+            _join_flare_thread(job, flare_thread)
             if job.state["stages"]["report"]["status"] == "running":
                 job.stage("report", "pending", "")
         job.state["status"] = "error"
@@ -3341,6 +3468,16 @@ _ATTACK_MAP: List[Tuple[str, str, str, str]] = [
     (r"Ransomware_Shadow", "T1490", "Inhibit System Recovery", "Impact"),
     (r"Crypto_Miner", "T1496", "Resource Hijacking", "Impact"),
     (r"License_Service_Tamper|Lisans Müdahale", "T1489", "Service Stop", "Impact"),
+    # capa capability groups (notes) and combined rules
+    (r"Süreç enjeksiyonu|enjeksiyon deseni", "T1055", "Process Injection", "Defense Evasion"),
+    (r"parola ya da kart verisi|Bilgi çalma zinciri", "T1555", "Credentials from Password Stores", "Credential Access"),
+    (r"Tuş kaydı", "T1056.001", "Input Capture: Keylogging", "Collection"),
+    (r"Sanal makine / antivirüs tespiti|sandbox'ı fark", "T1497", "Virtualization/Sandbox Evasion", "Defense Evasion"),
+    (r"Kurtarmayı engelleme|Fidye yazılımı deseni", "T1486", "Data Encrypted for Impact", "Impact"),
+    (r"Bilgi çalma zinciri", "T1041", "Exfiltration Over C2 Channel", "Exfiltration"),
+    (r"İndirip çalıştırma", "T1105", "Ingress Tool Transfer", "Command and Control"),
+    (r"bıraktığı programı otomatik başlatmaya", "T1547.001", "Boot or Logon Autostart: Registry Run Keys / Startup Folder", "Persistence"),
+    (r"FLOSS:|gizlediği adrese", "T1027", "Obfuscated Files or Information", "Defense Evasion"),
 ]
 _KNOWN_BAD_RX = re.compile(r"^(MalwareBazaar|ThreatFox):|zararlı yazılım ailesi|^CIRCL Hashlookup: .* zararlı|"
                            r"^Bellek dökümünde YARA|^Zararlı ailesi tespit edildi")
@@ -3350,6 +3487,8 @@ def _attack_techniques(red: List[str], crack: List[str], notes: List[str]) -> Li
     """MITRE ATT&CK techniques behind the findings, each with the first finding that shows it."""
     out: List[Dict[str, str]] = []
     for rx, tid, name, tactic in _ATTACK_MAP:
+        if any(o["id"] == tid for o in out):
+            continue
         for level, items in (("red", red), ("crack", crack), ("note", notes)):
             hit = next((x for x in items if re.search(rx, x)), None)
             if hit:
@@ -3448,6 +3587,214 @@ def _installer_never_started(b: Dict[str, Any]) -> str:
             "basılmasını bekledi; kurulumun ne yaptığı incelenmedi. Ekran görüntülerine bakın. 'Sandbox'ta tekrar "
             "çalıştır' ile asıl kurulum dosyasını seçin ya da canlı ekranda sandbox penceresini öne getirip butona "
             "kendiniz basın.")
+
+
+def _flare_files(s: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [f for f in ((s.get("flare") or {}).get("files") or []) if isinstance(f, dict)]
+
+
+def _flare_findings(s: Dict[str, Any], red: List[str], notes: List[str]) -> None:
+    """capa / FLOSS results. capa capabilities are notes (ordinary programs have many); a capa malware-family rule
+    and a critical string rule on strings the program hid (FLOSS) are red. A tool that timed out or a file too large
+    for it is coverage, not suspicion: that is shown in the panel and the report, not added to the notes (it would
+    raise the score)."""
+    for f in _flare_files(s):
+        label = str(f.get("label") or "?")
+        capa = f.get("capa") or {}
+        if capa.get("status") == "done":
+            groups = capa.get("groups") or {}
+            if groups.get("family"):
+                red.append(f"capa zararlı ailesi kuralı: '{label}' — {', '.join(str(x) for x in groups['family'][:3])}")
+            other = [k for k in groups if k != "family" and k in flare_tools.GROUP_LABELS]
+            if other:
+                notes.append(f"capa yetenekleri: '{label}' (imzasız) — "
+                             + "; ".join(f"{flare_tools.GROUP_LABELS[k]} ({', '.join(str(x) for x in groups[k][:2])})" for k in other)
+                             + ". Tek başına zararlı anlamına gelmez; davranışla birlikte değerlendirilir.")
+        floss = f.get("floss") or {}
+        if floss.get("status") == "done":
+            for fd in floss.get("findings") or []:
+                msg = (f"FLOSS: '{label}' dosyasının gizleyip çalışırken oluşturduğu metinlerde {fd.get('category')}: "
+                       + ", ".join(str(x) for x in (fd.get("matches") or [])[:4]))
+                (red if fd.get("severity") == "critical" else notes).append(msg)
+            hosts = sorted({h for h in (flare_tools.url_host(u) for u in floss.get("urls") or [])
+                            if h and domain_class(h) not in _NOISE_DOMAIN_CLASSES})
+            if hosts:
+                notes.append(f"FLOSS: '{label}' dosyasında gizlenmiş adresler var: {', '.join(hosts[:8])}")
+
+
+# Combined rules: several weak signals that together are strong. Each one needs evidence of different kinds (what the
+# file can do, what it did in the sandbox, what went over the network), so none of them fires on one signal alone.
+_USER_DIR_RX = re.compile(r"\\AppData\\|\\Temp\\|\\ProgramData\\|\\Users\\Public\\", re.I)
+_TEMP_AUTOSTART_RX = re.compile(r"\\(Temp|Users\\Public)\\[^|]*?\.(exe|dll|scr|bat|cmd|ps1|vbs|js|hta)\b", re.I)
+# .NET framework tools stealers start and inject into (AgentTesla, RedLine, ...). Installers run some of them too, but
+# with arguments (RegAsm x.dll /codebase); a bare start followed by network traffic is the malware pattern.
+_INJECT_HOSTS = {"regasm.exe", "regsvcs.exe", "msbuild.exe", "installutil.exe", "applaunch.exe", "vbc.exe", "jsc.exe",
+                 "aspnet_compiler.exe", "cvtres.exe", "addinprocess.exe", "addinprocess32.exe", "caspol.exe", "ilasm.exe"}
+_RANSOM_CMD_RX = re.compile(r"vssadmin[^\r\n]{0,40}delete|wbadmin[^\r\n]{0,40}delete|bcdedit[^\r\n]{0,60}recoveryenabled|"
+                            r"shadowcopy[^\r\n]{0,20}delete", re.I)
+
+
+def _pid(v: Any) -> Optional[int]:
+    """Process ids come from inside the sandbox: anything but a plain int is ignored."""
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+
+def _proc_args(p: Dict[str, Any]) -> str:
+    cmd = str(p.get("CommandLine") or "").strip()
+    if cmd.startswith('"'):
+        end = cmd.find('"', 1)
+        return cmd[end + 1:].strip() if end > 0 else ""
+    return cmd.split(" ", 1)[1].strip() if " " in cmd else ""
+
+
+def _composite_rules(s: Dict[str, Any], b: Optional[Dict[str, Any]], url_mode: bool, pm_events: int) -> List[Dict[str, Any]]:
+    b = b or {}
+    out: List[Dict[str, Any]] = []
+
+    def add(cid: str, level: str, title: str, evidence: List[str]) -> None:
+        out.append({"id": cid, "level": level, "title": title, "evidence": evidence[:6],
+                    "text": f"Birleşik kural — {title}: " + " + ".join(evidence[:5])})
+
+    files = _flare_files(s)
+
+    def capa_has(key: str) -> List[str]:
+        return [str(f.get("label")) for f in files if ((f.get("capa") or {}).get("groups") or {}).get(key)]
+
+    unsigned_static = [st for st in s.get("static") or [] if (st.get("signature") or {}).get("status") != "Valid"]
+    procs = [p for p in b.get("Processes") or [] if isinstance(p, dict)]
+    tree = [p for p in procs if p.get("InTree") is True]
+    conns = [c for c in (b.get("Network") or {}).get("Connections") or [] if isinstance(c, dict)]
+    sample_conns = [c for c in conns if c.get("FromSample") is True]
+    fb = b.get("Files") or {}
+    dropped_sig = {str(d.get("Path") or "").lower(): str(d.get("SigStatus") or "")
+                   for d in fb.get("DroppedHashes") or [] if isinstance(d, dict)}
+    new_exec = [str(x) for x in fb.get("NewExecutables") or []
+                if _USER_DIR_RX.search(str(x)) and not _is_wsb_noise_dropped_file(str(x))
+                and not re.search(r"\\_MEI[0-9a-z]+\\mitmproxy_windows\\", str(x), re.I)
+                and not (url_mode and _edge_noise(str(x)))]
+    hs = b.get("Https") if isinstance(b.get("Https"), dict) else {}
+    flows = [f for f in hs.get("flows") or [] if isinstance(f, dict)]
+    net = s.get("network") or {}
+    names = [d for d in (net.get("dns") or []) + (net.get("sni") or []) if isinstance(d, dict)]
+    names += [{"name": h.get("host"), "class": h.get("class")} for h in net.get("http") or [] if isinstance(h, dict)]
+    fakenet_domains, _ = _extract_fakenet_targets(b.get("FakeNetRequests") or []) if b.get("FakeNetRequests") else ([], [])
+    honey = [str(a) for a in b.get("HoneyfileAlerts") or []
+             if not (url_mode and re.search(r" by (msedge|msedgewebview2)\.exe\b", str(a), re.I))]
+
+    # 1. credential theft: access to credentials + data going out
+    cred_beh: List[str] = []
+    if honey:
+        cred_beh.append(f"yem dosyalara erişim ({len(honey)})")
+    if pm_events:
+        cred_beh.append(f"hassas kimlik dosyalarına erişim ({pm_events} olay)")
+    cred_static = [f"capa: '{x}' kimlik verisi toplama yeteneği" for x in capa_has("credentials")]
+    for st in unsigned_static:
+        for sf in st.get("string_findings") or []:
+            if str(sf.get("category", "")).startswith("Infostealer") and sf.get("severity") == "critical":
+                cred_static.append(f"'{st.get('rel')}' tarayıcı/cüzdan yolları içeriyor ({sf.get('distinct')} farklı)")
+    for f in files:
+        for fd in (f.get("floss") or {}).get("findings") or []:
+            if str(fd.get("category", "")).startswith("Infostealer"):
+                cred_static.append(f"FLOSS: '{f.get('label')}' tarayıcı/cüzdan yollarını gizliyor")
+    noise = set(_NOISE_DOMAIN_CLASSES) | {"Adobe"}
+    exfil_strong: List[str] = []
+    abused = sorted({str(d.get("name")) for d in names if d.get("class") == CLASS_ABUSED and d.get("name")}
+                    | {f"{f.get('host')}" for f in flows if domain_class(str(f.get("host") or "")) == CLASS_ABUSED}
+                    | {d for d in fakenet_domains if domain_class(d) == CLASS_ABUSED})
+    if abused:
+        exfil_strong.append(f"kötüye kullanılan servisle iletişim ({', '.join(abused[:3])})")
+    sent = [f for f in flows if f.get("method") in ("POST", "PUT") and (f.get("req_bytes") or 0) > 0
+            and domain_class(str(f.get("host") or "")) not in noise
+            and not (url_mode and _BROWSER_SERVICE_HOST_RX.search(str(f.get("host") or "")))]
+    if sent:
+        exfil_strong.append(f"HTTPS ile veri gönderme ({', '.join(sorted({str(f.get('host')) for f in sent})[:3])})")
+    unknown = sorted({str(d.get("name")) for d in names if d.get("class") == CLASS_UNKNOWN and d.get("from_sample") and d.get("name")})
+    exfil_weak = [f"örneğin süreçleri bilinmeyen adrese bağlandı ({', '.join(unknown[:3])})"] if unknown else []
+    # Static credential evidence (strings, capabilities) needs strong evidence of sending; observed access to
+    # credential files is enough with any connection of the sample to an unknown address.
+    if (cred_beh and (exfil_strong or exfil_weak)) or (cred_static and exfil_strong):
+        add("credential_theft", "red", "Bilgi çalma zinciri (kimlik verisine erişim + dışarı veri gönderme)",
+            cred_beh[:2] + cred_static[:2] + exfil_strong[:2] + (exfil_weak[:1] if not exfil_strong else []))
+
+    # 2. download / unpack and run: an unsigned program the sample wrote to a user folder was started
+    new_lower = {x.lower() for x in new_exec}
+    started = []
+    for p in tree:
+        path = str(p.get("Path") or "").lower()
+        if path and path in new_lower and dropped_sig.get(path) != "Valid":
+            started.append(str(p.get("Name") or Path(path).name))
+    started = sorted(set(started))
+    if started:
+        if sample_conns:
+            add("dropper", "red", "İndirip çalıştırma (dropper)",
+                [f"örneğin süreçleri {len(sample_conns)} ağ bağlantısı kurdu",
+                 f"kullanıcı klasörüne bıraktığı imzasız programı çalıştırdı ({', '.join(started[:3])})"])
+        else:
+            add("dropped_exec", "note", "Bıraktığı imzasız programı çalıştırdı",
+                [f"kullanıcı klasörüne yazılan program başlatıldı ({', '.join(started[:3])})", "ağ bağlantısı görülmedi"])
+
+    # 3. autostart pointing at a program the sample dropped (or at anything in Temp / Users\Public)
+    P = b.get("Persistence") or {}
+    autos = [str(x) for k in ("RunKeys", "Tasks", "Services") for x in P.get(k) or []
+             if not _is_wsb_noise_task(str(x)) and not _is_wsb_noise_service(str(x)) and not (url_mode and _edge_noise(str(x)))]
+    persisted = []
+    for a in autos:
+        al = a.lower()
+        if any(x in al for x in new_lower if dropped_sig.get(x) != "Valid") or _TEMP_AUTOSTART_RX.search(a):
+            persisted.append(a[:160])
+    if persisted:
+        add("dropped_persistence", "red", "Örnek bıraktığı programı otomatik başlatmaya ekledi",
+            [f"otomatik başlatma kaydı: {persisted[0]}"] + ([f"+{len(persisted) - 1} kayıt daha"] if len(persisted) > 1 else []))
+
+    # 4. a bare .NET framework tool started by the sample and then talking to the network / injection evidence
+    hosts_started = [p for p in tree if str(p.get("Name") or "").lower() in _INJECT_HOSTS
+                     and not re.search(r"\.dll\b|/codebase|/u(nregister)?\b|\.csproj|\.sln|\.proj\b", _proc_args(p), re.I)]
+    if hosts_started:
+        pids = {_pid(p.get("Pid")) for p in hosts_started} - {None}
+        ev = []
+        host_conns = [c for c in conns if _pid(c.get("Pid")) in pids]
+        if host_conns:
+            ev.append(f"{host_conns[0].get('Process')} ağ bağlantısı kurdu ({host_conns[0].get('Remote')}:{host_conns[0].get('Port')})")
+        ev += [f"capa: '{x}' enjeksiyon yeteneği" for x in capa_has("inject")][:2]
+        mem = [h for h in b.get("MemoryYara") or [] if isinstance(h, dict) and re.search(r"Hollow|Inject", str(h.get("rule")), re.I)]
+        if mem:
+            ev.append(f"bellekte {mem[0].get('rule')}")
+        if ev:
+            add("dotnet_injection", "red", "Meşru .NET aracı içine kod enjeksiyonu deseni",
+                [f"örnek {', '.join(sorted({str(p.get('Name')) for p in hosts_started}))} başlattı (argümansız)"] + ev)
+
+    # 5. evasion ability + almost nothing happened in the sandbox
+    if b.get("Target") and not url_mode:
+        evasion = [f"capa: '{x}' sanal makine / antivirüs tespiti" for x in capa_has("evasion")]
+        for st in unsigned_static:
+            for sf in st.get("string_findings") or []:
+                if str(sf.get("category", "")).startswith("Anti-VM") and sf.get("severity") in ("high", "critical"):
+                    evasion.append(f"'{st.get('rel')}' sanal makine adlarını arıyor ({sf.get('distinct')} farklı)")
+        quiet = len(tree) <= 1 and not sample_conns and int(fb.get("NewCount") or 0) < 3
+        if evasion and quiet:
+            add("sandbox_evasion", "note", "Örnek sandbox'ı fark edip sessiz kalmış olabilir",
+                evasion[:2] + ["sandbox'ta neredeyse hiç davranış görülmedi (VirtualBox ya da standart kullanıcı seçeneğiyle yeniden deneyin)"])
+
+    # 6. an address the program hid (FLOSS) was actually contacted
+    contacted = {str(d.get("name") or "").lower() for d in names} | {str(f.get("host") or "").lower() for f in flows} \
+        | {d.lower() for d in fakenet_domains}
+    contacted.discard("")
+    for f in files:
+        hosts = {flare_tools.url_host(u) for u in (f.get("floss") or {}).get("urls") or []}
+        hit = sorted(h for h in hosts if h in contacted and domain_class(h) not in noise)
+        if hit:
+            add("hidden_address", "red", "Dosyanın gizlediği adrese bağlanıldı",
+                [f"FLOSS: '{f.get('label')}' bu adresleri gizliyor", f"sandbox'ta bağlanıldı: {', '.join(hit[:4])}"])
+
+    # 7. ransomware: decoy files changed + recovery being disabled
+    changed = [a for a in honey if re.search(r"DELETED|MODIFIED|\(Modified\)", a)]
+    ransom_ev = [f"capa: '{x}' kurtarmayı engelleme yeteneği" for x in capa_has("impact")]
+    ransom_ev += [f"komut: {str(p.get('CommandLine'))[:100]}" for p in procs if _RANSOM_CMD_RX.search(str(p.get("CommandLine") or ""))][:2]
+    for st in s.get("static") or []:
+        ransom_ev += [f"YARA {ym.get('rule')} ('{st.get('rel')}')" for ym in st.get("yara_matches") or [] if "Ransom" in str(ym.get("rule"))][:1]
+    if len(changed) >= 2 and ransom_ev:
+        add("ransomware", "red", "Fidye yazılımı deseni", [f"{len(changed)} yem dosya değiştirildi/silindi"] + ransom_ev[:3])
+    return out
 
 
 def compute_verdict(job: Job) -> None:
@@ -3805,6 +4152,11 @@ def _compute_verdict(job: Job) -> None:
             notes.append(f"DNS-over-HTTPS (DoH) sunucusu tespit edildi: {', '.join(str(x) for x in net['doh_domains'][:5])} — şifreli DNS sorguları normal DNS listesinde görünmeyebilir.")
         if net.get("partial"):
             notes.append(f"Ağ özeti kısmi: {', '.join(net['partial'])} sorgusu zaman aşımına uğradı (kayıt çok büyük). Tamamı için kaydı Wireshark'ta açın.")
+    _flare_findings(s, red, notes)
+    pm_events = len(pm_sum["SensitiveEvents"]) if isinstance(pm_sum, dict) and isinstance(pm_sum.get("SensitiveEvents"), list) else 0
+    composite = _composite_rules(s, b, url_mode, pm_events)
+    for c in composite:
+        (red if c["level"] == "red" else notes).append(c["text"])
     # Coverage: "no red flags" must not look like a clean bill of health when checks did not actually run.
     stg = s["stages"]
     finished = s.get("status") not in ("running",)
@@ -3833,6 +4185,8 @@ def _compute_verdict(job: Job) -> None:
     verdict_obj: Dict[str, Any] = {"level": level, "red": red, "notes": notes, "crack": crack, "not_run": missing}
     verdict_obj.update(_score(red, crack, notes, missing, finished))
     verdict_obj["attack"] = _attack_techniques(red, crack, notes)
+    if composite:
+        verdict_obj["composite"] = [{k: c[k] for k in ("id", "level", "title", "evidence")} for c in composite]
     if families_out:
         verdict_obj["families"] = families_out
     if "Kurulum" in missing:
@@ -3840,6 +4194,39 @@ def _compute_verdict(job: Job) -> None:
     if known_good:
         verdict_obj["known_good"] = known_good
     s["verdict"] = verdict_obj
+
+
+def _proc_tree_lines(procs: List[Dict[str, Any]], limit: int = 200) -> List[str]:
+    """Markdown list of processes nested under the process that started them. A parent must appear before its child
+    (PIDs are reused in long runs); each process is printed once."""
+    first: Dict[Any, int] = {}
+    for i, p in enumerate(procs):
+        first.setdefault(_pid(p.get("Pid")), i)
+    kids: Dict[Any, List[int]] = {}
+    roots: List[int] = []
+    for i, p in enumerate(procs):
+        pid, ppid = _pid(p.get("Pid")), _pid(p.get("Ppid"))
+        pi = first.get(ppid) if ppid is not None else None
+        if pi is not None and pi < i and ppid != pid:
+            kids.setdefault(ppid, []).append(i)
+        else:
+            roots.append(i)
+    out: List[str] = []
+    seen: set = set()
+
+    def walk(i: int, depth: int) -> None:
+        if i in seen or len(out) >= limit:
+            return
+        seen.add(i)
+        p = procs[i]
+        flag = " **ŞÜPHELİ**" if p.get("Suspicious") else ""
+        cmd = str(p.get("CommandLine") or p.get("Path") or "")[:160].replace("`", "'")
+        out.append(f"{'  ' * depth}- {p.get('Name')} ({p.get('Pid')}){flag}" + (f": `{cmd}`" if cmd else ""))
+        for k in kids.get(_pid(p.get("Pid")), []):
+            walk(k, depth + 1)
+    for r in roots:
+        walk(r, 0)
+    return out
 
 
 def stage_report(job: Job) -> None:
@@ -3894,9 +4281,38 @@ def write_report(job: Job) -> None:
         L += ["", "## Zararlı ailesi ve ayar (CAPE ayıklayıcıları)", ""]
         L += [f"- **{f['family']}** — {f['label']} ({f['source']})" + (f": {', '.join(f['c2'])}" if f.get("c2") else "")
               for f in v["families"]]
+    if v.get("composite"):
+        L += ["", "## Birleşik kurallar (farklı türde kanıtların birlikte görüldüğü)", ""]
+        L += [f"- **{c['title']}** ({'kırmızı' if c['level'] == 'red' else 'not'}): " + "; ".join(c.get("evidence") or [])
+              for c in v["composite"]]
     if v.get("attack"):
         L += ["", "## MITRE ATT&CK teknikleri", ""]
         L += [f"- [{t['id']}]({t['url']}) {t['name']} ({t['tactic']}) — {t['evidence']}" for t in v["attack"]]
+    flare_files = _flare_files(s)
+    too_big = (s.get("flare") or {}).get("too_big") or []
+    if flare_files or too_big:
+        L += ["", f"## Yetenekler ve gizlenmiş metinler (capa {flare_tools.CAPA_VERSION} / FLOSS {flare_tools.FLOSS_VERSION})", ""]
+        if too_big:
+            L += [f"- {len(too_big)} imzasız program {flare_tools.CAPA_MAX_BYTES // (1024 * 1024)} MB'tan büyük olduğu için incelenmedi "
+                  f"(bu araçlar büyük dosyalarda saatler sürebilir): " + ", ".join(too_big[:8]), ""]
+        for f in flare_files:
+            capa, floss = f.get("capa") or {}, f.get("floss") or {}
+            L.append(f"### {f.get('label')}")
+            if capa.get("status") == "done":
+                groups = capa.get("groups") or {}
+                L.append(f"- capa: {len(capa.get('capabilities') or [])} yetenek"
+                         + (". Karara giren gruplar: " + "; ".join(f"{flare_tools.GROUP_LABELS.get(k, k)} ({', '.join(v_[:3])})"
+                                                                   for k, v_ in groups.items()) if groups else ""))
+            elif capa.get("status"):
+                L.append(f"- capa: {capa.get('status')} {capa.get('error') or ''}".rstrip())
+            if floss.get("status") == "done":
+                L.append(f"- FLOSS: {floss.get('total', 0)} gizlenmiş metin"
+                         + (f"; adresler: {', '.join(floss.get('urls')[:10])}" if floss.get("urls") else "")
+                         + ("; kural eşleşmeleri: " + ", ".join(str(x.get("category")) for x in floss.get("findings") or [])
+                            if floss.get("findings") else ""))
+            elif floss.get("status"):
+                L.append(f"- FLOSS: {floss.get('status')} {floss.get('error') or ''}".rstrip())
+            L.append("")
     inv = s.get("inventory") or {}
     L += ["", "## Envanter", "", f"{inv.get('files', 0)} dosya, {inv.get('pe', 0)} çalıştırılabilir, {inv.get('unsigned', 0)} imzasız, "
           f"{inv.get('hash_mismatch', 0)} imzası bozuk, {inv.get('missing', 0)} kayıp.", ""]
@@ -3965,6 +4381,9 @@ def write_report(job: Job) -> None:
             items = items or []
             L.append(f"### {title} ({len(items)})")
             L += [f"- `{x}`" for x in items[:60]] + [""]
+        tree_lines = _proc_tree_lines([p for p in b.get("Processes") or [] if isinstance(p, dict) and p.get("InTree") is True])
+        if tree_lines:
+            L += ["### Örneğin süreç ağacı", ""] + tree_lines + [""]
         L.append("### İşlemler")
         for p in (b.get("Processes") or [])[:150]:
             flag = (" **ŞÜPHELİ**" if p.get("Suspicious") else "") + (" [örnek]" if p.get("InTree") else "")
@@ -4068,7 +4487,8 @@ def write_html_report(job: Job, md_lines: List[str]) -> None:
             if not in_list:
                 in_list = True
                 html_parts.append("<ul>")
-            html_parts.append(f"<li>{_render_inline_md(line_s[2:])}</li>")
+            depth = min(6, (len(line) - len(line.lstrip(" "))) // 2)
+            html_parts.append(f"<li class=\"d{depth}\">{_render_inline_md(line_s[2:])}</li>" if depth else f"<li>{_render_inline_md(line_s[2:])}</li>")
             continue
 
         close_blocks()
@@ -4104,6 +4524,7 @@ def write_html_report(job: Job, md_lines: List[str]) -> None:
     code {{ background: #1e293b; color: #38bdf8; padding: 0.15rem 0.3rem; border-radius: 4px; font-family: Consolas, monospace; font-size: 0.85em; }}
     ul {{ padding-left: 1.25rem; margin: 0.4rem 0; }}
     li {{ margin: 0.25rem 0; }}
+    li.d1 {{ margin-left: 1.2rem; }} li.d2 {{ margin-left: 2.4rem; }} li.d3 {{ margin-left: 3.6rem; }} li.d4 {{ margin-left: 4.8rem; }} li.d5, li.d6 {{ margin-left: 6rem; }}
     .table-wrap {{ overflow-x: auto; margin: 1rem 0; }}
     table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
     th, td {{ padding: 0.5rem; text-align: left; border: 1px solid #1e293b; }}

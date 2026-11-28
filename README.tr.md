@@ -37,6 +37,8 @@
 
 - **Bağlantı (URL) Analizi:** Bağlantı host'ta hiç açılmaz. Sandbox içinde Edge kendi profiliyle açar (SmartScreen ve indirme sorusu kapalı); yönlendirme zinciri kaydedilir, adres VirusTotal'de sorulur (yalnızca adres gönderilir) ve indirilen her dosya şifrelenerek dışarı alınıp çalıştırılmadan incelenir. Edge'in kendisi dışında bir program başlatması kırmızı bulgudur.
 - **Zararlı Ailesi & C2 Ayarı Çıkarma:** [CAPE-parsers](https://github.com/CAPESandbox/CAPE-parsers) (66 aile) en riskli dosyalarda ve bellek dökümlerinden kesilen PE görüntülerinde ayrı bir süreç ve ortamda çalışır; bulunan C2 adresleri karara, rapora ve IOC dışa aktarımına girer.
+- **Yetenek ve Gizli Metin (capa / FLOSS, isteğe bağlı):** Mandiant'ın [capa](https://github.com/mandiant/capa) aracı en riskli imzasız programların neler yapabildiğini, [FLOSS](https://github.com/mandiant/flare-floss) ise yalnızca çalışırken oluşturdukları gizli metinleri çıkarır; ikisi de sandbox'la eş zamanlı çalışır ve dosyayı çalıştırmaz. Tek bir yetenek asla kırmızı sayılmaz (notepad.exe'de bile 30'dan fazla çıkar); yalnızca enjeksiyon, kimlik verisi toplama, tuş kaydı, sanal makine tespiti, kalıcılık ve C2 grupları not olarak karara girer. capa'nın zararlı ailesi kuralı ya da FLOSS metinlerinde gizlenmiş bir C2 adresi kırmızıdır.
+- **Birleşik Kurallar ve Süreç Ağacı:** Farklı türde kanıtlar birlikte görülünce devreye giren kurallar: kimlik verisine erişim + dışarı veri gönderme, indirip bıraktığı imzasız programı çalıştırma, bıraktığı programı otomatik başlatmaya ekleme, argümansız başlatılan .NET aracının (RegAsm, MSBuild...) ağa bağlanması, sanal makine tespit yeteneği + sandbox'ta hiçbir şey olmaması, dosyanın gizlediği adrese bağlanılması, yem dosyaların değişmesi + kurtarmanın kapatılması. Örneğin süreç ağacı panelde ve raporda gösterilir.
 - **Bellek Taraması:** Örneğin işlemlerinin bellek dökümü 6. saniyede (hızlı kapanan stealer'lar için) ve sonda alınır, YARA ile yalnızca RAM'de taranır ve silinir.
 - **HTTPS Trafiğini Çözme (isteğe bağlı):** Sandbox içinde `mitmproxy` çalışır; istek yöntemi, tam adres, durum kodu, boyut ve gönderilen verinin ilk 1 KB'ı kaydedilir. Telegram, Discord webhook, paste siteleri gibi kötüye kullanılan servislere veri gitmesi kırmızı bulgudur.
 - **İnternetsiz Mod & Yem Dosyalar:** İnternet kapalıyken sandbox içindeki sahte DNS / HTTP sunucusu (FakeNet) örneğin bağlanmak istediği adresleri yakalar. Sahte tarayıcı, cüzdan ve belge dosyaları okunur ya da şifrelenirse kırmızı bulgu olur.
@@ -60,6 +62,7 @@
 7. *(İsteğe bağlı)* Repo dışında, `%LOCALAPPDATA%\SafeBox\` altında duran araçlar (yoksa ilgili adım atlanır ve panel bunu söyler):
    - `extractor-venv\` (`CAPE-parsers` kurulu Python 3.13 ortamı) ve `cape-rules\` (CAPE aile YARA kuralları, GPLv3): zararlı ailesi / C2 ayarı çıkarma için.
    - `mitmproxy\mitmdump.exe`: HTTPS çözme için (SHA-256 ile sabitlenmiş, yalnızca sandbox içinde çalışır).
+   - `flare\capa.exe` (capa v10.0.0) ve `flare\floss.exe` (FLOSS v3.2.0): Mandiant'ın GitHub sürümlerindeki tek dosyalık Windows yapıları (SHA-256 ile sabitlenmiş; ana bilgisayarda dosyayı yalnızca okurlar, çalıştırmazlar).
 
 ---
 
@@ -84,6 +87,7 @@ pytest
 | `yara_scanner.py` | `yara-python` + yerleşik offline YARA ayrıştırıcı motoru |
 | `vt_client.py` | VirusTotal API istemcisi (kota yönetimi, akışlı büyük dosya yükleme) |
 | `intel_client.py` | MalwareBazaar & Hybrid Analysis salt hash sorgu istemcisi |
+| `flare_tools.py` | capa (yetenekler) ve FLOSS (gizlenmiş metinler) çalıştırıcısı; hash sabitleme, süre sınırı, çıktı ayrıştırma |
 | `config_extractor.py` | CAPE-parsers ile zararlı ailesi / C2 ayarı çıkarma (ayrı Python ortamında, ayrı süreç olarak çalışır) |
 | `sandbox_manager.py` | Sertleştirilmiş `.wsb` üretimi, Sandbox yaşam döngüsü, VirtualBox izolasyonu, `HKCU` sağ tık menüsü |
 | `enqueue.py` | Sağ tık menüsünden hızlı analiz başlatıcı |

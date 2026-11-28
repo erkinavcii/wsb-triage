@@ -54,8 +54,13 @@ A new analysis is a four-step wizard: pick the source (file, folder, archive or 
   - Executables and scripts the sample drops (unsigned, suspicious locations first) are copied out XOR-encoded and get the same static analysis, signature, YARA and config extraction on the host, never run. A file the host antivirus removes is reported red.
   - **Memory dumps:** private and executable memory of the sample's processes (an early dump after 6 s, since stealers exit fast, and one at the end) is scanned with YARA in RAM and then deleted.
   - **Family and C2 config extraction** with [CAPE parsers](https://github.com/CAPESandbox/CAPE-parsers) (66 families) on the riskiest files and on carved PE images from the memory dumps. Runs in a separate process and environment; config addresses become C2 IOCs.
+- **Capabilities & Hidden Strings (capa / FLOSS, optional):**
+  - Mandiant's [capa](https://github.com/mandiant/capa) lists what the riskiest unsigned programs can do, and [FLOSS](https://github.com/mandiant/flare-floss) recovers the strings they only build at run time; both run next to the sandbox and never execute the file.
+  - A capability alone is never red (notepad.exe has 30+). Only a few groups (injection, credential collection, keylogging, VM detection, persistence, C2) are carried into the verdict as notes; a capa malware-family rule or a C2 address hidden in FLOSS strings is red.
 - **Verdict, Score & MITRE ATT&CK:**
   - Red / review / clean verdict with a **1–10 score** (10 = known malware, "incomplete" when a check did not run) and findings mapped to **ATT&CK techniques** with evidence.
+  - **Combined rules** that need evidence of different kinds before they fire: credential access + data sent out, download + running an unsigned dropped program, autostart of a dropped program, a bare .NET tool (RegAsm, MSBuild...) started and then talking to the network, evasion ability + a sandbox run where nothing happened, an address the file hid being contacted, decoy files changed + recovery disabled.
+  - **Process tree** of the sample in the panel and the report.
 - **Multi-Source Threat Intel:**
   - Dropped executables are hashed inside the sandbox and looked up on VirusTotal without uploading them.
   - Optional **MalwareBazaar & Hybrid Analysis** hash-only enrichment (available automatically as a backup when VirusTotal has no key or hits quota, or per file on demand).
@@ -116,6 +121,7 @@ A new analysis is a four-step wizard: pick the source (file, folder, archive or 
 6. *(Optional)* Tools kept outside the repository under `%LOCALAPPDATA%\SafeBox\` (without them the step is skipped and the panel says so):
    - `extractor-venv\` (a Python 3.13 venv with `CAPE-parsers`) and `cape-rules\` (CAPE family YARA rules, GPLv3) for family / C2 config extraction.
    - `mitmproxy\mitmdump.exe` for HTTPS decryption (SHA-256 pinned, only ever run inside the sandbox).
+   - `flare\capa.exe` (capa v10.0.0) and `flare\floss.exe` (FLOSS v3.2.0), the standalone Windows builds from Mandiant's GitHub releases (SHA-256 pinned; they read files on the host, they never run them).
 
 ---
 

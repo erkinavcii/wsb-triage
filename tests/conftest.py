@@ -36,6 +36,8 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline, "_NOTIFY_ALLOW", False)
     # the CAPE family/config extractor is an optional local install: tests never depend on it
     monkeypatch.setattr(pipeline, "config_extractor_available", lambda: False)
+    # capa / FLOSS likewise (and they take minutes per file)
+    monkeypatch.setattr(pipeline, "flare_available", lambda: False)
     with pipeline.JOBS_LOCK:
         pipeline.JOBS.clear()
     yield cases

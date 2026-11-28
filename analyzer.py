@@ -790,6 +790,36 @@ _SYSBIN_NAMES = {
 }
 
 
+def match_string_signatures(text: str) -> List[Dict[str, Any]]:
+    """STRING_SIGNATURES over a text: one finding per category, escalated when several different traits match.
+    Also used for the strings FLOSS rebuilds from a program (pipeline)."""
+    string_findings = []
+    for rule in STRING_SIGNATURES:
+        matched_items = []
+        for pat in rule["patterns"]:
+            m = re.search(pat, text, flags=re.IGNORECASE)   # search, not findall: groups would hide the full match
+            if m:
+                sample_match = m.group(0).strip()[:80]
+                if sample_match not in matched_items:
+                    matched_items.append(sample_match)
+        if matched_items:
+            severity = rule["severity"]
+            esc = rule.get("escalate")
+            extra = 0
+            if esc and len(matched_items) >= esc[0]:
+                severity = esc[1]
+                extra = min(20, 5 * (len(matched_items) - esc[0]))   # each further distinct trait adds weight
+            string_findings.append({
+                "extra_points": extra,
+                "category": rule["category"],
+                "severity": severity,
+                "description": rule["description"],
+                "matches": matched_items[:8],
+                "distinct": len(matched_items),
+            })
+    return string_findings
+
+
 def analyze_single_file(file_path: str, sig_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     path_obj = Path(file_path)
     file_size = path_obj.stat().st_size
@@ -872,30 +902,7 @@ def analyze_single_file(file_path: str, sig_info: Optional[Dict[str, Any]] = Non
                 "description": f"LNK kısayolu sistem aracı/komut çalıştırıyor: {cmd_blob.strip()[:160]}",
             })
 
-    string_findings = []
-    for rule in STRING_SIGNATURES:
-        matched_items = []
-        for pat in rule["patterns"]:
-            m = re.search(pat, extracted_text, flags=re.IGNORECASE)   # search, not findall: groups would hide the full match
-            if m:
-                sample_match = m.group(0).strip()[:80]
-                if sample_match not in matched_items:
-                    matched_items.append(sample_match)
-        if matched_items:
-            severity = rule["severity"]
-            esc = rule.get("escalate")
-            extra = 0
-            if esc and len(matched_items) >= esc[0]:
-                severity = esc[1]
-                extra = min(20, 5 * (len(matched_items) - esc[0]))   # each further distinct trait adds weight
-            string_findings.append({
-                "extra_points": extra,
-                "category": rule["category"],
-                "severity": severity,
-                "description": rule["description"],
-                "matches": matched_items[:8],
-                "distinct": len(matched_items),
-            })
+    string_findings = match_string_signatures(extracted_text)
 
     # Extract URLs and IPv4 addresses of interest
     urls = list(set(re.findall(r"https?://[a-zA-Z0-9\-\._~:/\?#\[\]@!\$&'\(\)\*\+,;=%]{8,120}", extracted_text)))

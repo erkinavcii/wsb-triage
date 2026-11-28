@@ -283,6 +283,8 @@ def system_status():
     caps["yara"] = yara_scanner.rules_status()
     caps["config_extractor"] = pipeline.config_extractor_available()
     caps["mitmproxy"] = pipeline.mitm_available()
+    caps["capa"] = pipeline.flare_tools.capa_available()
+    caps["floss"] = pipeline.flare_tools.floss_available()
     icfg = pipeline._get_intel_config()
     caps["mb_enabled"] = icfg["mb_enabled"]
     caps["circl_enabled"] = bool(icfg.get("circl_enabled", False))

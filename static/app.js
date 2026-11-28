@@ -163,6 +163,8 @@ function capGroups() {
         desc: y ? `${asNum(y.rules_count)} kural${yProbs.length ? `, ${yProbs.length} dosya atlandı` : ''}${y.engine !== 'yara-python' ? ' · yerleşik motor' : ''}.` : 'Durum bilinmiyor.',
         action: y ? '<button class="btn btn-sm" data-act="yara">Kuralları yönet</button>' : '' },
       { name: 'Zararlı ailesi ve ayar ayıklama (CAPE)', tone: caps.config_extractor ? 'ok' : 'info', desc: caps.config_extractor ? 'Bilinen ailelerin C2 adresleri ve ayarları çıkarılır.' : 'Kurulu değil.', action: '' },
+      { name: 'Yetenek ve gizli metin (capa / FLOSS)', tone: caps.capa && caps.floss ? 'ok' : (caps.capa || caps.floss) ? 'med' : 'info',
+        desc: caps.capa && caps.floss ? 'İmzasız programların ne yapabildiği (capa) ve gizlediği metinler (FLOSS) çıkarılır.' : (caps.capa || caps.floss) ? `Yalnızca ${caps.capa ? 'capa' : 'FLOSS'} kurulu.` : 'Kurulu değil.', action: '' },
       { name: 'HTTPS çözme (mitmproxy)', tone: caps.mitmproxy ? 'ok' : 'info', desc: caps.mitmproxy ? 'Şifreli trafiğin içeriği isteğe bağlı kaydedilebilir.' : 'Kurulu değil.', action: '' },
     ]],
     ['İstihbarat', 'cat-intel', [
@@ -670,9 +672,9 @@ async function doAction(act) {
 }
 
 // ---------------------------------------------------------------- active job
-let activeTab = 'summary', staticFilter = 'all', filesSub = 'static', procFilter = 'all';
+let activeTab = 'summary', staticFilter = 'all', filesSub = 'static', procFilter = 'auto';
 function openJob(id) {
-  if (id !== activeJobId) { activeTab = 'summary'; filesSub = 'static'; procFilter = 'all'; Object.keys(pages).forEach(k => { if (!k.startsWith('jobs') && !k.startsWith('watch')) delete pages[k]; }); }
+  if (id !== activeJobId) { activeTab = 'summary'; filesSub = 'static'; procFilter = 'auto'; Object.keys(pages).forEach(k => { if (!k.startsWith('jobs') && !k.startsWith('watch')) delete pages[k]; }); }
   showView('jobSection');
   activeJobId = id; activeJob = null;
   history.replaceState(null, '', '#' + encodeURIComponent(id));
@@ -846,8 +848,15 @@ function verdictHtml(st) {
       <div class="meter">${Array.from({ length: 10 }, (_, i) => `<i class="${i < score ? 'on' : ''}"></i>`).join('')}</div></div>` : '';
   return `<div class="verdict ${tone}"><div class="verdict-top"><div class="grow"><div class="verdict-level">${esc(lvl)}</div><div class="verdict-title">${esc(title)}</div><div class="verdict-sub">${esc(sub)}</div></div>${scoreHtml}</div></div>`;
 }
+const COMPOSITE_PREFIX = 'Birleşik kural — ';
 function findingRows(list, tone, tag) {
-  return list.map(x => `<div class="finding ${tone}"><span class="finding-tag">${esc(tag)}</span><span class="grow break">${esc(x)}</span></div>`).join('');
+  return list.map(x => {
+    const s = String(x);
+    if (!s.startsWith(COMPOSITE_PREFIX)) return `<div class="finding ${tone}"><span class="finding-tag">${esc(tag)}</span><span class="grow break">${esc(s)}</span></div>`;
+    const body = s.slice(COMPOSITE_PREFIX.length), cut = body.indexOf(': ');
+    const title = cut > 0 ? body.slice(0, cut) : body, ev = cut > 0 ? body.slice(cut + 2).split(' + ') : [];
+    return `<div class="finding ${tone}"><span class="finding-tag" title="Birden çok farklı türde kanıtın birlikte görüldüğü kural">Birleşik</span><span class="grow break"><b>${esc(title)}</b>${ev.length ? `<span class="row row-wrap mt-sm">${ev.map(e => `<span class="chip">${esc(e)}</span>`).join('')}</span>` : ''}</span></div>`;
+  }).join('');
 }
 function renderSummaryTab(st, ctx) {
   const v = st.verdict || {};
@@ -937,6 +946,35 @@ function categoryHtml(c) {
     ${full.length ? `<div class="grid-2">${full.map(x => lcard(x.key, x.title, x.items, x.tone)).join('')}</div>` : ''}
     ${clean.length ? `<div class="clean-line">${full.length ? 'Bulgu çıkmayanlar' : 'Bulgu yok'}: <b>${clean.map(x => esc(x.title)).join(' · ')}</b></div>` : ''}</div>`;
 }
+// Process tree of the sample: children grouped under the process that started them (Ppid). PIDs can be reused in a
+// long run, so each node is visited once and a parent must have been seen before its child.
+function procTreeHtml(procs, conns) {
+  const byPid = new Map(), kids = new Map();
+  procs.forEach((p, i) => { if (!byPid.has(p.Pid)) byPid.set(p.Pid, { p, i }); });
+  const roots = [];
+  procs.forEach((p, i) => {
+    const par = byPid.get(p.Ppid);
+    if (par && par.i < i && p.Ppid !== p.Pid) { if (!kids.has(p.Ppid)) kids.set(p.Ppid, []); kids.get(p.Ppid).push(p); }
+    else roots.push(p);
+  });
+  const netBy = new Map();
+  asObjs(conns).forEach(c => { if (!netBy.has(c.Pid)) netBy.set(c.Pid, []); netBy.get(c.Pid).push(`${c.Remote}:${c.Port}`); });
+  const seen = new Set();
+  let count = 0;
+  const node = (p, depth) => {
+    if (seen.has(p) || count >= 300) return '';
+    seen.add(p); count++;
+    const net = netBy.get(p.Pid) || [];
+    const cmd = String(p.CommandLine || p.Path || '');
+    const children = (kids.get(p.Pid) || []).map(c => node(c, depth + 1)).join('');
+    return `<li class="ptree-item"><div class="ptree-row ${p.Suspicious ? 'tone-crit' : ''}">
+      <span class="ptree-name">${esc(p.Name)}</span><span class="faint tiny">pid ${esc(p.Pid)} · ${esc(p.FirstSeen)}</span>
+      ${p.Suspicious ? '<span class="chip tone-crit">şüpheli komut</span>' : ''}${net.length ? `<span class="chip cat-net" title="${esc(net.slice(0, 8).join(' · '))}">${net.length} bağlantı</span>` : ''}
+      ${cmd ? `<div class="ptree-cmd mono" title="${esc(cmd.slice(0, 1000))}">${esc(cmd.slice(0, 300))}</div>` : ''}</div>${children ? `<ul class="ptree">${children}</ul>` : ''}</li>`;
+  };
+  const html = roots.map(r => node(r, 0)).join('');
+  return `<ul class="ptree ptree-root">${html}</ul>${count >= 300 ? '<div class="clean-line">İlk 300 işlem gösteriliyor; tamamı için "Tümü" listesine bakın.</div>' : ''}`;
+}
 function renderBehaviorTab(st, ctx) {
   const s = (st.stages || {}).sandbox || {};
   if (!ctx.b && !ctx.live) {
@@ -953,15 +991,18 @@ function renderBehaviorTab(st, ctx) {
   const chips = [lanChip, o.enable_vgpu ? '<span class="chip tone-high">Ekran kartı açık — yalıtım daha zayıf</span>' : '',
     src.RunMode ? `<span class="chip">${esc(src.RunMode === 'copied' ? 'Örnek sandbox diskine kopyalanıp çalıştırıldı' : 'Örnek kopyalanmadan, salt okunur klasörden çalıştırıldı')}</span>` : ''].join('');
 
-  const PF = [['all', 'Tümü', () => true], ['tree', 'Örnekten', p => p.InTree], ['susp', 'Şüpheli', p => p.Suspicious]];
-  const pf = PF.find(x => x[0] === procFilter) || PF[0];
+  const PF = [['tree', 'Ağaç (örnek)', p => p.InTree], ['all', 'Tümü', () => true], ['sample', 'Örnekten', p => p.InTree], ['susp', 'Şüpheli', p => p.Suspicious]];
+  const pf = PF.find(x => x[0] === procFilter) || (ctx.procs.some(p => p.InTree) ? PF[0] : PF[1]);
   const plist = ctx.procs.filter(pf[2]);
   const pg = paginate('procs', plist, 20);
-  const procTable = `<div class="card"><div class="card-head"><div><h3>Başlayan işlemler</h3><p>Sandbox'ta izleme süresince başlayan her işlem; örneğin kendi başlattıkları ve şüpheli komut satırları işaretli.</p></div>
-      <div class="seg">${PF.map(([id, label, fn]) => `<button class="seg-btn ${procFilter === id ? 'active' : ''}" data-proc-filter="${id}">${label} <span class="count">${ctx.procs.filter(fn).length}</span></button>`).join('')}</div></div>
-    ${plist.length ? `<div class="table-wrap"><table class="tbl"><tr><th>Saat</th><th>İşlem</th><th>Üst işlem</th><th>Komut satırı</th></tr>${pg.items.map(p => `<tr class="${p.Suspicious ? 'hl tone-crit' : p.InTree ? 'hl cat-proc' : ''}">
+  const listHtml = !plist.length ? '<div class="empty">Bu filtreye uyan işlem yok.</div>'
+    : pf[0] === 'tree' ? procTreeHtml(plist, ctx.conns)
+    : `<div class="table-wrap"><table class="tbl"><tr><th>Saat</th><th>İşlem</th><th>Üst işlem</th><th>Komut satırı</th></tr>${pg.items.map(p => `<tr class="${p.Suspicious ? 'hl tone-crit' : p.InTree ? 'hl cat-proc' : ''}">
       <td class="nowrap muted">${esc(p.FirstSeen)}</td><td class="nowrap">${esc(p.Name)} <span class="faint">${esc(p.Pid)}</span>${p.Suspicious ? ' <span class="chip tone-crit">şüpheli</span>' : p.InTree ? ' <span class="chip cat-proc">örnek</span>' : ''}</td>
-      <td class="muted">${esc(p.ParentName)}</td><td class="mono break">${esc(String(p.CommandLine || p.Path || '').slice(0, 400))}</td></tr>`).join('')}</table></div>${pg.ctrl}` : '<div class="empty">Bu filtreye uyan işlem yok.</div>'}</div>`;
+      <td class="muted">${esc(p.ParentName)}</td><td class="mono break">${esc(String(p.CommandLine || p.Path || '').slice(0, 400))}</td></tr>`).join('')}</table></div>${pg.ctrl}`;
+  const procTable = `<div class="card"><div class="card-head"><div><h3>Başlayan işlemler</h3><p>${pf[0] === 'tree' ? 'Örneğin başlattığı işlemler, kimin kimi başlattığına göre. Şüpheli komut satırları ve ağ bağlantısı kuran işlemler işaretli.' : "Sandbox'ta izleme süresince başlayan her işlem; örneğin kendi başlattıkları ve şüpheli komut satırları işaretli."}</p></div>
+      <div class="seg">${PF.map(([id, label, fn]) => `<button class="seg-btn ${pf[0] === id ? 'active' : ''}" data-proc-filter="${id}">${label} <span class="count">${ctx.procs.filter(fn).length}</span></button>`).join('')}</div></div>
+    ${listHtml}</div>`;
   setHtml($('panelBehavior'), `<div class="stack-lg">
     <div class="grid-4">${stat('Kalan süre', left)}${stat('Yeni işlem (örnekten)', `${ctx.procs.length} (${fromSample})`)}${stat('Şüpheli komut', susp, susp > 0)}${stat('TCP bağlantısı', ctx.conns.length)}</div>
     <div class="row row-wrap">${chips}</div>
@@ -1040,7 +1081,38 @@ const STATIC_FILTERS = [
   ['low', 'Düşük (0–34)', (r) => r < 35, 'tone-ok'],
   ['vt', 'VirusTotal uyardı', (r, vt) => vt > 0, 'tone-crit'],
 ];
-function fileCard(f, idx, vt) {
+const CAPA_GROUP_TONE = { family: 'tone-crit', inject: 'tone-high', credentials: 'tone-high', spy: 'tone-high', impact: 'tone-high', c2: 'tone-high', evasion: 'tone-med', persistence: 'tone-med' };
+const CAPA_GROUP_LABEL = { family: 'Zararlı ailesi', inject: 'Enjeksiyon / kabuk kodu', credentials: 'Kimlik verisi toplama', spy: 'Tuş / ekran kaydı', evasion: 'VM / antivirüs tespiti', persistence: 'Kalıcılık', impact: 'Kurtarmayı engelleme', c2: 'Uzaktan komut (C2)' };
+const TOOL_STATUS = { error: 'hata', timeout: 'zaman aşımı', skipped: 'atlandı', cancelled: 'iptal' };
+function capaChip(fl) {
+  const g = Object.keys(((fl || {}).capa || {}).groups || {});
+  if (!g.length) return '';
+  const tone = g.includes('family') ? 'tone-crit' : g.some(k => CAPA_GROUP_TONE[k] === 'tone-high') ? 'tone-high' : 'tone-med';
+  return `<span class="chip ${tone}" title="capa yetenek grupları">capa: ${g.map(k => esc(CAPA_GROUP_LABEL[k] || k)).join(', ')}</span>`;
+}
+function flareBlock(fl) {
+  if (!fl) return '';
+  const capa = fl.capa || {}, floss = fl.floss || {};
+  const parts = [];
+  if (capa.status === 'done') {
+    const groups = capa.groups || {}, caps = asObjs(capa.capabilities);
+    const chips = Object.keys(groups).map(k => `<span class="chip ${CAPA_GROUP_TONE[k] || ''}" title="${esc(asArr(groups[k]).join(' · '))}">${esc(CAPA_GROUP_LABEL[k] || k)}</span>`).join('');
+    parts.push(`<div class="mini cat-intel"><div class="mini-title">capa: ${caps.length} yetenek</div>
+      <div class="mini-desc">${chips ? 'Karara giren gruplar: ' : 'Karara giren bir yetenek grubu yok. '}Sıradan programlarda da onlarca yetenek çıkar; tek başına zararlı anlamına gelmez.</div>
+      ${chips ? `<div class="row row-wrap mt-sm">${chips}</div>` : ''}
+      ${caps.length ? `<details class="sub"><summary>Tüm yetenekler (${caps.length})</summary><div class="table-wrap table-scroll"><table class="tbl"><tr><th>Yetenek</th><th>Kategori</th><th>ATT&amp;CK</th></tr>${caps.map(c => `<tr><td>${esc(c.name)}</td><td class="mono muted">${esc(c.namespace)}</td><td class="mono">${asArr(c.attack).map(esc).join(' ')}</td></tr>`).join('')}</table></div></details>` : ''}</div>`);
+  } else if (capa.status) parts.push(`<div class="clean-line">capa: ${esc(TOOL_STATUS[capa.status] || capa.status)}${capa.error ? ' — ' + esc(capa.error) : ''}</div>`);
+  if (floss.status === 'done') {
+    const strs = ['decoded', 'stack', 'tight'].flatMap(k => asArr(floss[k]).map(s => `[${k}] ${s}`));
+    const finds = asObjs(floss.findings).map(s => `<div class="mini ${sevTone(s.severity)}"><div class="mini-title">FLOSS: ${esc(s.category)}</div><div class="mini-code">${esc(asArr(s.matches).join(' | '))}</div></div>`).join('');
+    parts.push(`<div class="mini cat-file"><div class="mini-title">FLOSS: ${asNum(floss.total)} gizlenmiş metin</div>
+      <div class="mini-desc">Programın dosyada açıkça tutmayıp çalışırken oluşturduğu metinler (çözülen, yığında kurulan).</div>
+      ${asArr(floss.urls).length ? `<div class="mini-code">${asArr(floss.urls).map(esc).join(' · ')}</div>` : ''}
+      ${strs.length ? `<details class="sub"><summary>Metinleri göster (${strs.length})</summary><pre class="codebox">${esc(strs.slice(0, 400).join('\n'))}</pre></details>` : ''}</div>${finds}`);
+  } else if (floss.status) parts.push(`<div class="clean-line">FLOSS: ${esc(TOOL_STATUS[floss.status] || floss.status)}${floss.error ? ' — ' + esc(floss.error) : ''}</div>`);
+  return parts.length ? `<div class="stack-sm">${parts.join('')}</div>` : '';
+}
+function fileCard(f, idx, vt, fl) {
   const sha = (f.hashes || {}).sha256 || '', pe = f.pe_info || {};
   const mini = (tone, title, desc, code) => `<div class="mini ${tone}"><div class="mini-title">${esc(title)}</div>${desc ? `<div class="mini-desc">${esc(desc)}</div>` : ''}${code ? `<div class="mini-code">${esc(code)}</div>` : ''}</div>`;
   const left = [
@@ -1071,12 +1143,13 @@ function fileCard(f, idx, vt) {
   const risk = asNum(f.risk_score);
   return `<details class="fcard">
     <summary>${ic('right', 'chev')}<span class="risk ${riskTone(risk)}" title="Statik risk puanı (0-100)">${risk}</span>
-      <span class="grow"><span class="strong mono break">${esc(f.rel)}</span><span class="row row-wrap">${sigChip(f.signature)}${vt ? vtCell(vt.result, vt.intel) : ''}<span class="tiny faint">${esc(f.file_size_mb)} MB · entropi ${esc(f.entropy)}/8</span></span></span></summary>
+      <span class="grow"><span class="strong mono break">${esc(f.rel)}</span><span class="row row-wrap">${sigChip(f.signature)}${vt ? vtCell(vt.result, vt.intel) : ''}${capaChip(fl)}<span class="tiny faint">${esc(f.file_size_mb)} MB · entropi ${esc(f.entropy)}/8</span></span></span></summary>
     <div class="fbody">
       <div class="kv"><span>SHA-256: <b class="mono">${esc(sha)}</b></span></div>
       ${peMeta}
       ${asArr(f.risk_reasons).length ? `<ul class="reasons">${asArr(f.risk_reasons).map(r => `<li>${esc(r)}</li>`).join('')}</ul>` : ''}
       <div class="grid-2"><div class="stack-sm">${left.join('') || '<div class="clean-line">Bilinen stealer / RAT / anti-VM izi yok.</div>'}</div><div class="stack-sm">${right}</div></div>
+      ${flareBlock(fl)}
       <div class="btn-group">
         <button class="btn btn-sm" data-preview="${idx}">${ic('eye')} İçeriği incele</button>
         ${vt ? `<span class="hint">VirusTotal: ${esc(vt.status)}</span>` : `<button class="btn btn-sm" data-vt-query="${idx}">VirusTotal'da sorgula</button>`}
@@ -1108,10 +1181,23 @@ function renderFilesTab(st, ctx) {
     const active = STATIC_FILTERS.find(x => x[0] === staticFilter) || STATIC_FILTERS[0];
     const list = all.filter(x => active[2](x.r, vm(x)));
     const pg = paginate('static', list, 10);
+    const flare = st.flare || {}, flareBy = {};
+    asObjs(flare.files).forEach(x => { flareBy[x.label] = x; });
+    const fFiles = asObjs(flare.files), tooBig = asArr(flare.too_big);
+    const notDone = fFiles.flatMap(x => [['capa', x.capa], ['FLOSS', x.floss]].filter(([, r]) => r && r.status && r.status !== 'done').map(([t, r]) => `${t}: ${x.label} (${TOOL_STATUS[r.status] || r.status})`));
+    const extraLines = [tooBig.length ? `${tooBig.length} imzasız program 2 MB'tan büyük olduğu için incelenmedi (bu araçlar büyük dosyalarda saatler sürebilir): <span class="mono">${tooBig.slice(0, 4).map(esc).join(', ')}</span>` : '',
+      notDone.length ? `Sonuç vermeyen ${notDone.length} inceleme: <span class="mono">${notDone.slice(0, 4).map(esc).join(' · ')}</span>` : ''].filter(Boolean);
+    const flareLine = (flare.status === 'running' ? `<div class="clean-line"><span class="spin"></span> capa / FLOSS sürüyor: ${esc(flare.msg || '')}</div>`
+      : flare.status === 'done' && fFiles.length ? `<div class="clean-line">capa / FLOSS: ${esc(flare.msg || '')} Sonuçlar ilgili dosyanın kartında.</div>`
+      : flare.status === 'done' ? `<div class="clean-line">capa / FLOSS: ${esc(flare.msg || 'incelenecek imzasız program yoktu.')}</div>`
+      : flare.status === 'unavailable' ? '<div class="clean-line">capa / FLOSS kurulu değil; yetenek ve gizli metin incelemesi yapılmadı.</div>'
+      : flare.status === 'error' ? `<div class="clean-line">capa / FLOSS hata verdi: ${esc(flare.error || '')}</div>` : '')
+      + extraLines.map(l => `<div class="clean-line">${l}</div>`).join('');
     body = !ctx.files.length ? '<div class="empty">Statik analiz henüz sonuç üretmedi.</div>' : `<div class="stack">
       <div class="row row-wrap between"><p class="small muted">En riskliden sıralı. Ayrıntı için bir dosyaya tıklayın. Sandbox'tan alınan dosyalar <span class="mono">[bırakılan]</span>, <span class="mono">[indirilen]</span> ve <span class="mono">[PowerShell betiği]</span> etiketiyle bu listededir.</p>
         <div class="row row-wrap">${STATIC_FILTERS.map(([id, label, fn, tone]) => `<button class="chip chip-btn ${tone} ${staticFilter === id ? 'active' : ''}" data-static-filter="${id}">${label} <span class="count">${all.filter(x => fn(x.r, vm(x))).length}</span></button>`).join('')}</div></div>
-      ${list.length ? `<div>${pg.items.map(x => fileCard(x.f, x.idx, x.vt)).join('')}</div>${pg.ctrl}` : '<div class="empty">Bu filtreye uyan dosya yok.</div>'}</div>`;
+      ${flareLine}
+      ${list.length ? `<div>${pg.items.map(x => fileCard(x.f, x.idx, x.vt, flareBy[x.f.rel])).join('')}</div>${pg.ctrl}` : '<div class="empty">Bu filtreye uyan dosya yok.</div>'}</div>`;
   } else if (filesSub === 'dropped') {
     body = `<div class="stack"><p class="small muted">Örneğin sandbox'ta oluşturduğu imzasız dosyalar şifrelenerek dışarı alındı ve bu bilgisayarda <b>çalıştırılmadan</b> incelendi. Statik sonuçları "Statik analiz" listesinde <span class="mono">[bırakılan]</span> etiketiyle.</p>${extractedTable(ctx.dropped, 'Bırakılan')}</div>`;
   } else if (filesSub === 'downloads') {
